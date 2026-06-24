@@ -1,0 +1,31 @@
+[package]
+name = "potoroo"
+version = "0.1.0"
+edition = "2021"
+description = "A modern partial-order causal-link (POCL) planner in Rust"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "potoroo"
+path = "src/bin/vhpop.rs"
+
+[lib]
+name = "potoroo"
+path = "src/lib.rs"
+
+[dependencies]
+pddl = "0.2"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# Pure-Rust LP modelling + solver (microlp backend) for the Lplan heuristic. No
+# system libraries required, so the core stays buildable everywhere.
+good_lp = { version = "1.13", default-features = false, features = ["microlp"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+
+# Link-time optimization for the release binary: a free constant-factor speedup
+# on the search-heavy hot path, with no behavioural change.
+[profile.release]
+lto = true
+codegen-units = 1
