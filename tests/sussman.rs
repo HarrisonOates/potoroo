@@ -37,7 +37,7 @@ fn solve(ground: bool) -> String {
 
 fn golden(name: &str) -> String {
     // Golden files contain a trailing newline; the formatted body does not.
-    fs::read_to_string(format!("../src/testdata/{name}"))
+    fs::read_to_string(format!("tests/testdata/{name}"))
         .expect("read golden")
         .trim_end_matches('\n')
         .to_string()

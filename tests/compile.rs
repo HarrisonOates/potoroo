@@ -16,7 +16,7 @@ use potoroo::plan::Plan;
 use potoroo::search::{plan, Outcome, SearchContext};
 use potoroo::validate::is_valid_solution;
 
-fn load(domain_file: &str, problem_file: &str) -> (vhpop::domain::Domain, vhpop::problem::Problem) {
+fn load(domain_file: &str, problem_file: &str) -> (potoroo::domain::Domain, potoroo::problem::Problem) {
     let domain_src = fs::read_to_string(format!("examples/{domain_file}")).expect("read domain");
     let problem_src =
         fs::read_to_string(format!("examples/{problem_file}")).expect("read problem");
@@ -111,7 +111,7 @@ fn compile_heuristic_ranks_initial_plan() {
 /// suite. Validates the returned plan with the independent checker.
 #[test]
 fn compile_ground_fast_path_solves_sussman() {
-    if !vhpop::external::downward_available() {
+    if !potoroo::external::downward_available() {
         eprintln!("skipping: downward binary not available");
         return;
     }
@@ -129,7 +129,7 @@ fn compile_ground_fast_path_solves_sussman() {
 
 #[test]
 fn compile_ground_fast_path_solves_gripper() {
-    if !vhpop::external::downward_available() {
+    if !potoroo::external::downward_available() {
         eprintln!("skipping: downward binary not available");
         return;
     }

@@ -29,7 +29,7 @@ fn check(domain_file: &str, problem_file: &str, heuristic: &str, ground: bool) {
 
     let mut params = Parameters::default();
     params.ground_actions = ground;
-    params.heuristic = vhpop::heuristics::Heuristic::parse(heuristic).expect("valid heuristic");
+    params.heuristic = potoroo::heuristics::Heuristic::parse(heuristic).expect("valid heuristic");
 
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {

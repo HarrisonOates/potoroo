@@ -25,7 +25,7 @@ fn eval(domain_file: &str, problem_file: &str) -> (f32, f32, std::time::Duration
     let ctx = SearchContext::new(&domain, &problem, &params);
     let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
     let t = Instant::now();
-    let h = vhpop::lplan::lplan_rank(&initial, &ctx, params.weight);
+    let h = potoroo::lplan::lplan_rank(&initial, &ctx, params.weight);
     let dt = t.elapsed();
     (h, params.weight, dt)
 }
@@ -70,7 +70,7 @@ fn lplan_sussman_solves_valid_optimal() {
     };
     let mut params = Parameters::default();
     params.ground_actions = true;
-    params.heuristic = vhpop::heuristics::Heuristic::parse("LPLAN").unwrap();
+    params.heuristic = potoroo::heuristics::Heuristic::parse("LPLAN").unwrap();
     let ctx = SearchContext::new(&domain, &problem, &params);
     let sol = match plan(&ctx) {
         Outcome::Solved(p) => p,
