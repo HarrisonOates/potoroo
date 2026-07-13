@@ -7,7 +7,7 @@ license = "GPL-2.0-or-later"
 
 [[bin]]
 name = "potoroo"
-path = "src/bin/vhpop.rs"
+path = "src/bin/potoroo.rs"
 
 [lib]
 name = "potoroo"

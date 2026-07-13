@@ -173,7 +173,7 @@ pub fn run_fd_heuristic(
 }
 
 /// The frozen `downward` C++ search binary (built from the submodule). Resolution
-/// order: `VHPOP_DOWNWARD` env → the submodule build → `downward` on `PATH`.
+/// order: `POTOROO_DOWNWARD` env → the submodule build → `downward` on `PATH`.
 pub fn downward_path() -> String {
     if let Ok(p) = std::env::var("POTOROO_DOWNWARD") {
         return p;
@@ -521,7 +521,7 @@ fn unique_tmp_dir() -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("vhpop-fd-{pid}-{n}"))
+    std::env::temp_dir().join(format!("potoroo-fd-{pid}-{n}"))
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -1,9 +1,9 @@
 //! The A* search loop and the search context (problem, parameters, achiever
 //! maps, and per-step variable-type registry) shared across all search nodes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::fasthash::FastMap;
 use std::rc::Rc;
@@ -13,7 +13,8 @@ use crate::bindings::{Bindings, StepVarTypes, TypeContext};
 use crate::chain;
 use crate::domain::Domain;
 use crate::effect::Effect;
-use crate::formula::{Atom, Formula, Literal};
+use crate::formula::{Formula, Literal};
+use crate::instantiate::{instantiate_effect, instantiate_formula, precondition_consistent};
 use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
 use crate::problem::Problem;
@@ -53,6 +54,12 @@ pub struct SearchContext<'a> {
     /// ground actions, cached initial-state fixpoint), built lazily on first use
     /// and reused across every search node. See `crate::sample_ff`.
     sample_ff_model: RefCell<Option<Rc<crate::sample_ff::SampleFfModel>>>,
+    /// Number of heuristic (rank) evaluations performed during search.
+    pub(crate) h_evals: Cell<usize>,
+    /// Total wall time spent in heuristic (rank) evaluations.
+    pub(crate) h_eval_nanos: Cell<u128>,
+    /// Children discarded by relaxed-reachability pruning at generation time.
+    pub(crate) pruned: Cell<usize>,
 }
 
 impl<'a> StepVarTypes for SearchContext<'a> {
@@ -114,6 +121,9 @@ impl<'a> SearchContext<'a> {
             fresh_vars: RefCell::new(FastMap::default()),
             compile_base: RefCell::new(None),
             sample_ff_model: RefCell::new(None),
+            h_evals: Cell::new(0),
+            h_eval_nanos: Cell::new(0),
+            pruned: Cell::new(0),
         };
         ctx.step_var_types
             .borrow_mut()
@@ -316,13 +326,11 @@ impl<'a> SearchContext<'a> {
 
     pub fn planning_graph(&self) -> Rc<crate::planning_graph::PlanningGraph> {
         if self.planning_graph.borrow().is_none() {
-            // The planning graph is always built from the full set of consistent
-            // ground action instantiations, independent of `-g`.
-            let actions = self.ground_actions();
-            let pg = crate::planning_graph::PlanningGraph::build(
+            let pg = crate::planning_graph::PlanningGraph::build_from_schemas(
                 &self.domain.predicates,
                 &self.init_action,
-                &actions,
+                &self.domain.actions,
+                |ty| self.compatible_objects(ty),
             );
             *self.planning_graph.borrow_mut() = Some(Rc::new(pg));
         }
@@ -369,6 +377,13 @@ impl<'a> SearchContext<'a> {
             constants: &self.domain.constants,
             step_vars: self,
         }
+    }
+
+    /// Accumulates one heuristic (rank) evaluation into the search stats.
+    pub(crate) fn record_h_eval(&self, elapsed: std::time::Duration) {
+        self.h_evals.set(self.h_evals.get() + 1);
+        self.h_eval_nanos
+            .set(self.h_eval_nanos.get() + elapsed.as_nanos());
     }
 
     /// Registers a step's action for variable-type lookups.
@@ -443,95 +458,16 @@ fn schema_to_action(schema: &ActionSchema) -> StepAction {
     }
 }
 
-/// Whether a ground precondition's (in)equality literals are satisfied by the
-/// substitution. Used to prune naive ground instances.
-fn precondition_consistent(f: &Rc<Formula>, subst: &HashMap<Variable, Object>) -> bool {
-    match f.as_ref() {
-        Formula::Conjunction(cs) => cs.iter().all(|c| precondition_consistent(c, subst)),
-        Formula::Equality { left, right, .. } => resolve(*left, subst) == resolve(*right, subst),
-        Formula::Inequality { left, right, .. } => resolve(*left, subst) != resolve(*right, subst),
-        _ => true,
-    }
-}
-
-fn resolve(t: Term, subst: &HashMap<Variable, Object>) -> Term {
-    match t {
-        Term::Variable(v) => subst.get(&v).map(|&o| Term::Object(o)).unwrap_or(t),
-        Term::Object(_) => t,
-    }
-}
-
-fn instantiate_formula(f: &Rc<Formula>, subst: &HashMap<Variable, Object>) -> Rc<Formula> {
-    match f.as_ref() {
-        Formula::True | Formula::False => f.clone(),
-        Formula::Atom(a) => Rc::new(Formula::Atom(instantiate_atom(a, subst))),
-        Formula::Negation(a) => Rc::new(Formula::Negation(instantiate_atom(a, subst))),
-        Formula::Equality {
-            left,
-            left_id,
-            right,
-            right_id,
-        } => Rc::new(Formula::Equality {
-            left: resolve(*left, subst),
-            left_id: *left_id,
-            right: resolve(*right, subst),
-            right_id: *right_id,
-        }),
-        Formula::Inequality {
-            left,
-            left_id,
-            right,
-            right_id,
-        } => Rc::new(Formula::Inequality {
-            left: resolve(*left, subst),
-            left_id: *left_id,
-            right: resolve(*right, subst),
-            right_id: *right_id,
-        }),
-        Formula::Conjunction(cs) => {
-            Formula::conjoin_all(cs.iter().map(|c| instantiate_formula(c, subst)))
-        }
-        Formula::Disjunction(ds) => {
-            Formula::disjoin_all(ds.iter().map(|d| instantiate_formula(d, subst)))
-        }
-        Formula::Exists { params, body } => Rc::new(Formula::Exists {
-            params: params.clone(),
-            body: instantiate_formula(body, subst),
-        }),
-        Formula::Forall { params, body } => Rc::new(Formula::Forall {
-            params: params.clone(),
-            body: instantiate_formula(body, subst),
-        }),
-    }
-}
-
-fn instantiate_atom(a: &Atom, subst: &HashMap<Variable, Object>) -> Atom {
-    Atom {
-        predicate: a.predicate,
-        terms: a.terms.iter().map(|&t| resolve(t, subst)).collect(),
-    }
-}
-
-fn instantiate_effect(e: &Effect, subst: &HashMap<Variable, Object>) -> Effect {
-    let literal = match &e.literal {
-        Literal::Atom(a) => Literal::Atom(instantiate_atom(a, subst)),
-        Literal::Negation(a) => Literal::Negation(instantiate_atom(a, subst)),
-    };
-    Effect {
-        parameters: e.parameters.clone(),
-        condition: instantiate_formula(&e.condition, subst),
-        literal,
-        when: e.when,
-        link_condition: instantiate_formula(&e.link_condition, subst),
-    }
-}
-
 /// A plan wrapped for the priority queue. Lower rank is better; ties broken by
 /// subsequent rank elements. Ordered so the best plan is greatest (Rust's
 /// `BinaryHeap` is a max-heap; the best plan must sort largest to be popped).
 struct QueuedPlan {
     plan: Rc<Plan>,
     rank: Vec<f32>,
+    /// When true the rank is a cheap proxy (parent's h + structural tiebreakers)
+    /// and the real h must be computed when this plan is popped. Used by
+    /// `LazyGbfs` and `LazyGbfsDual`.
+    is_lazy: bool,
 }
 
 impl PartialEq for QueuedPlan {
@@ -579,10 +515,150 @@ pub struct SearchStats {
     pub nodes_generated: usize,
     /// Plans dequeued and refined (search nodes visited/expanded).
     pub nodes_visited: usize,
+    /// Heuristic (rank) evaluations performed.
+    pub h_evals: usize,
+    /// Total milliseconds spent in heuristic (rank) evaluations.
+    pub h_eval_ms: u128,
+    /// Children discarded by relaxed-reachability pruning at generation time.
+    pub pruned: usize,
 }
 
 pub fn plan(ctx: &SearchContext) -> Outcome {
     plan_with_stats(ctx).0
+}
+
+/// Pops the next plan to expand from the primary queue (and optionally the
+/// secondary FIFO queue for dual-queue mode), handling lazy h-evaluation.
+///
+/// Returns `(Some(plan), rank0)` where `rank0` is the plan's primary rank
+/// component (used as the lazy proxy for its children), or `(None, 0.0)` if
+/// all queues are empty.
+///
+/// Lazy plans: their rank is a proxy; the real h is computed here. If the real
+/// rank is finite the plan is re-pushed with the correct rank (not expanded
+/// this call). Dead-end plans (real rank = ∞) are silently dropped. Neither
+/// case counts as a visited plan.
+#[allow(clippy::too_many_arguments)]
+fn pop_next(
+    primary: &mut BinaryHeap<QueuedPlan>,
+    mut secondary: Option<&mut BinaryHeap<QueuedPlan>>,
+    expanded_ids: &HashSet<usize>,
+    ctx: &SearchContext,
+    is_lazy: bool,
+    is_gbfs: bool,
+    is_dual: bool,
+    is_alt: bool,
+    boost_budget: &mut usize,
+    expand_count: &mut usize,
+) -> (Option<Rc<Plan>>, f32) {
+    // ALT: strict 1:1 alternation between the A*-ordered primary queue and the
+    // h-ordered secondary queue. The queue is chosen once per call (i.e. per
+    // expansion) so skipping stale entries inside the loop below does not
+    // perturb the alternation. Odd expansions pop the A* queue, even the GBFS
+    // queue.
+    let alt_use_secondary = is_alt && {
+        *expand_count += 1;
+        *expand_count % 2 == 0
+    };
+    loop {
+        // In dual-queue mode, decide which queue to pop from.
+        let use_secondary = alt_use_secondary
+            || (is_dual && *boost_budget == 0 && {
+                *expand_count += 1;
+                *expand_count % 3 == 0 // pop secondary every 3rd expansion (2:1 ratio)
+            });
+
+        let q = if use_secondary {
+            if let Some(sec) = secondary.as_deref_mut() {
+                sec.pop().or_else(|| primary.pop())
+            } else {
+                primary.pop()
+            }
+        } else if is_alt {
+            // Both queues hold the same plans (modulo stale entries), so fall
+            // back to the secondary queue when the primary drains first.
+            primary
+                .pop()
+                .or_else(|| secondary.as_deref_mut().and_then(|sec| sec.pop()))
+        } else {
+            primary.pop()
+        };
+
+        let q = match q {
+            Some(q) => q,
+            None => return (None, 0.0),
+        };
+
+        // Skip plans already expanded (stale secondary-queue duplicates).
+        if (is_dual || is_alt) && expanded_ids.contains(&q.plan.id.get()) {
+            continue;
+        }
+
+        if !is_lazy || !q.is_lazy {
+            let r0 = q.rank[0];
+            return (Some(q.plan), r0);
+        }
+
+        // Lazy: compute the real rank now.
+        let real_rank = if is_gbfs {
+            q.plan.rank_gbfs(ctx)
+        } else {
+            q.plan.rank(ctx)
+        };
+        if real_rank[0].is_finite() {
+            primary.push(QueuedPlan {
+                plan: q.plan,
+                rank: real_rank,
+                is_lazy: false,
+            });
+        }
+        // Do not expand; loop to pop the next candidate.
+    }
+}
+
+/// Whether some open condition introduced by `child`'s newly added step is
+/// relaxed-unreachable under `child`'s bindings. Such a child can never be
+/// completed: this is the same ∞-value that would make an eager rank discard
+/// it, checked over only the new step's conditions (not the full open-condition
+/// list) so it stays much cheaper than a full h evaluation.
+///
+/// Refinements that add no step (reuse, separation, ordering) return false —
+/// their open conditions were already checked when first introduced. Binding
+/// changes can in principle turn an *old* open condition unreachable; those
+/// dead ends are still caught at pop time by the real h evaluation.
+fn has_unreachable_new_open_cond(ctx: &SearchContext, parent: &Plan, child: &Plan) -> bool {
+    if child.num_steps() <= parent.num_steps() {
+        return false;
+    }
+    let Some(new_step) = chain::iter(&child.steps).next() else {
+        return false;
+    };
+    let new_step_id = new_step.id;
+    let pg = ctx.planning_graph();
+    let type_ctx = ctx.type_ctx();
+    let mut unreachable = false;
+    for oc in chain::iter(child.open_conds()) {
+        if oc.step_id != new_step_id {
+            continue;
+        }
+        let (v, _) = crate::planning_graph::formula_value(
+            &pg,
+            &ctx.domain.predicates,
+            &type_ctx,
+            child,
+            &oc.condition,
+            oc.step_id,
+            false,
+        );
+        if v.infinite() {
+            unreachable = true;
+            break;
+        }
+    }
+    // Don't let a parked (or discarded) child retain its bindings lookup
+    // index, mirroring `Plan::rank`.
+    child.bindings.clear_index();
+    unreachable
 }
 
 /// Like [`plan`], but also returns the [`SearchStats`] gathered during the
@@ -597,18 +673,57 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
     };
     initial_plan.id.set(0);
 
+    // Algorithm flags derived once.
+    let alg = ctx.params.search_algorithm;
+    let is_ida = alg == SearchAlgorithm::Ida;
+    let is_bfs = alg == SearchAlgorithm::Bfs;
+    let is_gbfs = matches!(
+        alg,
+        SearchAlgorithm::Gbfs | SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
+    );
+    let is_lazy = matches!(alg, SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual);
+    let is_dual = alg == SearchAlgorithm::LazyGbfsDual;
+    // ALT: eager dual-queue alternation. Children are ranked under both the A*
+    // ordering (primary queue) and the GBFS ordering (secondary queue);
+    // expansions strictly alternate 1:1 between the two queues.
+    let is_alt = alg == SearchAlgorithm::Alt;
+    // Lazy modes skip ranking at generation time, so dead-end children are only
+    // detected (and dropped) when popped, after paying a queue slot and a full
+    // h evaluation. When a planning-graph heuristic is active, check just the
+    // refinement's *new* open conditions for relaxed reachability at generation
+    // time instead. Eager modes already get this from the ∞-rank discard.
+    let prune_unreachable = is_lazy && ctx.params.heuristic.needs_planning_graph();
+
     // One pending-plan queue and generated-plan counter per flaw order.
     let mut queues: Vec<BinaryHeap<QueuedPlan>> =
         (0..n_orders).map(|_| BinaryHeap::new()).collect();
+    // Secondary queues (only allocated for dual-queue modes): FIFO for
+    // LGBFS-D, h-ordered (GBFS rank) for ALT.
+    let mut secondary_queues: Vec<BinaryHeap<QueuedPlan>> = if is_dual || is_alt {
+        (0..n_orders).map(|_| BinaryHeap::new()).collect()
+    } else {
+        Vec::new()
+    };
+    // Plan IDs already expanded; used to skip stale secondary-queue entries.
+    let mut expanded_ids: HashSet<usize> = HashSet::new();
+
+    // Dual-queue boost state.
+    let mut best_h: f32 = inf;
+    let mut boost_budget: usize = 0;
+    let mut expand_count: usize = 0; // for 2:1 primary:secondary ratio
+
     let mut generated_plans: Vec<usize> = vec![0; n_orders];
     let mut num_generated_plans: usize = 0;
     let mut num_visited_plans: usize = 0;
-    let stats = std::env::var_os("VHPOP_STATS").is_some();
+    let stats = std::env::var_os("POTOROO_STATS").is_some();
 
     let mut current_flaw_order: usize = 0;
     let mut flaw_orders_left: usize = n_orders;
     let mut next_switch: usize = 1000;
-    let is_ida = ctx.params.search_algorithm == SearchAlgorithm::Ida;
+
+    // The rank[0] of the plan currently being expanded. Used as the lazy proxy
+    // for its children in lazy-evaluation modes.
+    let mut current_rank0: f32 = 0.0;
 
     let mut current_plan: Option<Rc<Plan>> = Some(initial_plan.clone());
     generated_plans[current_flaw_order] += 1;
@@ -629,6 +744,19 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                 break;
             }
             num_visited_plans += 1;
+            if is_dual || is_alt {
+                expanded_ids.insert(plan.id.get());
+            }
+            if is_dual {
+                // Update boost when this plan's h improves the incumbent.
+                if current_rank0 < best_h {
+                    best_h = current_rank0;
+                    boost_budget = boost_budget.saturating_add(10);
+                }
+                if boost_budget > 0 {
+                    boost_budget -= 1;
+                }
+            }
             // Register step actions referenced by this plan for type lookups.
             for s in chain::iter(&plan.steps) {
                 ctx.register_step(s.id, &s.action);
@@ -637,24 +765,87 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
             let mut refinements: Vec<Rc<Plan>> = Vec::new();
             plan.refinements_with(ctx, current_flaw_order, &mut refinements);
 
+            let cfo = current_flaw_order;
             for new_plan in refinements {
                 // N.B. id must be set before rank is computed (rank uses serial_no).
                 new_plan.id.set(num_generated_plans);
-                let rank = new_plan.rank(ctx);
+
+                // ALT: GBFS-ordered rank from the shared evaluation, consumed
+                // by the secondary-queue push below.
+                let mut alt_gbfs_rank: Option<Vec<f32>> = None;
+
+                // Compute rank and determine whether to push eagerly or lazily.
+                let (rank, is_lazy_push) = if is_bfs {
+                    // BFS: rank by step count, then plan id (FIFO tiebreak).
+                    (
+                        vec![new_plan.num_steps() as f32, new_plan.id.get() as f32],
+                        false,
+                    )
+                } else if is_lazy {
+                    if prune_unreachable
+                        && has_unreachable_new_open_cond(ctx, &plan, &new_plan)
+                    {
+                        ctx.pruned.set(ctx.pruned.get() + 1);
+                        continue;
+                    }
+                    // Lazy: use parent's rank[0] as a cheap h proxy, with the
+                    // same tiebreakers as `plan_rank_gbfs`: fewer remaining
+                    // flaws, then newest-generated (LIFO). Ascending plan ids
+                    // would sweep proxy-plateaus breadth-first — exactly where
+                    // lazy GBFS stalls.
+                    (
+                        vec![
+                            current_rank0,
+                            new_plan.num_open_conds() as f32,
+                            -(new_plan.id.get() as f32),
+                        ],
+                        true,
+                    )
+                } else if is_gbfs {
+                    (new_plan.rank_gbfs(ctx), false)
+                } else if is_alt {
+                    // ALT queues the child under both orderings; one shared
+                    // evaluation produces the A* rank (primary queue) and the
+                    // GBFS rank (secondary queue, pushed below).
+                    let (a_rank, g_rank) = new_plan.rank_both(ctx);
+                    alt_gbfs_rank = Some(g_rank);
+                    (a_rank, false)
+                } else {
+                    (new_plan.rank(ctx), false)
+                };
+
                 let primary = rank[0];
                 if primary.is_finite()
-                    && generated_plans[current_flaw_order]
-                        < ctx.params.search_limits[current_flaw_order]
+                    && generated_plans[cfo] < ctx.params.search_limits[cfo]
                 {
                     if is_ida && primary > f_limit {
                         next_f_limit = next_f_limit.min(primary);
                         continue;
                     }
-                    queues[current_flaw_order].push(QueuedPlan {
+                    if is_dual {
+                        // Secondary queue: pure FIFO ordered by plan id.
+                        secondary_queues[cfo].push(QueuedPlan {
+                            plan: new_plan.clone(),
+                            rank: vec![new_plan.id.get() as f32],
+                            is_lazy: is_lazy_push,
+                        });
+                    } else if is_alt {
+                        // ALT secondary queue: the GBFS (h-ordered) rank from
+                        // the shared evaluation above.
+                        secondary_queues[cfo].push(QueuedPlan {
+                            plan: new_plan.clone(),
+                            rank: alt_gbfs_rank
+                                .take()
+                                .expect("ALT child ranked without GBFS rank"),
+                            is_lazy: false,
+                        });
+                    }
+                    queues[cfo].push(QueuedPlan {
                         plan: new_plan,
                         rank,
+                        is_lazy: is_lazy_push,
                     });
-                    generated_plans[current_flaw_order] += 1;
+                    generated_plans[cfo] += 1;
                     num_generated_plans += 1;
                 }
             }
@@ -668,6 +859,9 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                     limit_reached = true;
                     flaw_orders_left = flaw_orders_left.saturating_sub(1);
                     queues[current_flaw_order].clear();
+                    if is_dual || is_alt {
+                        secondary_queues[current_flaw_order].clear();
+                    }
                 }
                 if flaw_orders_left > 0 {
                     loop {
@@ -689,10 +883,26 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                 if generated_plans[current_flaw_order] == 0 {
                     // First visit to this flaw order: start from the initial plan.
                     current_plan = Some(initial_plan.clone());
+                    current_rank0 = 0.0;
                     generated_plans[current_flaw_order] += 1;
                     num_generated_plans += 1;
                 } else {
-                    current_plan = queues[current_flaw_order].pop().map(|q| q.plan);
+                    (current_plan, current_rank0) = pop_next(
+                        &mut queues[current_flaw_order],
+                        if is_dual || is_alt {
+                            Some(&mut secondary_queues[current_flaw_order])
+                        } else {
+                            None
+                        },
+                        &expanded_ids,
+                        ctx,
+                        is_lazy,
+                        is_gbfs,
+                        is_dual,
+                        is_alt,
+                        &mut boost_budget,
+                        &mut expand_count,
+                    );
                 }
 
                 // Instantiate all actions if the plan is otherwise complete
@@ -706,8 +916,24 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                                     break;
                                 }
                                 None => {
-                                    current_plan =
-                                        queues[current_flaw_order].pop().map(|q| q.plan);
+                                    (current_plan, current_rank0) = pop_next(
+                                        &mut queues[current_flaw_order],
+                                        if is_dual || is_alt {
+                                            Some(
+                                                &mut secondary_queues[current_flaw_order],
+                                            )
+                                        } else {
+                                            None
+                                        },
+                                        &expanded_ids,
+                                        ctx,
+                                        is_lazy,
+                                        is_gbfs,
+                                        is_dual,
+                                        is_alt,
+                                        &mut boost_budget,
+                                        &mut expand_count,
+                                    );
                                 }
                             },
                             _ => break,
@@ -729,6 +955,7 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
         if f_limit != inf {
             // Restart the IDA* search with the relaxed f-limit.
             current_plan = Some(initial_plan.clone());
+            current_rank0 = 0.0;
         } else {
             break;
         }
@@ -743,6 +970,9 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
     let search_stats = SearchStats {
         nodes_generated: num_generated_plans,
         nodes_visited: num_visited_plans,
+        h_evals: ctx.h_evals.get(),
+        h_eval_ms: ctx.h_eval_nanos.get() / 1_000_000,
+        pruned: ctx.pruned.get(),
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {

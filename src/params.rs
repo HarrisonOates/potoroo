@@ -10,12 +10,31 @@ use crate::heuristics::{FlawSelectionOrder, Heuristic};
 /// Search algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchAlgorithm {
-    /// A* (the default).
+    /// A* (the default): rank = g + w·h.
     A,
     /// IDA* (deferred).
     Ida,
     /// Hill climbing (deferred).
     Hc,
+    /// Breadth-first search: rank = (steps, plan_id). No heuristic needed.
+    Bfs,
+    /// Greedy best-first search: rank = (h, steps, plan_id). Ignores the g
+    /// component; the h value is still computed eagerly at generation time.
+    Gbfs,
+    /// Lazy GBFS: push refinements with the parent's h as a proxy rank; compute
+    /// the real h only when a node is popped from the open list. Avoids h
+    /// evaluation for nodes that are never expanded.
+    LazyGbfs,
+    /// Lazy GBFS with a boosted dual queue: a primary queue (h-ordered) and a
+    /// secondary queue (FIFO). Both use lazy evaluation. The primary queue gets
+    /// extra budget whenever a node improves the incumbent best-h (boost).
+    LazyGbfsDual,
+    /// LAMA-style queue alternation: every generated child is ranked eagerly
+    /// under both the A* ordering (g + w·h) and the GBFS ordering (h) and
+    /// pushed into two queues; expansions strictly alternate (1:1) between the
+    /// A*-ordered and h-ordered queues. Bounds greedy search's worst case at
+    /// roughly 2x A* while keeping greedy's wins.
+    Alt,
 }
 
 /// Action cost model.

@@ -299,6 +299,22 @@ impl CompiledProblem {
             let _ = writeln!(s, "  (:types {})", simple_type_names(types).join(" "));
         }
 
+        // Objects as domain constants: committed-step preconditions and guard
+        // equalities reference ground objects, and FD's translator parses the
+        // domain standalone — any object it meets there must be declared here
+        // (the problem file therefore declares no :objects).
+        let objs = all_objects_with_types(ctx);
+        if !objs.is_empty() {
+            let _ = write!(s, "  (:constants");
+            for (o, ty) in &objs {
+                let _ = write!(s, " {}", object_name(*o, ctx));
+                if typed {
+                    let _ = write!(s, " - {}", types.name(*ty));
+                }
+            }
+            let _ = writeln!(s, ")");
+        }
+
         // Predicates: originals + indicator props + guard props.
         let _ = writeln!(s, "  (:predicates");
         for p in all_predicates(preds) {
@@ -402,24 +418,12 @@ impl CompiledProblem {
     }
 
     fn emit_problem(&self, ctx: &SearchContext) -> String {
-        let types = &ctx.domain.types;
-        let typed = !simple_type_names(types).is_empty();
-
         let mut s = String::new();
         let _ = writeln!(s, "(define (problem pocl-compiled-prob)");
         let _ = writeln!(s, "  (:domain pocl-compiled)");
 
-        let objs = all_objects_with_types(ctx);
-        if !objs.is_empty() {
-            let _ = write!(s, "  (:objects");
-            for (o, ty) in &objs {
-                let _ = write!(s, " {}", object_name(*o, ctx));
-                if typed {
-                    let _ = write!(s, " - {}", types.name(*ty));
-                }
-            }
-            let _ = writeln!(s, ")");
-        }
+        // Objects are declared as :constants in the domain (they appear inside
+        // committed-step actions there), so the problem declares none.
 
         // Init: problem init + every step's l₋ + guards true initially.
         let _ = write!(s, "  (:init");

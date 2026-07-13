@@ -129,7 +129,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
 | `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `UCPOP` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
-| `-s` | `--search-algorithm` | `A` | Search algorithm (`A` = best-first A\*) | `A` |
+| `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
 | `-v` | `--verbose` | [N] | Verbosity level (0–3) | 0 |
 | `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
 | `-H` | `--help` | — | Display help and exit | |

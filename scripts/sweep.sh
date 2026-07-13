@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Differential sweep: pair every problem file under examples/ with the domain
 # file that declares its (:domain ...), then run both the C++ reference and the
-# Rust port and diff their stdout (ignoring the Time: line). Cases that exceed
+# Potoroo port and diff their stdout (ignoring the Time: line). Cases that exceed
 # the per-run timeout for either binary are skipped (reported separately).
 #
-# Usage: sweep.sh [extra vhpop flags...]
+# Usage: sweep.sh [extra potoroo flags...]
 #   e.g. sweep.sh          (default lifted config)
 #        sweep.sh -g       (ground actions)
 set -u
@@ -13,7 +13,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../.."
 ex="$root/examples"
 REF="${REF_VHPOP:-$root/vhpop}"
-RUST="${RUST_VHPOP:-$here/../target/debug/vhpop}"
+RUST="${RUST_POTOROO:-$here/../target/debug/potoroo}"
 TIMEOUT="${SWEEP_TIMEOUT:-10}"
 flags=("$@")
 

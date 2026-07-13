@@ -145,7 +145,27 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> Vec<f32> {
+        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+            .0
+    }
+
+    /// Computes the A* rank ([`plan_rank`](Self::plan_rank)) and the GBFS rank
+    /// ([`plan_rank_gbfs`](Self::plan_rank_gbfs)) in one pass, sharing every
+    /// heuristic evaluation between them. The two ranks differ only in the
+    /// g-component (step count) mixed into some entries and the trailing GBFS
+    /// tiebreakers, so algorithms that need both orderings of the same plan
+    /// (`ALT`) pay one evaluation instead of two.
+    pub fn plan_rank_both(
+        &self,
+        plan: &Plan,
+        weight: f32,
+        predicates: &PredicateTable,
+        ctx: &TypeContext,
+        pg: Option<&PlanningGraph>,
+        search_ctx: &SearchContext,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut rank = Vec::with_capacity(self.h.len());
+        let mut grank = Vec::with_capacity(self.h.len() + 2);
         // Cache the ADD / ADDR sums across the (single) ADD* / ADDR* terms.
         let mut add_done = false;
         let mut add_cost = 0.0f32;
@@ -155,21 +175,42 @@ impl Heuristic {
         let mut addr_work = 0i32;
         // i32::MAX as f32 (the C++ `std::numeric_limits<int>::max()` comparison).
         let int_max_f = i32::MAX as f32;
+        let steps = plan.num_steps() as f32;
 
         for &h in &self.h {
             match h {
-                HVal::Lifo => rank.push(-(plan.serial_no() as f32)),
-                HVal::Fifo => rank.push(plan.serial_no() as f32),
-                HVal::Oc => rank.push(plan.num_open_conds() as f32),
-                HVal::Uc => rank.push(plan.num_unsafes() as f32),
-                HVal::Buc => rank.push(if plan.num_unsafes() > 0 { 1.0 } else { 0.0 }),
-                HVal::SPlusOc => {
-                    rank.push(plan.num_steps() as f32 + weight * plan.num_open_conds() as f32)
+                // No g component: both ranks carry the same value.
+                HVal::Lifo => {
+                    rank.push(-(plan.serial_no() as f32));
+                    grank.push(-(plan.serial_no() as f32));
                 }
-                HVal::Ucpop => rank.push(
-                    plan.num_steps() as f32
-                        + weight * (plan.num_open_conds() + plan.num_unsafes()) as f32,
-                ),
+                HVal::Fifo => {
+                    rank.push(plan.serial_no() as f32);
+                    grank.push(plan.serial_no() as f32);
+                }
+                HVal::Oc => {
+                    rank.push(plan.num_open_conds() as f32);
+                    grank.push(plan.num_open_conds() as f32);
+                }
+                HVal::Uc => {
+                    rank.push(plan.num_unsafes() as f32);
+                    grank.push(plan.num_unsafes() as f32);
+                }
+                HVal::Buc => {
+                    let v = if plan.num_unsafes() > 0 { 1.0 } else { 0.0 };
+                    rank.push(v);
+                    grank.push(v);
+                }
+                HVal::SPlusOc => {
+                    let hterm = weight * plan.num_open_conds() as f32;
+                    rank.push(steps + hterm);
+                    grank.push(hterm);
+                }
+                HVal::Ucpop => {
+                    let hterm = weight * (plan.num_open_conds() + plan.num_unsafes()) as f32;
+                    rank.push(steps + hterm);
+                    grank.push(hterm);
+                }
                 HVal::Add | HVal::AddCost | HVal::AddWork => {
                     let pg = pg.expect("ADD heuristic requires a planning graph");
                     if !add_done {
@@ -186,31 +227,43 @@ impl Heuristic {
                             );
                             add_cost += v.add_cost();
                             add_work = saturating_sum(add_work, v.add_work());
+                            // Both accumulators pegged: every downstream value
+                            // is already decided (cost ranks read only the
+                            // `< int_max_f` threshold, work is saturated), so
+                            // skip the remaining open conditions. Dead-end
+                            // children hit this on their first unreachable
+                            // condition — the newest, scanned first.
+                            if add_cost >= int_max_f && add_work == i32::MAX {
+                                break;
+                            }
                         }
                     }
-                    rank.push(match h {
+                    let cost_fin = add_cost < int_max_f;
+                    let work_fin = add_work < i32::MAX;
+                    match h {
                         HVal::Add => {
-                            if add_cost < int_max_f {
-                                plan.num_steps() as f32 + weight * add_cost
+                            rank.push(if cost_fin {
+                                steps + weight * add_cost
                             } else {
                                 f32::INFINITY
-                            }
+                            });
+                            grank.push(if cost_fin { add_cost } else { f32::INFINITY });
                         }
                         HVal::AddCost => {
-                            if add_cost < int_max_f {
-                                add_cost
-                            } else {
-                                f32::INFINITY
-                            }
+                            let v = if cost_fin { add_cost } else { f32::INFINITY };
+                            rank.push(v);
+                            grank.push(v);
                         }
                         _ => {
-                            if add_work < i32::MAX {
+                            let v = if work_fin {
                                 add_work as f32
                             } else {
                                 f32::INFINITY
-                            }
+                            };
+                            rank.push(v);
+                            grank.push(v);
                         }
-                    });
+                    }
                 }
                 HVal::Addr | HVal::AddrCost | HVal::AddrWork => {
                     let pg = pg.expect("ADDR heuristic requires a planning graph");
@@ -228,53 +281,98 @@ impl Heuristic {
                             );
                             addr_cost += v.add_cost();
                             addr_work = saturating_sum(addr_work, v.add_work());
+                            // See the ADD loop: pegged accumulators decide
+                            // every downstream value; skip the rest.
+                            if addr_cost >= int_max_f && addr_work == i32::MAX {
+                                break;
+                            }
                         }
                     }
-                    rank.push(match h {
+                    let cost_fin = addr_cost < int_max_f;
+                    let work_fin = addr_work < i32::MAX;
+                    match h {
                         HVal::Addr => {
-                            if addr_cost < int_max_f {
-                                plan.num_steps() as f32 + weight * addr_cost
+                            rank.push(if cost_fin {
+                                steps + weight * addr_cost
                             } else {
                                 f32::INFINITY
-                            }
+                            });
+                            grank.push(if cost_fin { addr_cost } else { f32::INFINITY });
                         }
                         HVal::AddrCost => {
-                            if addr_cost < int_max_f {
-                                addr_cost
-                            } else {
-                                f32::INFINITY
-                            }
+                            let v = if cost_fin { addr_cost } else { f32::INFINITY };
+                            rank.push(v);
+                            grank.push(v);
                         }
                         _ => {
-                            if addr_work < i32::MAX {
+                            let v = if work_fin {
                                 addr_work as f32
                             } else {
                                 f32::INFINITY
-                            }
+                            };
+                            rank.push(v);
+                            grank.push(v);
                         }
-                    });
+                    }
                 }
                 HVal::Relax | HVal::RelaxR => {
                     let pg = pg.expect("RELAX heuristic requires a planning graph");
                     let reuse = matches!(h, HVal::RelaxR);
-                    let value = match pg.relaxed_plan_size(ctx, plan, reuse) {
-                        Some(v) => plan.num_steps() as f32 + weight * v,
-                        None => f32::INFINITY,
-                    };
-                    rank.push(value);
+                    match pg.relaxed_plan_size(ctx, plan, reuse) {
+                        Some(v) => {
+                            rank.push(steps + weight * v);
+                            grank.push(weight * v);
+                        }
+                        None => {
+                            rank.push(f32::INFINITY);
+                            grank.push(f32::INFINITY);
+                        }
+                    }
                 }
+                // Delegating heuristics carry no separable g component; both
+                // ranks use the same value, computed once.
                 HVal::SampleFf(k) => {
-                    rank.push(crate::sample_ff::sample_ff_rank(plan, search_ctx, weight, k));
+                    let v = crate::sample_ff::sample_ff_rank(plan, search_ctx, weight, k);
+                    rank.push(v);
+                    grank.push(v);
                 }
                 HVal::Lplan => {
-                    rank.push(crate::lplan::lplan_rank(plan, search_ctx, weight));
+                    let v = crate::lplan::lplan_rank(plan, search_ctx, weight);
+                    rank.push(v);
+                    grank.push(v);
                 }
                 HVal::Compile(backend) => {
-                    rank.push(compile_rank(plan, search_ctx, weight, backend));
+                    let v = compile_rank(plan, search_ctx, weight, backend);
+                    rank.push(v);
+                    grank.push(v);
                 }
             }
         }
-        rank
+        // GBFS tiebreakers: prefer fewer remaining flaws (progress towards
+        // completion), then newest-generated (LIFO). Ascending serial numbers
+        // would sweep h-plateaus breadth-first, which is exactly where greedy
+        // search stalls; diving on the newest plan escapes them.
+        grank.push(plan.num_open_conds() as f32);
+        grank.push(-(plan.serial_no() as f32));
+        (rank, grank)
+    }
+
+    /// Greedy-BFS variant of [`plan_rank`]: strips the g-component (step count)
+    /// from each `HVal` so the primary sort criterion is pure h. After the
+    /// h-components, `steps` and `plan_id` are appended as tiebreakers so the
+    /// ordering remains deterministic. Heuristics that already have no g
+    /// component (e.g. `AddCost`, `Oc`, `Fifo`) are returned unchanged.
+    pub fn plan_rank_gbfs(
+        &self,
+        plan: &Plan,
+        weight: f32,
+        predicates: &PredicateTable,
+        ctx: &TypeContext,
+        pg: Option<&PlanningGraph>,
+        search_ctx: &SearchContext,
+    ) -> Vec<f32> {
+        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+            .1
     }
 }
 

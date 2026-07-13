@@ -9,6 +9,7 @@
 pub mod action;
 pub mod bindings;
 pub mod chain;
+pub(crate) mod instantiate;
 pub mod compile;
 pub mod domain;
 pub mod effect;

@@ -7,12 +7,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
+use crate::action::ActionSchema;
 use crate::bindings::{Bindings, TypeContext};
 use crate::chain;
 use crate::effect::Effect;
 use crate::formula::{Atom, Formula, Literal};
+use crate::instantiate::{instantiate_atom, instantiate_effect, instantiate_formula,
+                         precondition_consistent};
 use crate::plan::{Plan, StepAction, INIT_ID};
 use crate::predicates::{Predicate, PredicateTable};
+use crate::terms::{Object, Term, Variable};
+use crate::types::Type;
 
 pub const THRESHOLD: f32 = 0.01;
 
@@ -288,6 +293,139 @@ impl PlanningGraph {
         pg
     }
 
+    /// Builds the relaxed planning graph from `init_action` and a set of action
+    /// `schemas`, without pre-grounding them. For each fixpoint iteration, each
+    /// schema is applied to every type-compatible parameter tuple; only tuples
+    /// whose precondition is achievable at the current level are processed. This
+    /// avoids the O(n^m) upfront grounding cost while producing identical
+    /// `atom_values` to `build`.
+    ///
+    /// `get_objects(ty)` must return all problem objects of (sub)type `ty`.
+    pub fn build_from_schemas(
+        predicates: &PredicateTable,
+        init_action: &Rc<StepAction>,
+        schemas: &[ActionSchema],
+        get_objects: impl Fn(Type) -> Vec<Object>,
+    ) -> PlanningGraph {
+        let mut pg = PlanningGraph {
+            atom_values: HashMap::new(),
+            negation_values: HashMap::new(),
+            predicate_atoms: HashMap::new(),
+            predicate_negations: HashMap::new(),
+            actions: Vec::new(),
+            pos_achievers: HashMap::new(),
+        };
+
+        // Initialise level 0 from the init atoms.
+        for effect in init_action.effects.iter() {
+            let atom = effect.literal.atom().clone();
+            if predicates.is_static(atom.predicate) {
+                pg.atom_values.entry(atom).or_insert(HeuristicValue::ZERO);
+            } else {
+                pg.atom_values
+                    .entry(atom)
+                    .or_insert(HeuristicValue::ZERO_COST_UNIT_WORK);
+            }
+        }
+
+        // Pre-compute the compatible-object lists for every type that appears
+        // as a schema parameter, so `get_objects` is called at most once per type.
+        let mut type_domains: HashMap<Type, Vec<Object>> = HashMap::new();
+        for schema in schemas {
+            for &v in &schema.parameters {
+                let ty = schema.var_types[v.0 as usize];
+                type_domains.entry(ty).or_insert_with(|| get_objects(ty));
+            }
+        }
+        let type_sets: HashMap<Type, HashSet<Object>> = type_domains
+            .iter()
+            .map(|(ty, objs)| (*ty, objs.iter().copied().collect()))
+            .collect();
+
+        // Fixpoint.
+        loop {
+            let mut changed = false;
+            let mut new_atom_values: HashMap<Atom, HeuristicValue> = HashMap::new();
+            let mut new_negation_values: HashMap<Atom, HeuristicValue> = HashMap::new();
+            let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
+
+            for schema in schemas {
+                let mut je = JoinEnum::new(schema, &atoms_by_pred, &type_domains, &type_sets);
+                je.run(&mut |subst, _tuple| {
+                    apply_schema_tuple(
+                        schema,
+                        subst,
+                        &pg,
+                        predicates,
+                        &mut new_atom_values,
+                        &mut new_negation_values,
+                        &mut changed,
+                    );
+                });
+            }
+
+            for (atom, value) in new_atom_values {
+                pg.atom_values.insert(atom, value);
+            }
+            for (atom, value) in new_negation_values {
+                pg.negation_values.insert(atom, value);
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        // Build predicate-to-atom indexes (same as `build`).
+        for atom in pg.atom_values.keys() {
+            pg.predicate_atoms
+                .entry(atom.predicate)
+                .or_default()
+                .push(atom.clone());
+        }
+        for atom in pg.negation_values.keys() {
+            pg.predicate_negations
+                .entry(atom.predicate)
+                .or_default()
+                .push(atom.clone());
+        }
+
+        // Collect the reachable ground actions for relaxed-plan extraction.
+        // Only tuples whose precondition has finite value at convergence are
+        // included, which is the same subset that `cheapest_achiever` would
+        // accept from a full ground-action list.
+        let mut reachable_actions: Vec<Rc<StepAction>> = Vec::new();
+        let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
+        for schema in schemas {
+            let mut je = JoinEnum::new(schema, &atoms_by_pred, &type_domains, &type_sets);
+            je.run(&mut |subst, tuple| {
+                collect_reachable_tuple(
+                    schema,
+                    subst,
+                    tuple,
+                    &pg,
+                    predicates,
+                    &mut reachable_actions,
+                );
+            });
+        }
+        pg.actions = reachable_actions;
+
+        // Index positive add effects for relaxed-plan extraction.
+        for (ai, action) in pg.actions.iter().enumerate() {
+            for (ei, effect) in action.effects.iter().enumerate() {
+                if let Literal::Atom(a) = &effect.literal {
+                    pg.pos_achievers
+                        .entry(a.predicate)
+                        .or_default()
+                        .push((ai, ei));
+                }
+            }
+        }
+
+        pg
+    }
+
     pub fn heuristic_value_atom(
         &self,
         atom: &Atom,
@@ -301,12 +439,34 @@ impl PlanningGraph {
                 .copied()
                 .unwrap_or(HeuristicValue::INFINITE),
             Some((ctx, b)) => {
-                // Take minimum value over ground atoms that unify.
+                // Take minimum value over ground atoms that unify. The pattern
+                // is resolved against the bindings once; per-candidate matching
+                // is then cheap positional checks instead of full unification.
+                let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
+                if let Some(terms) = pattern.object_terms() {
+                    // Fully bound: a single hash lookup decides it.
+                    let ground = Atom {
+                        predicate: atom.predicate,
+                        terms,
+                    };
+                    return self.heuristic_value_atom(&ground, 0, None);
+                }
                 let mut value = HeuristicValue::INFINITE;
                 if let Some(ground_atoms) = self.predicate_atoms.get(&atom.predicate) {
-                    let lifted = Literal::Atom(atom.clone());
                     for a in ground_atoms {
-                        if b.unify(ctx, &lifted, step_id, &Literal::Atom(a.clone()), 0) {
+                        let m = pattern.matches(ctx, &a.terms);
+                        debug_assert_eq!(
+                            m,
+                            b.unify(
+                                ctx,
+                                &Literal::Atom(atom.clone()),
+                                step_id,
+                                &Literal::Atom(a.clone()),
+                                0
+                            ),
+                            "AtomPattern::matches diverged from Bindings::unify"
+                        );
+                        if m {
                             let v = self.heuristic_value_atom(a, 0, None);
                             value = hv_min(value, v);
                             if value.zero() {
@@ -342,11 +502,37 @@ impl PlanningGraph {
                 if !self.heuristic_value_atom(atom, step_id, bindings).zero() {
                     return HeuristicValue::ZERO;
                 }
+                let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
+                if let Some(terms) = pattern.object_terms() {
+                    // Fully bound: decide membership in the negation table
+                    // directly (the scan below values candidates through
+                    // `heuristic_value_atom`, so mirror that here).
+                    let ground = Atom {
+                        predicate: atom.predicate,
+                        terms,
+                    };
+                    return if self.negation_values.contains_key(&ground) {
+                        self.heuristic_value_atom(&ground, 0, None)
+                    } else {
+                        HeuristicValue::INFINITE
+                    };
+                }
                 let mut value = HeuristicValue::INFINITE;
                 if let Some(ground_atoms) = self.predicate_negations.get(&atom.predicate) {
-                    let lifted = Literal::Atom(atom.clone());
                     for a in ground_atoms {
-                        if b.unify(ctx, &lifted, step_id, &Literal::Atom(a.clone()), 0) {
+                        let m = pattern.matches(ctx, &a.terms);
+                        debug_assert_eq!(
+                            m,
+                            b.unify(
+                                ctx,
+                                &Literal::Atom(atom.clone()),
+                                step_id,
+                                &Literal::Atom(a.clone()),
+                                0
+                            ),
+                            "AtomPattern::matches diverged from Bindings::unify"
+                        );
+                        if m {
                             let v = self.heuristic_value_atom(a, 0, None);
                             value = hv_min(value, v);
                             if value.zero() {
@@ -608,9 +794,21 @@ impl PlanningGraph {
         }
         // Lifted: pick the cheapest reachable ground atom that unifies.
         let mut best: Option<(Atom, f32)> = None;
-        let lifted = Literal::Atom(atom.clone());
+        let mut pattern = bindings.resolve_pattern(ctx, &atom.terms, step_id);
         for a in self.predicate_atoms.get(&atom.predicate)? {
-            if bindings.unify(ctx, &lifted, step_id, &Literal::Atom(a.clone()), 0) {
+            let m = pattern.matches(ctx, &a.terms);
+            debug_assert_eq!(
+                m,
+                bindings.unify(
+                    ctx,
+                    &Literal::Atom(atom.clone()),
+                    step_id,
+                    &Literal::Atom(a.clone()),
+                    0
+                ),
+                "AtomPattern::matches diverged from Bindings::unify"
+            );
+            if m {
                 let c = self.heuristic_value_atom(a, 0, None).add_cost();
                 if best.as_ref().map_or(true, |(_, bc)| c < *bc) {
                     best = Some((a.clone(), c));
@@ -803,4 +1001,326 @@ fn term_domain(
         }
         Term::Variable(v) => bindings.domain(ctx, v, step_id),
     }
+}
+
+/// Collects the positive atomic conjuncts of a precondition reachable through
+/// nested conjunctions: the join queries driving schema instantiation.
+fn collect_join_atoms<'a>(f: &'a Formula, out: &mut Vec<&'a Atom>) {
+    match f {
+        Formula::Atom(a) => out.push(a),
+        Formula::Conjunction(cs) => {
+            for c in cs {
+                collect_join_atoms(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Backtracking join enumerating every parameter tuple of a schema whose
+/// positive precondition conjuncts all match currently-reachable ground atoms.
+/// Tuples skipped by the join are exactly those with an unreachable positive
+/// conjunct, whose precondition value is infinite — the per-tuple processing
+/// discards them anyway — so replacing the Cartesian type-domain enumeration
+/// with this join leaves the resulting planning graph unchanged while making
+/// instantiation proportional to the number of matches.
+struct JoinEnum<'a> {
+    schema: &'a ActionSchema,
+    /// Positive precondition conjuncts (the join queries).
+    join: Vec<&'a Atom>,
+    used: Vec<bool>,
+    /// Currently-reachable ground atoms, by predicate.
+    atoms_by_pred: &'a HashMap<Predicate, Vec<&'a Atom>>,
+    /// Type-compatible objects per parameter type (for the membership check on
+    /// join-bound objects, and for enumerating join-unconstrained parameters).
+    type_domains: &'a HashMap<Type, Vec<Object>>,
+    type_sets: &'a HashMap<Type, HashSet<Object>>,
+    subst: HashMap<Variable, Object>,
+}
+
+impl<'a> JoinEnum<'a> {
+    fn new(
+        schema: &'a ActionSchema,
+        atoms_by_pred: &'a HashMap<Predicate, Vec<&'a Atom>>,
+        type_domains: &'a HashMap<Type, Vec<Object>>,
+        type_sets: &'a HashMap<Type, HashSet<Object>>,
+    ) -> Self {
+        let mut join = Vec::new();
+        collect_join_atoms(&schema.precondition, &mut join);
+        let used = vec![false; join.len()];
+        JoinEnum {
+            schema,
+            join,
+            used,
+            atoms_by_pred,
+            type_domains,
+            type_sets,
+            subst: HashMap::new(),
+        }
+    }
+
+    /// The declared type of a schema parameter (join atoms only mention
+    /// schema parameters).
+    fn var_type(&self, v: Variable) -> Type {
+        self.schema.var_types[v.0 as usize]
+    }
+
+    fn run(&mut self, visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object])) {
+        // Pick the unused join conjunct with the fewest unbound variables,
+        // tie-broken by smallest candidate list.
+        let mut pick: Option<(usize, (usize, usize))> = None;
+        for (i, ja) in self.join.iter().enumerate() {
+            if self.used[i] {
+                continue;
+            }
+            let unbound = ja
+                .terms
+                .iter()
+                .filter(|t| matches!(t, Term::Variable(v) if !self.subst.contains_key(v)))
+                .count();
+            let cands = self.atoms_by_pred.get(&ja.predicate).map_or(0, |v| v.len());
+            let key = (unbound, cands);
+            if pick.map_or(true, |(_, k)| key < k) {
+                pick = Some((i, key));
+            }
+        }
+        let Some((i, _)) = pick else {
+            // All conjuncts matched: enumerate any remaining unbound
+            // parameters over their type domains, then emit the tuple.
+            self.enumerate_rest(0, visit);
+            return;
+        };
+        self.used[i] = true;
+        let ja: &Atom = self.join[i];
+        // Copy the candidate list (references only) so the loop doesn't hold a
+        // borrow of `self` across the recursive call.
+        let cands: Vec<&Atom> = self
+            .atoms_by_pred
+            .get(&ja.predicate)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        {
+            'cand: for ga in cands {
+                // Match the conjunct against the ground candidate under the
+                // partial substitution, binding its unbound variables.
+                let mut newly_bound: Vec<Variable> = Vec::new();
+                let mut ok = true;
+                for (t, gt) in ja.terms.iter().zip(ga.terms.iter()) {
+                    let Term::Object(o) = gt else {
+                        ok = false;
+                        break;
+                    };
+                    match t {
+                        Term::Object(p) => {
+                            if p != o {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        Term::Variable(v) => match self.subst.get(v) {
+                            Some(b) => {
+                                if b != o {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            None => {
+                                // The Cartesian enumeration only ever tried
+                                // objects from the parameter's type domain.
+                                if !self.type_sets[&self.var_type(*v)].contains(o) {
+                                    for v in newly_bound {
+                                        self.subst.remove(&v);
+                                    }
+                                    continue 'cand;
+                                }
+                                self.subst.insert(*v, *o);
+                                newly_bound.push(*v);
+                            }
+                        },
+                    }
+                }
+                if ok {
+                    self.run(visit);
+                }
+                for v in newly_bound {
+                    self.subst.remove(&v);
+                }
+            }
+        }
+        self.used[i] = false;
+    }
+
+    /// Enumerates parameters not bound by any join conjunct over their type
+    /// domains, then emits the complete tuple.
+    fn enumerate_rest(
+        &mut self,
+        from: usize,
+        visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object]),
+    ) {
+        let params = &self.schema.parameters;
+        let mut k = from;
+        while k < params.len() && self.subst.contains_key(&params[k]) {
+            k += 1;
+        }
+        if k == params.len() {
+            let tuple: Vec<Object> = params.iter().map(|p| self.subst[p]).collect();
+            visit(&self.subst, &tuple);
+            return;
+        }
+        let v = params[k];
+        let domain = self.type_domains[&self.var_type(v)].clone();
+        for obj in domain {
+            self.subst.insert(v, obj);
+            self.enumerate_rest(k + 1, visit);
+        }
+        self.subst.remove(&v);
+    }
+}
+
+/// Groups the currently-reachable atoms by predicate for the join.
+fn atoms_by_predicate(atom_values: &HashMap<Atom, HeuristicValue>) -> HashMap<Predicate, Vec<&Atom>> {
+    let mut map: HashMap<Predicate, Vec<&Atom>> = HashMap::new();
+    for atom in atom_values.keys() {
+        map.entry(atom.predicate).or_default().push(atom);
+    }
+    map
+}
+
+/// Per-tuple processing of `apply_schema_tuples`: updates `new_atom_values` /
+/// `new_negation_values` with the cost of each reachable effect of a
+/// statically-consistent tuple whose precondition has a finite value in `pg`.
+#[allow(clippy::too_many_arguments)]
+fn apply_schema_tuple(
+    schema: &ActionSchema,
+    subst: &HashMap<Variable, Object>,
+    pg: &PlanningGraph,
+    predicates: &PredicateTable,
+    new_atom_values: &mut HashMap<Atom, HeuristicValue>,
+    new_negation_values: &mut HashMap<Atom, HeuristicValue>,
+    changed: &mut bool,
+) {
+    if !precondition_consistent(&schema.precondition, subst) {
+        return;
+    }
+
+    let ground_pre = instantiate_formula(&schema.precondition, subst);
+    let (pre_value, _) = pg.ground_formula_value(predicates, &ground_pre);
+    if pre_value.infinite() {
+        return;
+    }
+
+    for effect in &schema.effects {
+        let ground_cond = instantiate_formula(&effect.condition, subst);
+        let (mut cond_value, _) = pg.ground_formula_value(predicates, &ground_cond);
+        if cond_value.infinite() {
+            continue;
+        }
+        cond_value.add_assign(&pre_value);
+        cond_value.increase_makespan(THRESHOLD);
+        cond_value.increase_cost(1.0);
+
+        let lit = match &effect.literal {
+            Literal::Atom(a) => {
+                let ga = instantiate_atom(a, subst);
+                // Skip forall effects whose parameters are still unbound.
+                if ga.terms.iter().any(|t| t.variable()) {
+                    continue;
+                }
+                Literal::Atom(ga)
+            }
+            Literal::Negation(a) => {
+                let ga = instantiate_atom(a, subst);
+                if ga.terms.iter().any(|t| t.variable()) {
+                    continue;
+                }
+                Literal::Negation(ga)
+            }
+        };
+
+        match lit {
+            Literal::Atom(atom) => {
+                let existing = new_atom_values
+                    .get(&atom)
+                    .or_else(|| pg.atom_values.get(&atom))
+                    .copied();
+                let mut new_value = cond_value;
+                new_value.increment_work();
+                match existing {
+                    None => {
+                        new_atom_values.insert(atom, new_value);
+                        *changed = true;
+                    }
+                    Some(old_value) => {
+                        let merged = hv_min(new_value, old_value);
+                        if merged != old_value {
+                            new_atom_values.insert(atom, merged);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+            Literal::Negation(atom) => {
+                let existing = new_negation_values
+                    .get(&atom)
+                    .or_else(|| pg.negation_values.get(&atom))
+                    .copied();
+                match existing {
+                    None => {
+                        // Closed-world: only achieve the negation if the
+                        // atom is not (yet) certainly present.
+                        if pg.heuristic_value_atom(&atom, 0, None).zero() {
+                            let mut new_value = cond_value;
+                            new_value.increment_work();
+                            new_negation_values.insert(atom, new_value);
+                            *changed = true;
+                        }
+                    }
+                    Some(old_value) => {
+                        let mut new_value = cond_value;
+                        new_value.increment_work();
+                        let merged = hv_min(new_value, old_value);
+                        if merged != old_value {
+                            new_negation_values.insert(atom, merged);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-tuple processing of `collect_reachable`: appends the ground
+/// `StepAction` for a statically-consistent tuple whose precondition is
+/// reachable at convergence. Only reachable actions need be stored for
+/// relaxed-plan extraction.
+fn collect_reachable_tuple(
+    schema: &ActionSchema,
+    subst: &HashMap<Variable, Object>,
+    tuple: &[Object],
+    pg: &PlanningGraph,
+    predicates: &PredicateTable,
+    out: &mut Vec<Rc<StepAction>>,
+) {
+    if !precondition_consistent(&schema.precondition, subst) {
+        return;
+    }
+    let ground_pre = instantiate_formula(&schema.precondition, subst);
+    let (pre_value, _) = pg.ground_formula_value(predicates, &ground_pre);
+    if pre_value.infinite() {
+        return;
+    }
+    let effects: Vec<Effect> = schema
+        .effects
+        .iter()
+        .map(|e| instantiate_effect(e, subst))
+        .collect();
+    out.push(Rc::new(StepAction {
+        name: schema.name.clone(),
+        parameters: Vec::new(),
+        arguments: tuple.to_vec(),
+        precondition: ground_pre,
+        effects,
+        var_types: Vec::new(),
+    }));
 }

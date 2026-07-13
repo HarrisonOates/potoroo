@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Benchmark harness (Phase 0b). Runs the Rust vhpop binary with one or more
+# Benchmark harness (Phase 0b). Runs the Potoroo binary with one or more
 # heuristics across a curated set of benchmark problems, collecting the opt-in
-# `VHPOP_STATS_JSON` lines (coverage + search-node counts), and prints a
+# `POTOROO_STATS_JSON` lines (coverage + search-node counts), and prints a
 # per-problem comparison table via bench.py.
 #
 # Usage:
@@ -12,7 +12,7 @@
 #   TIMEOUT_SECS     = 60
 #
 # Env:
-#   VHPOP_GROUND=1   pass -g (ground mode) to the planner.
+#   POTOROO_GROUND=1   pass -g (ground mode) to the planner.
 set -euo pipefail
 
 TARGET="${1:-ADD}"
@@ -21,9 +21,18 @@ TIMEOUT="${3:-60}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_DIR="$(cd "$RUST_DIR/.." && pwd)"
-EX="$REPO_DIR/examples"
-BIN="$RUST_DIR/target/release/vhpop"
+EX="$RUST_DIR/examples"
+BIN="$RUST_DIR/target/release/potoroo"
+
+# Ground runs need Fast Downward for reachability-based grounding; default to
+# the in-repo checkout so they don't silently fall back to naive grounding.
+if [ -z "${POTOROO_FD:-}" ] && [ -x "$RUST_DIR/downward/fast-downward.py" ]; then
+  export POTOROO_FD="$RUST_DIR/downward/fast-downward.py"
+fi
+if [ -z "${POTOROO_DOWNWARD:-}" ]; then
+  dw="$(ls "$RUST_DIR"/downward/builds/*/bin/downward 2>/dev/null | head -1)"
+  [ -n "$dw" ] && export POTOROO_DOWNWARD="$dw"
+fi
 
 # Curated (problem) list covering the paper's domains (blocks/gripper/logistics)
 # plus a few classics. Domains are auto-resolved from each problem's (:domain X).
@@ -48,7 +57,7 @@ case ",$BASELINES," in
 esac
 
 GROUND_FLAG=()
-[ "${VHPOP_GROUND:-0}" = "1" ] && GROUND_FLAG=(-g)
+[ "${POTOROO_GROUND:-0}" = "1" ] && GROUND_FLAG=(-g)
 
 echo "Building release binary..." >&2
 ( cd "$RUST_DIR" && cargo build --release --quiet )
@@ -82,13 +91,15 @@ for pf in "${PROBLEMS[@]}"; do
   for h in "${HEURS[@]}"; do
     echo "run: $pf  -h $h ${GROUND_FLAG[*]}" >&2
     # The binary prints STATS to stderr; capture stderr, keep only STATS lines.
-    VHPOP_STATS_JSON=1 timeout "$TIMEOUT" \
+    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" \
       "$BIN" -h "$h" "${GROUND_FLAG[@]}" "$dom" "$prob" \
       >/dev/null 2>>"$STATS_FILE" || {
         # Timeout / nonzero: synthesize an unsolved STATS row so the table shows it.
         pname="$(grep -ohiE '\(problem[[:space:]]+[a-zA-Z0-9_-]+' "$prob" | head -1 \
                   | sed -E 's/.*\(problem[[:space:]]+//I')"
-        echo "STATS {\"problem\":\"${pname:-$pf}\",\"heuristic\":\"$h\",\"ground\":${VHPOP_GROUND:-false},\"solved\":false,\"plan_len\":0,\"nodes_generated\":0,\"nodes_visited\":0,\"wall_ms\":$((TIMEOUT*1000))}" >>"$STATS_FILE"
+        # Label must match the binary's "ALG(HEUR)" so the row lands in the
+        # same table column (bench.sh always runs the default algorithm A).
+        echo "STATS {\"problem\":\"${pname:-$pf}\",\"heuristic\":\"A($h)\",\"ground\":${POTOROO_GROUND:-false},\"solved\":false,\"plan_len\":0,\"nodes_generated\":0,\"nodes_visited\":0,\"wall_ms\":$((TIMEOUT*1000))}" >>"$STATS_FILE"
       }
   done
 done

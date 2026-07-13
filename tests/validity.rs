@@ -1,5 +1,5 @@
 //! Integration test: every solution the planner returns must pass the
-//! independent POCL validity checker (`vhpop::validate::is_valid_solution`).
+//! independent POCL validity checker (`potoroo::validate::is_valid_solution`).
 //! This guards against silently-emitted invalid plans across representative
 //! domains, in both lifted and ground mode and under several heuristics.
 

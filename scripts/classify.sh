@@ -7,7 +7,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../.."
 ex="$root/examples"
 REF="${REF_VHPOP:-$root/vhpop}"
-RUST="${RUST_VHPOP:-$here/../target/release/vhpop}"
+RUST="${RUST_POTOROO:-$here/../target/release/potoroo}"
 T="${TIMEOUT:-60}"
 
 declare -A domain_file

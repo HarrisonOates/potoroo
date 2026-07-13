@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Tabulate VHPOP benchmark stats (Phase 0b).
+"""Tabulate Potoroo benchmark stats (Phase 0b).
 
 Reads one JSON object per line (the payloads emitted after `STATS ` by the
-planner under VHPOP_STATS_JSON), from a file argument or stdin, and prints a
+planner under POTOROO_STATS_JSON), from a file argument or stdin, and prints a
 per-problem comparison table with one column group per heuristic:
 
     solved | plan_len | generated | visited | wall_ms
@@ -54,8 +54,8 @@ def main():
     pcol = max([len("problem")] + [len(p) for p in problems])
 
     # Header.
-    sub = ["slv", "len", "gen", "vis", "ms"]
-    subw = {"slv": 3, "len": 5, "gen": 9, "vis": 9, "ms": 7}
+    sub = ["slv", "len", "gen", "vis", "ms", "hms"]
+    subw = {"slv": 3, "len": 5, "gen": 9, "vis": 9, "ms": 7, "hms": 7}
     header1 = " " * pcol
     for h in heurs:
         width = sum(subw.values()) + len(sub) - 1
@@ -81,6 +81,7 @@ def main():
                 "gen": str(r.get("nodes_generated", 0)),
                 "vis": str(r.get("nodes_visited", 0)),
                 "ms": str(r.get("wall_ms", 0)),
+                "hms": str(r.get("h_eval_ms", 0)),
             }
             line += "  " + " ".join(vals[s].rjust(subw[s]) for s in sub)
         print(line)

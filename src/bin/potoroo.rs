@@ -1,4 +1,4 @@
-//! VHPOP command-line entry point. Outputs per-problem: `;name`, the scheduled
+//! Potoroo command-line entry point. Outputs per-problem: `;name`, the scheduled
 //! step lines or a `no plan` message, and a `Time:` line. The classical subset
 //! supports A*/IDA*/hill-climbing (HC behaves like A* in this version), the
 //! cheap and additive (ADD/ADDR) heuristics, and the full flaw-selection DSL
@@ -38,6 +38,9 @@ struct Cli {
     /// Raw `-h` value as given on the command line (default `UCPOP`). Only used
     /// to label the optional `POTOROO_STATS_JSON` benchmark output.
     heuristic_name: String,
+    /// Raw `-s` value as given on the command line (default `A`). Included in the
+    /// `POTOROO_STATS_JSON` output so different algorithms are distinguishable.
+    algorithm_name: String,
 }
 
 fn run() -> Result<ExitCode, String> {
@@ -123,17 +126,24 @@ fn run() -> Result<ExitCode, String> {
         // Machine-readable benchmark line (stderr, opt-in). Kept off stdout so
         // the differential tests still diff stdout byte-for-byte.
         if std::env::var_os("POTOROO_STATS_JSON").is_some() {
+            // Label: "ALG(HEUR)" so different algorithms on the same heuristic
+            // appear as distinct columns in the benchmark table.
+            let label = format!("{}({})", cli.algorithm_name, cli.heuristic_name);
             eprintln!(
                 "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
-                 \"plan_len\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{}}}",
+                 \"plan_len\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
+                 \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{}}}",
                 json_escape(&problem.name),
-                json_escape(&cli.heuristic_name),
+                json_escape(&label),
                 cli.params.ground_actions,
                 solved,
                 plan_len,
                 stats.nodes_generated,
                 stats.nodes_visited,
                 ms,
+                stats.h_evals,
+                stats.h_eval_ms,
+                stats.pruned,
             );
         }
     }
@@ -166,6 +176,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut verbosity = 0u32;
     let mut files = Vec::new();
     let mut heuristic_name = String::from("UCPOP");
+    let mut algorithm_name = String::from("A");
     // Track whether the user set these so repeated flags replace the defaults.
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
     let mut search_limits: Vec<usize> = Vec::new();
@@ -259,6 +270,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             "s" => {
                 let v = required_value!();
                 params.search_algorithm = parse_search_algorithm(&v)?;
+                algorithm_name = v.to_ascii_uppercase();
             }
             "T" => {
                 let _ = required_value!(); // time limit (minutes) — accepted, not enforced
@@ -294,6 +306,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
 
     if !flaw_orders.is_empty() {
         params.flaw_orders = flaw_orders;
+    } else if !params.ground_actions && params.heuristic.needs_planning_graph() {
+        // Lifted planning-graph runs: resolve static open conditions first.
+        // Statics only link to init, so handling them early commits variable
+        // bindings cheaply and makes the planning-graph heuristic informative
+        // (unbound atoms are otherwise valued by their most optimistic
+        // instantiation). Big measured win on logistics/hanoi; overridable
+        // with an explicit -f. The library default stays UCPOP.
+        params.flaw_orders =
+            vec![FlawSelectionOrder::parse("static").expect("static alias parses")];
     }
     if !search_limits.is_empty() {
         params.search_limits = search_limits;
@@ -309,6 +330,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         verbosity,
         files,
         heuristic_name,
+        algorithm_name,
     }))
 }
 
@@ -350,6 +372,11 @@ fn parse_search_algorithm(v: &str) -> Result<SearchAlgorithm, String> {
         "A" => Ok(SearchAlgorithm::A),
         "IDA" => Ok(SearchAlgorithm::Ida),
         "HC" => Ok(SearchAlgorithm::Hc),
+        "BFS" => Ok(SearchAlgorithm::Bfs),
+        "GBFS" => Ok(SearchAlgorithm::Gbfs),
+        "LGBFS" => Ok(SearchAlgorithm::LazyGbfs),
+        "LGBFS-D" => Ok(SearchAlgorithm::LazyGbfsDual),
+        "ALT" => Ok(SearchAlgorithm::Alt),
         other => Err(format!("invalid search algorithm `{other}`")),
     }
 }
@@ -373,7 +400,7 @@ fn print_help() {
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default UCPOP)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
-         \x20 -s, --search-algorithm=A   search algorithm (A)\n\
+         \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20 -v, --verbose[=N]          verbosity level\n\
          \x20 -w, --weight=W             heuristic weight (default 1)\n\
          \x20 -H, --help                 display this help and exit\n\

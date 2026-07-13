@@ -131,20 +131,75 @@ impl Plan {
     /// — that just duplicated the vector for millions of queued plans.
     pub fn rank(&self, ctx: &SearchContext) -> Vec<f32> {
         let type_ctx = ctx.type_ctx();
-        // Build the planning graph on demand for the additive heuristics.
         let pg = if ctx.params.heuristic.needs_planning_graph() {
             Some(ctx.planning_graph())
         } else {
             None
         };
-        ctx.params.heuristic.plan_rank(
+        let start = std::time::Instant::now();
+        let rank = ctx.params.heuristic.plan_rank(
             self,
             ctx.params.weight,
             &ctx.domain.predicates,
             &type_ctx,
             pg.as_deref(),
             ctx,
-        )
+        );
+        ctx.record_h_eval(start.elapsed());
+        // Most generated plans are ranked once and then parked in a queue;
+        // don't let each retain its bindings lookup index.
+        self.bindings.clear_index();
+        rank
+    }
+
+    /// Both rank vectors — A* ([`rank`](Self::rank)) and GBFS
+    /// ([`rank_gbfs`](Self::rank_gbfs)) — from a single heuristic evaluation.
+    /// Used by `ALT`, which queues every child under both orderings; counts as
+    /// one h evaluation since the underlying work is done once.
+    pub fn rank_both(&self, ctx: &SearchContext) -> (Vec<f32>, Vec<f32>) {
+        let type_ctx = ctx.type_ctx();
+        let pg = if ctx.params.heuristic.needs_planning_graph() {
+            Some(ctx.planning_graph())
+        } else {
+            None
+        };
+        let start = std::time::Instant::now();
+        let ranks = ctx.params.heuristic.plan_rank_both(
+            self,
+            ctx.params.weight,
+            &ctx.domain.predicates,
+            &type_ctx,
+            pg.as_deref(),
+            ctx,
+        );
+        ctx.record_h_eval(start.elapsed());
+        self.bindings.clear_index();
+        ranks
+    }
+
+    /// Greedy-BFS rank vector: h-only (no g component), with steps and
+    /// plan_id appended as tiebreakers. Used by GBFS, LGBFS, and LGBFS-D.
+    pub fn rank_gbfs(&self, ctx: &SearchContext) -> Vec<f32> {
+        let type_ctx = ctx.type_ctx();
+        let pg = if ctx.params.heuristic.needs_planning_graph() {
+            Some(ctx.planning_graph())
+        } else {
+            None
+        };
+        let start = std::time::Instant::now();
+        let rank = ctx.params.heuristic.plan_rank_gbfs(
+            self,
+            ctx.params.weight,
+            &ctx.domain.predicates,
+            &type_ctx,
+            pg.as_deref(),
+            ctx,
+        );
+        ctx.record_h_eval(start.elapsed());
+        // Most generated plans are ranked once and then parked in a queue;
+        // don't let each retain its bindings lookup index.
+        self.bindings.clear_index();
+        rank
     }
 
     #[allow(clippy::too_many_arguments)]
