@@ -44,8 +44,8 @@ pub fn read_pddl(src: &str) -> Result<ParsedUnit, ReadError> {
 }
 
 /// Normalize source so the `pddl` crate's whitespace-separated list parsers
-/// accept VHPOP-permissive input. VHPOP (and the PDDL spec) treat `(` and `)`
-/// as self-delimiting tokens, so adjacent forms like `(a ?x)(b ?y)` are legal;
+/// accept permissive PDDL input. The spec treats `(` and `)` as self-delimiting
+/// tokens, so adjacent forms like `(a ?x)(b ?y)` are legal;
 /// the `pddl` crate's `nom` lists require a separator. PDDL has no string
 /// literals, so a `)(` sequence is always a token boundary and inserting a space
 /// there is semantically harmless (including inside `;` comments).
@@ -58,7 +58,11 @@ fn normalize(src: &str) -> String {
 /// after `(define (` is sufficient for well-formed PDDL.
 fn looks_like_problem(src: &str) -> bool {
     let lower = src.to_ascii_lowercase();
-    match (lower.find("(define"), lower.find("(problem"), lower.find("(domain")) {
+    match (
+        lower.find("(define"),
+        lower.find("(problem"),
+        lower.find("(domain"),
+    ) {
         (Some(_), Some(p), Some(d)) => p < d,
         (Some(_), Some(_), None) => true,
         _ => false,

@@ -1,6 +1,5 @@
 //! Integration test: plan the Sussman anomaly in both lifted and ground modes
-//! and compare the formatted plan body against the golden files produced by the
-//! reference VHPOP binary.
+//! and compare the formatted plan body against the established golden files.
 
 use std::fs;
 

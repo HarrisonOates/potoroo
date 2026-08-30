@@ -1,11 +1,10 @@
 //! Persistent singly-linked list with structural sharing.
 //!
-//! VHPOP represents the mutable collections of a plan (steps, links, unsafes,
-//! open conditions) as immutable `Chain<T>` nodes shared across plan nodes via
-//! reference counting. Refining a plan conses a new element onto the front (or
-//! removes one), reusing the unchanged suffix. We model the same thing with
-//! `Rc`: a chain is `Option<Rc<Chain<T>>>` where `None` is the empty chain, and
-//! the unchanged tail is shared by cloning the `Rc`.
+//! The mutable collections of a plan (steps, links, unsafes, open conditions)
+//! are immutable `Chain<T>` nodes shared across plan nodes via reference
+//! counting. Refining a plan conses a new element onto the front (or removes
+//! one), reusing the unchanged suffix. A chain is `Option<Rc<Chain<T>>>`, where
+//! `None` is the empty chain and cloning the `Rc` shares the unchanged tail.
 
 use std::rc::Rc;
 
@@ -95,15 +94,10 @@ pub fn contains<T: PartialEq>(c: &Option<Rc<Chain<T>>>, x: &T) -> bool {
 }
 
 pub fn iter<T>(c: &Option<Rc<Chain<T>>>) -> Iter<'_, T> {
-    Iter {
-        cur: c.as_deref(),
-    }
+    Iter { cur: c.as_deref() }
 }
 
-pub fn remove<T: PartialEq + Clone>(
-    c: &Option<Rc<Chain<T>>>,
-    x: &T,
-) -> Option<Rc<Chain<T>>> {
+pub fn remove<T: PartialEq + Clone>(c: &Option<Rc<Chain<T>>>, x: &T) -> Option<Rc<Chain<T>>> {
     match c {
         Some(n) => n.remove(x),
         None => None,

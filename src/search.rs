@@ -43,7 +43,7 @@ pub struct SearchContext<'a> {
     /// Types of fresh variables allocated per step for universally-quantified
     /// effect instances (the renamed forall parameters in `make_link`/`separate`).
     /// Keyed by step id; each fresh variable has index `action.var_types.len() +
-    /// position`. Replaces VHPOP's global `TermTable::add_variable`.
+    /// position`.
     fresh_vars: RefCell<FastMap<usize, Vec<Type>>>,
     /// The constant base of the SAS⁺ causal-link compilation (the ground original
     /// actions + their facts), built lazily on first use. Reused across every
@@ -270,7 +270,11 @@ impl<'a> SearchContext<'a> {
             .collect();
         let mut object_by_name: HashMap<String, Object> = HashMap::new();
         for (o, _) in self.domain.constants.owned_objects() {
-            let n = self.domain.constants.object_name(None, o).to_ascii_lowercase();
+            let n = self
+                .domain
+                .constants
+                .object_name(None, o)
+                .to_ascii_lowercase();
             object_by_name.insert(n, o);
         }
         for (o, _) in self.problem.objects.owned_objects() {
@@ -295,8 +299,7 @@ impl<'a> SearchContext<'a> {
             let Some(schema) = schema_by_name.get(action) else {
                 continue;
             };
-            let args: Option<Vec<Object>> =
-                toks.map(|t| object_by_name.get(t).copied()).collect();
+            let args: Option<Vec<Object>> = toks.map(|t| object_by_name.get(t).copied()).collect();
             let Some(args) = args else { continue };
             if args.len() != schema.parameters.len() {
                 continue;
@@ -396,7 +399,7 @@ impl<'a> SearchContext<'a> {
     /// Allocates a fresh variable scoped to `step_id` with type `ty`, used for a
     /// universally-quantified effect instance (the renamed forall parameter).
     /// Its index lies past the step's action parameters; [`var_type`] resolves it
-    /// via `fresh_vars`. Replaces VHPOP's global `TermTable::add_variable`.
+    /// via `fresh_vars`.
     pub fn fresh_forall_var(&self, step_id: usize, ty: Type) -> Variable {
         let base = self
             .step_var_types
@@ -681,7 +684,10 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
         alg,
         SearchAlgorithm::Gbfs | SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
     );
-    let is_lazy = matches!(alg, SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual);
+    let is_lazy = matches!(
+        alg,
+        SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
+    );
     let is_dual = alg == SearchAlgorithm::LazyGbfsDual;
     // ALT: eager dual-queue alternation. Children are ranked under both the A*
     // ordering (primary queue) and the GBFS ordering (secondary queue);
@@ -782,9 +788,7 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                         false,
                     )
                 } else if is_lazy {
-                    if prune_unreachable
-                        && has_unreachable_new_open_cond(ctx, &plan, &new_plan)
-                    {
+                    if prune_unreachable && has_unreachable_new_open_cond(ctx, &plan, &new_plan) {
                         ctx.pruned.set(ctx.pruned.get() + 1);
                         continue;
                     }
@@ -815,9 +819,7 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                 };
 
                 let primary = rank[0];
-                if primary.is_finite()
-                    && generated_plans[cfo] < ctx.params.search_limits[cfo]
-                {
+                if primary.is_finite() && generated_plans[cfo] < ctx.params.search_limits[cfo] {
                     if is_ida && primary > f_limit {
                         next_f_limit = next_f_limit.min(primary);
                         continue;
@@ -852,8 +854,8 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
 
             // Time to switch flaw orders? (limit reached, or this order has had
             // its turn of `next_switch` generated plans).
-            let order_limit_reached = generated_plans[current_flaw_order]
-                >= ctx.params.search_limits[current_flaw_order];
+            let order_limit_reached =
+                generated_plans[current_flaw_order] >= ctx.params.search_limits[current_flaw_order];
             if order_limit_reached || generated_plans[current_flaw_order] >= next_switch {
                 if order_limit_reached {
                     limit_reached = true;
@@ -919,9 +921,7 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                                     (current_plan, current_rank0) = pop_next(
                                         &mut queues[current_flaw_order],
                                         if is_dual || is_alt {
-                                            Some(
-                                                &mut secondary_queues[current_flaw_order],
-                                            )
+                                            Some(&mut secondary_queues[current_flaw_order])
                                         } else {
                                             None
                                         },
@@ -962,9 +962,7 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
     }
 
     if stats {
-        eprintln!(
-            "Plans generated: {num_generated_plans}\nPlans visited: {num_visited_plans}"
-        );
+        eprintln!("Plans generated: {num_generated_plans}\nPlans visited: {num_visited_plans}");
     }
 
     let search_stats = SearchStats {
@@ -1060,9 +1058,7 @@ fn instantiate_step_list(
             true,
         )];
         if let Some(nb) = bindings.add(&ctx.type_ctx(), &bl, false) {
-            if let Some(result) =
-                instantiate_step_list(ctx, steps, step_idx, param_idx + 1, nb)
-            {
+            if let Some(result) = instantiate_step_list(ctx, steps, step_idx, param_idx + 1, nb) {
                 return Some(result);
             }
         }

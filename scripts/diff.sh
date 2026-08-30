@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Differential test helper: run the C++ reference vhpop and the Potoroo port on the
-# same inputs/flags and diff their stdout (ignoring the nondeterministic
+# Differential test helper: run the reference planner and Potoroo on the same
+# inputs/flags and diff their stdout (ignoring the nondeterministic
 # "Time:" line). Exit 0 if identical.
 #
 # Usage: diff.sh <domain.pddl> <problem.pddl> [potoroo flags...]
 #
 # Env:
-#   REF_VHPOP      path to the C++ reference binary (default: ../../vhpop)
 #   RUST_POTOROO   path to the Potoroo binary (default: ../target/debug/potoroo)
 set -u
 

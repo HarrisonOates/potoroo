@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use potoroo::domain::Domain;
-use potoroo::params::{ActionCost, Parameters, SearchAlgorithm};
 use potoroo::heuristics::{FlawSelectionOrder, Heuristic};
+use potoroo::params::{ActionCost, Parameters, SearchAlgorithm};
 use potoroo::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
 use potoroo::problem::Problem;
 use potoroo::search::{format_steps, plan_with_stats, Outcome, SearchContext};
@@ -33,6 +33,10 @@ fn main() -> ExitCode {
 /// Parsed command-line configuration.
 struct Cli {
     params: Parameters,
+    /// Selects ground POCL over Fast Downward's multi-valued SAS+ task. Search
+    /// algorithms, heuristics, flaw orders, weights, and limits still come from
+    /// `params`.
+    fdr_pocl: bool,
     verbosity: u32,
     files: Vec<String>,
     /// Raw `-h` value as given on the command line (default `UCPOP`). Only used
@@ -64,10 +68,7 @@ fn run() -> Result<ExitCode, String> {
     } else {
         let mut v = Vec::new();
         for f in &cli.files {
-            v.push(
-                std::fs::read_to_string(f)
-                    .map_err(|e| format!("error reading {f}: {e}"))?,
-            );
+            v.push(std::fs::read_to_string(f).map_err(|e| format!("error reading {f}: {e}"))?);
         }
         v
     };
@@ -100,6 +101,64 @@ fn run() -> Result<ExitCode, String> {
         println!(";{}", problem.name);
         let timer = Instant::now();
         let ctx = SearchContext::new(domain, problem, &cli.params);
+        if cli.fdr_pocl {
+            let task = potoroo::fdr_pocl::translate(&ctx).map_err(|e| e.to_string())?;
+            if cli.verbosity > 0 {
+                eprintln!(
+                    "SAS+ task: {} variables ({} multi-valued), {} facts, {} operators",
+                    task.variables.len(),
+                    task.multi_valued_variables(),
+                    task.num_facts(),
+                    task.operators.len()
+                );
+            }
+            let (outcome, stats) = potoroo::fdr_pocl::solve_with_params(&task, &cli.params)
+                .map_err(|e| e.to_string())?;
+            let (solved, plan_len) = match outcome {
+                potoroo::fdr_pocl::Outcome::Solved(solution) => {
+                    if cli.verbosity > 0 {
+                        eprintln!("Number of steps: {}", solution.operators.len());
+                    }
+                    println!("{}", solution.format(&task));
+                    (true, solution.operators.len())
+                }
+                potoroo::fdr_pocl::Outcome::LimitReached => {
+                    println!("no plan");
+                    println!(";Search limit reached.");
+                    (false, 0)
+                }
+                potoroo::fdr_pocl::Outcome::NoSolution => {
+                    println!("no plan");
+                    println!(";Problem has no solution.");
+                    (false, 0)
+                }
+            };
+            let ms = timer.elapsed().as_millis();
+            println!("Time: {ms}");
+            if std::env::var_os("POTOROO_STATS_JSON").is_some() {
+                let label = format!("FDR:{}({})", cli.algorithm_name, cli.heuristic_name);
+                eprintln!(
+                    "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":true,\
+                     \"solved\":{},\"plan_len\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
+                     \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
+                     \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{}}}",
+                    json_escape(&problem.name),
+                    json_escape(&label),
+                    solved,
+                    plan_len,
+                    stats.nodes_generated,
+                    stats.nodes_visited,
+                    ms,
+                    stats.h_evals,
+                    stats.h_eval_ms,
+                    stats.pruned,
+                    stats.max_steps,
+                    stats.max_open_conditions,
+                    stats.max_threats,
+                );
+            }
+            continue;
+        }
         let (outcome, stats) = plan_with_stats(&ctx);
         let (solved, plan_len) = match &outcome {
             Outcome::Solved(p) => {
@@ -169,11 +228,12 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// Hand-rolled getopt-style parser matching `vhpop.cc`'s option set. Returns
+/// Hand-rolled getopt-style parser for Potoroo's command-line options. Returns
 /// `None` if `-H`/`-V` handled output and the program should exit.
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String> {
     let mut params = Parameters::default();
     let mut verbosity = 0u32;
+    let mut fdr_pocl = false;
     let mut files = Vec::new();
     let mut heuristic_name = String::from("UCPOP");
     let mut algorithm_name = String::from("A");
@@ -247,6 +307,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 flaw_orders.push(FlawSelectionOrder::parse(&v)?);
             }
+            "P" => fdr_pocl = true,
             "g" => params.ground_actions = true,
             "h" => {
                 let v = required_value!();
@@ -261,9 +322,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 search_limits.push(parse_limit(&v)?);
             }
-            "r" => {
-                return Err("-r (random open conditions) is not yet supported".to_string())
-            }
+            "r" => return Err("-r (random open conditions) is not yet supported".to_string()),
             "S" => {
                 let _ = required_value!(); // seed; only relevant with -r
             }
@@ -280,9 +339,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             }
             "v" => {
                 verbosity = match inline {
-                    Some(v) => v
-                        .parse()
-                        .map_err(|_| format!("invalid verbosity `{v}`"))?,
+                    Some(v) => v.parse().map_err(|_| format!("invalid verbosity `{v}`"))?,
                     None => 1,
                 };
             }
@@ -295,9 +352,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             }
             "w" => {
                 let v = required_value!();
-                params.weight = v
-                    .parse()
-                    .map_err(|_| format!("invalid weight `{v}`"))?;
+                params.weight = v.parse().map_err(|_| format!("invalid weight `{v}`"))?;
             }
             other => return Err(format!("unknown option `-{other}`")),
         }
@@ -306,7 +361,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
 
     if !flaw_orders.is_empty() {
         params.flaw_orders = flaw_orders;
-    } else if !params.ground_actions && params.heuristic.needs_planning_graph() {
+    } else if !fdr_pocl && !params.ground_actions && params.heuristic.needs_planning_graph() {
         // Lifted planning-graph runs: resolve static open conditions first.
         // Statics only link to init, so handling them early commits variable
         // bindings cheaply and makes the planning-graph heuristic informative
@@ -324,9 +379,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         let pad = params.search_limits.last().copied().unwrap_or(usize::MAX);
         params.search_limits.push(pad);
     }
+    if !fdr_pocl && params.heuristic.requires_fdr_pocl() {
+        return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
+    }
 
     Ok(Some(Cli {
         params,
+        fdr_pocl,
         verbosity,
         files,
         heuristic_name,
@@ -340,6 +399,7 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "action-cost" => "a",
         "domain-constraints" => "d",
         "flaw-order" => "f",
+        "fdr-pocl" => "P",
         "ground-actions" => "g",
         "heuristic" => "h",
         "help" => "H",
@@ -385,8 +445,7 @@ fn parse_limit(v: &str) -> Result<usize, String> {
     if v.eq_ignore_ascii_case("unlimited") {
         Ok(usize::MAX)
     } else {
-        v.parse()
-            .map_err(|_| format!("invalid search limit `{v}`"))
+        v.parse().map_err(|_| format!("invalid search limit `{v}`"))
     }
 }
 
@@ -397,6 +456,7 @@ fn print_help() {
          Options (classical subset):\n\
          \x20 -a, --action-cost=COST     action cost: UNIT, DURATION, RELATIVE\n\
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default UCPOP)\n\
+         \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default UCPOP)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\

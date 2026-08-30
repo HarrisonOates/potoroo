@@ -28,7 +28,12 @@ pub struct Ordering {
 }
 
 impl Ordering {
-    pub fn new(before_id: usize, before_time: StepTime, after_id: usize, after_time: StepTime) -> Self {
+    pub fn new(
+        before_id: usize,
+        before_time: StepTime,
+        after_id: usize,
+        after_time: StepTime,
+    ) -> Self {
         Ordering {
             before_id,
             before_time,
@@ -137,22 +142,22 @@ impl BinaryOrderings {
     /// `self` when the ordering is already implied or trivially redundant.
     /// Returns `None` if the ordering is inconsistent (would create a cycle).
     pub fn refine(self: &Rc<Self>, new_ordering: Ordering) -> Option<Rc<BinaryOrderings>> {
-        if new_ordering.before_id != 0
-            && new_ordering.after_id != GOAL_ID
-            && self.possibly_not_before(
-                new_ordering.before_id,
-                new_ordering.before_time,
-                new_ordering.after_id,
-                new_ordering.after_time,
-            )
-        {
-            let mut orderings = (**self).clone();
-            orderings.fill_transitive(new_ordering);
-            Some(Rc::new(orderings))
-        } else {
-            // Either trivially satisfied (init before / before goal), or already implied.
-            Some(self.clone())
+        let before = new_ordering.before_id;
+        let after = new_ordering.after_id;
+
+        if before == after || before == GOAL_ID || after == 0 {
+            return None;
         }
+        if before == 0 || after == GOAL_ID || self.ordered_before(before, after) {
+            return Some(self.clone());
+        }
+        if self.ordered_before(after, before) {
+            return None;
+        }
+
+        let mut orderings = (**self).clone();
+        orderings.fill_transitive(new_ordering);
+        Some(Rc::new(orderings))
     }
 
     /// Returns the ordering collection accounting for a freshly added step plus
@@ -248,5 +253,49 @@ impl BinaryOrderings {
         }
         start_times.insert(step_id, sd);
         sd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refine_rejects_a_reverse_ordering() {
+        let orderings = Rc::new(BinaryOrderings::new())
+            .refine_with_step(
+                Ordering::new(1, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                1,
+            )
+            .unwrap()
+            .refine_with_step(Ordering::new(1, StepTime::AtEnd, 2, StepTime::AtStart), 2)
+            .unwrap();
+
+        assert!(orderings
+            .refine(Ordering::new(2, StepTime::AtEnd, 1, StepTime::AtStart))
+            .is_none());
+    }
+
+    #[test]
+    fn refine_accepts_redundant_and_unordered_constraints() {
+        let orderings = Rc::new(BinaryOrderings::new())
+            .refine_with_step(
+                Ordering::new(1, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                1,
+            )
+            .unwrap()
+            .refine_with_step(
+                Ordering::new(2, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                2,
+            )
+            .unwrap();
+        let refined = orderings
+            .refine(Ordering::new(1, StepTime::AtEnd, 2, StepTime::AtStart))
+            .unwrap();
+        let redundant = refined
+            .refine(Ordering::new(1, StepTime::AtEnd, 2, StepTime::AtStart))
+            .unwrap();
+
+        assert!(Rc::ptr_eq(&refined, &redundant));
     }
 }

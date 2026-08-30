@@ -93,9 +93,9 @@ pub enum FdError {
     /// A temp-file I/O error while preparing the PDDL inputs.
     #[error("I/O error preparing Fast Downward inputs: {0}")]
     Io(#[from] std::io::Error),
-    /// Fast Downward ran but we could not find the initial heuristic value in its
-    /// output. The captured output is included for diagnosis.
-    #[error("could not parse initial heuristic value from Fast Downward output")]
+    /// Fast Downward ran but its expected heuristic/SAS+ output was unavailable.
+    /// The captured process output is included for diagnosis.
+    #[error("could not parse Fast Downward output:\n{output}")]
     ParseFailure { output: String },
 }
 
@@ -219,7 +219,11 @@ fn spawn_h_server(heur: FdHeuristic) -> Result<HServer, FdError> {
         .map_err(|source| FdError::Spawn { path, source })?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-    Ok(HServer { child, stdin, stdout })
+    Ok(HServer {
+        child,
+        stdin,
+        stdout,
+    })
 }
 
 /// One request/response against a (possibly freshly spawned) server process.
@@ -314,8 +318,7 @@ pub fn run_downward_sas(sas: &str, heur: FdHeuristic) -> Result<HResult, FdError
         return Ok(v);
     }
 
-    let dir = unique_tmp_dir();
-    std::fs::create_dir_all(&dir)?;
+    let dir = create_unique_tmp_dir()?;
     let plan_path = dir.join("sas_plan");
     let path = downward_path();
     let search = format!("astar({})", heur.evaluator());
@@ -363,8 +366,7 @@ pub fn run_downward_sas(sas: &str, heur: FdHeuristic) -> Result<HResult, FdError
 /// (later) step; this is the plumbing.
 pub fn run_fd_translate(domain_pddl: &str, problem_pddl: &str) -> Result<String, FdError> {
     use std::io::Write;
-    let dir = unique_tmp_dir();
-    std::fs::create_dir_all(&dir)?;
+    let dir = create_unique_tmp_dir()?;
     let domain_path = dir.join("domain.pddl");
     let problem_path = dir.join("problem.pddl");
     let sas_path = dir.join("output.sas");
@@ -401,16 +403,11 @@ pub fn run_fd_translate(domain_pddl: &str, problem_pddl: &str) -> Result<String,
 
 /// Writes the PDDL to a unique temp directory, runs Fast Downward there, returns
 /// captured stdout+stderr. The temp directory is removed afterwards.
-fn invoke_fd(
-    domain_pddl: &str,
-    problem_pddl: &str,
-    heur: FdHeuristic,
-) -> Result<String, FdError> {
+fn invoke_fd(domain_pddl: &str, problem_pddl: &str, heur: FdHeuristic) -> Result<String, FdError> {
     use std::io::Write;
 
-    // Unique scratch directory (pid + a monotonically increasing counter).
-    let dir = unique_tmp_dir();
-    std::fs::create_dir_all(&dir)?;
+    // Unique scratch directory, atomically claimed across concurrent processes.
+    let dir = create_unique_tmp_dir()?;
     let domain_path = dir.join("domain.pddl");
     let problem_path = dir.join("problem.pddl");
     let sas_path = dir.join("output.sas");
@@ -476,7 +473,9 @@ pub fn parse_initial_h(output: &str, heur: FdHeuristic) -> Option<HResult> {
             continue;
         };
         // rest looks like "<name>: <value>"
-        let Some(colon) = rest.find(':') else { continue };
+        let Some(colon) = rest.find(':') else {
+            continue;
+        };
         let name = rest[..colon].trim();
         let value = rest[colon + 1..].trim();
         let parsed = parse_h_value(value)?;
@@ -516,12 +515,19 @@ fn parse_h_value(s: &str) -> Option<HResult> {
     tok.parse::<f32>().ok().map(HResult::Finite)
 }
 
-fn unique_tmp_dir() -> std::path::PathBuf {
+fn create_unique_tmp_dir() -> std::io::Result<std::path::PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("potoroo-fd-{pid}-{n}"))
+    loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("potoroo-fd-{pid}-{n}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -565,7 +571,10 @@ New best heuristic value for lmcut: 5
     #[test]
     fn parses_infinity() {
         let out = "Initial heuristic value for ff: infinity\n";
-        assert_eq!(parse_initial_h(out, FdHeuristic::Ff), Some(HResult::Infinite));
+        assert_eq!(
+            parse_initial_h(out, FdHeuristic::Ff),
+            Some(HResult::Infinite)
+        );
     }
 
     #[test]
@@ -580,7 +589,10 @@ New best heuristic value for lmcut: 5
     #[test]
     fn unsolvable_without_value_is_infinite() {
         let out = "Building causal graph...\nCompletely explored state space -- no solution!\n";
-        assert_eq!(parse_initial_h(out, FdHeuristic::Ff), Some(HResult::Infinite));
+        assert_eq!(
+            parse_initial_h(out, FdHeuristic::Ff),
+            Some(HResult::Infinite)
+        );
     }
 
     #[test]

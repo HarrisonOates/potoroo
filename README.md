@@ -96,7 +96,41 @@ potoroo -h COMPILE_LMCUT -g examples/gripper-domain.pddl examples/gripper-4.pddl
 
 # Compose two heuristics (lexicographic tiebreaking)
 potoroo -h "UCPOP/ADD" examples/logistics-domain.pddl examples/logistics-a.pddl
+
+# Ground POCL search directly over Fast Downward's SAS+ variables
+potoroo --fdr-pocl -v examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
 ```
+
+### Finite-domain ground POCL
+
+`--fdr-pocl` translates the original problem with Fast Downward and retains its
+multi-valued SAS+ variables throughout ground POCL refinement.
+Causal links protect equalities such as `location(truck) = paris`; every effect
+assigning another value to `location(truck)` is treated as a threat, without
+requiring an explicit delete proposition. With `-v`, Potoroo reports how many
+translated variables are genuinely multi-valued.
+
+The finite-domain path consumes the normal search configuration: A*/IDA*/HC,
+BFS, GBFS, lazy/dual-queue GBFS, ALT, search weights and limits, and the
+flaw-order DSL. Cheap structural heuristics, `ADD`/`ADDR`, joint FF-style
+`RELAX`/`RELAXR` extraction, and native `LMCUT`/`LMCUTR` (including composed
+ranks) are implemented directly over finite-domain facts. It currently uses
+unit action costs, rejects SAS+ axioms/derived variables and the
+representation-specific `SAMPLE_FF`, `LPLAN`, and `COMPILE*` heuristics, and
+conservatively treats conditional assignments as potential threats. Native
+LM-cut currently requires unconditional SAS+ effects.
+
+| Native FDR heuristic | Description |
+|------|-------------|
+| `LMCUT` | Joint LM-cut estimate for all open conditions, starting from the problem initial state |
+| `LMCUTR` | Reuse-aware LM-cut: committed-step effects are free; an admissible lower bound on additional steps under unit costs |
+
+These are direct POCL open-condition relaxations and are distinct from
+`COMPILE_LMCUT`, which evaluates LM-cut on the causal-link compilation.
+
+For resource-shuttling problems, `-s ALT -h ADD` is generally more robust than
+pure GBFS: ALT interleaves greedy `h_add` guidance with total estimated plan
+cost, avoiding low-heuristic plateaus caused by repeated vehicle transitions.
 
 ### Output
 
@@ -126,6 +160,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 |------|-----------|----------|-------------|---------|
 | `-a` | `--action-cost` | `UNIT`\|`DURATION`\|`RELATIVE` | Action cost model | `UNIT` |
 | `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `UCPOP` |
+| — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
 | `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `UCPOP` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
@@ -256,4 +291,3 @@ Potoroo builds on the following work:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
-

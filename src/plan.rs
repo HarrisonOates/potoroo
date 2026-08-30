@@ -5,9 +5,8 @@
 //! A [`Plan`] is an immutable node sharing its step/link/unsafe/open-condition
 //! collections (persistent [`Chain`]s) with its parent, plus an
 //! [`Rc<BinaryOrderings>`] and [`Rc<Bindings>`]. Refinement selects one flaw and
-//! produces zero or more child plans. The refinement order and plan-id
-//! assignment are kept identical to VHPOP's, because they determine which
-//! optimal plan A* returns.
+//! produces zero or more child plans. Refinement order and plan-id assignment
+//! are deterministic because they determine which optimal plan A* returns.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -487,9 +486,9 @@ impl Plan {
         after_time: StepTime,
         unsafe_: &Unsafe,
     ) {
-        if let Some(new_orderings) = self
-            .orderings
-            .refine(Ordering::new(before_id, before_time, after_id, after_time))
+        if let Some(new_orderings) =
+            self.orderings
+                .refine(Ordering::new(before_id, before_time, after_id, after_time))
         {
             plans.push(Plan::new(
                 self.steps.clone(),
@@ -645,12 +644,10 @@ impl Plan {
         let gt = open_cond.when.start_time();
         for sc in chain::iter(&self.steps) {
             let step = sc.clone();
-            if self.orderings.possibly_before(
-                step.id,
-                StepTime::AtStart,
-                open_cond.step_id,
-                gt,
-            ) {
+            if self
+                .orderings
+                .possibly_before(step.id, StepTime::AtStart, open_cond.step_id, gt)
+            {
                 for (action, effect_idx) in achievers {
                     if Rc::ptr_eq(action, &step.action) {
                         let effect = action.effects[*effect_idx].clone();
@@ -992,7 +989,12 @@ impl Plan {
             unsafe_.step_id,
             true,
         );
-        if added && self.bindings.add(&ctx.type_ctx(), &new_bindings, true).is_some() {
+        if added
+            && self
+                .bindings
+                .add(&ctx.type_ctx(), &new_bindings, true)
+                .is_some()
+        {
             1
         } else {
             0
@@ -1102,15 +1104,15 @@ impl Plan {
         };
         let gt = open_cond.when.end_time();
         for s in chain::iter(&self.steps) {
-            if self.orderings.possibly_not_before(
-                open_cond.step_id,
-                gt,
-                s.id,
-                StepTime::AtStart,
-            ) {
+            if self
+                .orderings
+                .possibly_not_before(open_cond.step_id, gt, s.id, StepTime::AtStart)
+            {
                 for effect in s.action.effects.iter() {
                     let et = StepTime::AtEnd;
-                    if self.orderings.possibly_not_before(open_cond.step_id, gt, s.id, et)
+                    if self
+                        .orderings
+                        .possibly_not_before(open_cond.step_id, gt, s.id, et)
                         && self.bindings.affects(
                             &ctx.type_ctx(),
                             &effect.literal,
@@ -1149,8 +1151,7 @@ impl Plan {
             }
             r += *addable;
             if r <= limit {
-                if *reusable < 0
-                    && !self.reusable_steps(ctx, reusable, &literal, open_cond, limit)
+                if *reusable < 0 && !self.reusable_steps(ctx, reusable, &literal, open_cond, limit)
                 {
                     return false;
                 }
@@ -1436,17 +1437,18 @@ pub fn link_threats(
                             s.id,
                             &link.condition,
                             link.to_id,
-                        ) {
-                            *unsafes = chain::cons(
-                                Unsafe {
-                                    link: link.clone(),
-                                    step_id: s.id,
-                                    effect: e.clone(),
-                                },
-                                unsafes.clone(),
-                            );
-                            *num_unsafes += 1;
-                        }
+                        )
+                    {
+                        *unsafes = chain::cons(
+                            Unsafe {
+                                link: link.clone(),
+                                step_id: s.id,
+                                effect: e.clone(),
+                            },
+                            unsafes.clone(),
+                        );
+                        *num_unsafes += 1;
+                    }
                 }
             }
         }
@@ -1486,17 +1488,18 @@ pub fn step_threats(
                             step.id,
                             &l.condition,
                             l.to_id,
-                        ) {
-                            *unsafes = chain::cons(
-                                Unsafe {
-                                    link: l.clone(),
-                                    step_id: step.id,
-                                    effect: e.clone(),
-                                },
-                                unsafes.clone(),
-                            );
-                            *num_unsafes += 1;
-                        }
+                        )
+                    {
+                        *unsafes = chain::cons(
+                            Unsafe {
+                                link: l.clone(),
+                                step_id: step.id,
+                                effect: e.clone(),
+                            },
+                            unsafes.clone(),
+                        );
+                        *num_unsafes += 1;
+                    }
                 }
             }
         }

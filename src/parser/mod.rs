@@ -1,8 +1,7 @@
 //! PDDL parsing front-end.
 //!
-//! Rather than porting VHPOP's bison/flex grammar (`pddl.yy`/`tokens.ll`), we use
-//! the [`pddl`](https://crates.io/crates/pddl) crate to produce a strongly-typed
-//! AST and lower it into our internal model in [`lower`].
+//! The [`pddl`](https://crates.io/crates/pddl) crate produces a strongly-typed
+//! AST, which is lowered into Potoroo's internal model in [`lower`].
 
 pub mod lower;
 pub mod read;

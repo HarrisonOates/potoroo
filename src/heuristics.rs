@@ -12,7 +12,7 @@ use crate::search::SearchContext;
 
 /// A plan-ranking heuristic value. `MAKESPAN` (temporal) is deferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HVal {
+pub(crate) enum HVal {
     Lifo,
     Fifo,
     Oc,
@@ -31,6 +31,11 @@ enum HVal {
     /// action; `RelaxR` reuses existing plan steps (counts only new actions).
     Relax,
     RelaxR,
+    /// Native LM-cut over the FDR POCL open-condition relaxation. `LmCut`
+    /// starts from the problem initial state; `LmCutR` also treats effects of
+    /// committed steps as initially available. FDR POCL search only.
+    LmCut,
+    LmCutR,
     /// Sample-FF heuristic (Bercher et al. 2013): keep the committed plan steps
     /// non-relaxed and fill the gaps between them with delete relaxation, over
     /// `usize` sampled linearizations of the partial order. Ground search only.
@@ -118,11 +123,11 @@ impl Heuristic {
                     needs_pg = true;
                     HVal::RelaxR
                 }
+                "LMCUT" | "LM-CUT" => HVal::LmCut,
+                "LMCUTR" | "LM-CUTR" => HVal::LmCutR,
                 "LPLAN" => HVal::Lplan,
                 "MAKESPAN" => {
-                    return Err(
-                        "heuristic `MAKESPAN` is temporal and not yet supported".to_string()
-                    )
+                    return Err("heuristic `MAKESPAN` is temporal and not yet supported".to_string())
                 }
                 other => return Err(format!("invalid heuristic `{other}`")),
             };
@@ -133,6 +138,21 @@ impl Heuristic {
 
     pub fn needs_planning_graph(&self) -> bool {
         self.needs_pg
+    }
+
+    /// Whether this ranking contains a heuristic defined only for native FDR
+    /// POCL nodes rather than the literal partial-plan representation.
+    pub fn requires_fdr_pocl(&self) -> bool {
+        self.h
+            .iter()
+            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR))
+    }
+
+    /// Parsed ranking terms for alternate plan representations. Keeping the
+    /// syntax in one place lets ground finite-domain search consume exactly the
+    /// same `-h` configuration without translating SAS+ facts back to literals.
+    pub(crate) fn terms(&self) -> &[HVal] {
+        &self.h
     }
 
     /// Fills `rank` with the heuristic ranks for `plan`. Lower is better.
@@ -329,6 +349,9 @@ impl Heuristic {
                         }
                     }
                 }
+                HVal::LmCut | HVal::LmCutR => {
+                    unreachable!("native LMCUT/LMCUTR requires FDR POCL search")
+                }
                 // Delegating heuristics carry no separable g component; both
                 // ranks use the same value, computed once.
                 HVal::SampleFf(k) => {
@@ -417,7 +440,7 @@ fn saturating_sum(n: i32, m: i32) -> i32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrderType {
+pub(crate) enum OrderType {
     Lifo,
     Fifo,
     Random,
@@ -445,18 +468,18 @@ enum RankHeuristic {
 }
 
 #[derive(Debug, Clone)]
-struct SelectionCriterion {
-    non_separable: bool,
-    separable: bool,
-    open_cond: bool,
-    local_open_cond: bool,
-    static_open_cond: bool,
-    unsafe_open_cond: bool,
+pub(crate) struct SelectionCriterion {
+    pub(crate) non_separable: bool,
+    pub(crate) separable: bool,
+    pub(crate) open_cond: bool,
+    pub(crate) local_open_cond: bool,
+    pub(crate) static_open_cond: bool,
+    pub(crate) unsafe_open_cond: bool,
     /// `i32::MAX` means unlimited.
-    max_refinements: i32,
-    order: OrderType,
+    pub(crate) max_refinements: i32,
+    pub(crate) order: OrderType,
     heuristic: RankHeuristic,
-    reuse: bool,
+    pub(crate) reuse: bool,
 }
 
 /// A flaw-selection order: a sequence of selection criteria.
@@ -614,8 +637,7 @@ impl FlawSelectionOrder {
                         if at(pos) == b',' || at(pos) == b'}' {
                             if !c.open_cond {
                                 c.local_open_cond = true;
-                                if order.first_open_cond_criterion
-                                    > order.last_open_cond_criterion
+                                if order.first_open_cond_criterion > order.last_open_cond_criterion
                                 {
                                     order.first_open_cond_criterion = idx;
                                 }
@@ -630,8 +652,7 @@ impl FlawSelectionOrder {
                         if at(pos) == b',' || at(pos) == b'}' {
                             if !c.open_cond {
                                 c.static_open_cond = true;
-                                if order.first_open_cond_criterion
-                                    > order.last_open_cond_criterion
+                                if order.first_open_cond_criterion > order.last_open_cond_criterion
                                 {
                                     order.first_open_cond_criterion = idx;
                                 }
@@ -646,8 +667,7 @@ impl FlawSelectionOrder {
                         if at(pos) == b',' || at(pos) == b'}' {
                             if !c.open_cond {
                                 c.unsafe_open_cond = true;
-                                if order.first_open_cond_criterion
-                                    > order.last_open_cond_criterion
+                                if order.first_open_cond_criterion > order.last_open_cond_criterion
                                 {
                                     order.first_open_cond_criterion = idx;
                                 }
@@ -670,7 +690,7 @@ impl FlawSelectionOrder {
                 }
             }
             pos += 1; // consume '}'
-            // Optional max-refinements integer.
+                      // Optional max-refinements integer.
             let mut next_pos = pos;
             while at(next_pos).is_ascii_digit() {
                 next_pos += 1;
@@ -758,12 +778,14 @@ impl FlawSelectionOrder {
         self.needs_pg
     }
 
-    pub fn select(
-        &self,
-        plan: &Plan,
-        ctx: &SearchContext,
-        pg: Option<&PlanningGraph>,
-    ) -> Flaw {
+    /// Parsed criteria for search representations that implement their own
+    /// flaw objects. SAS+ threats are ground and therefore non-separable, but
+    /// the ordering and refinement-count rules are otherwise shared.
+    pub(crate) fn criteria(&self) -> &[SelectionCriterion] {
+        &self.selection_criteria
+    }
+
+    pub fn select(&self, plan: &Plan, ctx: &SearchContext, pg: Option<&PlanningGraph>) -> Flaw {
         let mut selection = FlawSelection {
             flaw: None,
             criterion: i32::MAX as i64,
@@ -827,7 +849,7 @@ impl FlawSelectionOrder {
                 if applies {
                     let within = crit.max_refinements >= 3
                         || plan.unsafe_refinements(
-                                        ctx,
+                            ctx,
                             &mut refinements,
                             &mut separable,
                             &mut promotable,
@@ -889,7 +911,7 @@ impl FlawSelectionOrder {
                             }
                             OrderType::Mr => {
                                 plan.unsafe_refinements(
-                                        ctx,
+                                    ctx,
                                     &mut refinements,
                                     &mut separable,
                                     &mut promotable,
@@ -897,9 +919,7 @@ impl FlawSelectionOrder {
                                     u,
                                     i32::MAX,
                                 );
-                                if c < selection.criterion
-                                    || refinements as f32 > selection.rank
-                                {
+                                if c < selection.criterion || refinements as f32 > selection.rank {
                                     selection.flaw = Some(Flaw::Unsafe(u.clone()));
                                     selection.criterion = c;
                                     selection.rank = refinements as f32;
@@ -963,7 +983,11 @@ impl FlawSelectionOrder {
                     is_static = if oc.is_static(predicates) { 1 } else { 0 };
                 }
                 if crit.unsafe_open_cond && is_unsafe < 0 {
-                    is_unsafe = if plan.unsafe_open_condition(ctx, oc) { 1 } else { 0 };
+                    is_unsafe = if plan.unsafe_open_condition(ctx, oc) {
+                        1
+                    } else {
+                        0
+                    };
                 }
                 let applies = crit.open_cond
                     || (crit.local_open_cond && local)
@@ -1038,9 +1062,7 @@ impl FlawSelectionOrder {
                                     oc,
                                     i32::MAX,
                                 );
-                                if c < selection.criterion
-                                    || refinements as f32 > selection.rank
-                                {
+                                if c < selection.criterion || refinements as f32 > selection.rank {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
                                     selection.rank = refinements as f32;
@@ -1051,13 +1073,7 @@ impl FlawSelectionOrder {
                                 let has_new = if addable < 0 {
                                     match oc.literal() {
                                         Some(literal) => {
-                                            !plan.addable_steps(
-                                                ctx,
-                                                &mut addable,
-                                                &literal,
-                                                oc,
-                                                0,
-                                            )
+                                            !plan.addable_steps(ctx, &mut addable, &literal, oc, 0)
                                         }
                                         None => false,
                                     }
@@ -1106,19 +1122,16 @@ impl FlawSelectionOrder {
                                     OrderType::Lc => {
                                         let rank = h.add_cost();
                                         if c < selection.criterion || rank < selection.rank {
-                                            selection.flaw =
-                                                Some(Flaw::OpenCondition(oc.clone()));
+                                            selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                             selection.criterion = c;
                                             selection.rank = rank;
-                                            last_criterion =
-                                                if rank == 0.0 { c - 1 } else { c };
+                                            last_criterion = if rank == 0.0 { c - 1 } else { c };
                                         }
                                     }
                                     OrderType::Mc => {
                                         let rank = h.add_cost();
                                         if c < selection.criterion || rank > selection.rank {
-                                            selection.flaw =
-                                                Some(Flaw::OpenCondition(oc.clone()));
+                                            selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                             selection.criterion = c;
                                             selection.rank = rank;
                                             last_criterion = c;
@@ -1127,19 +1140,16 @@ impl FlawSelectionOrder {
                                     OrderType::Lw => {
                                         let rank = h.add_work() as f32;
                                         if c < selection.criterion || rank < selection.rank {
-                                            selection.flaw =
-                                                Some(Flaw::OpenCondition(oc.clone()));
+                                            selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                             selection.criterion = c;
                                             selection.rank = rank;
-                                            last_criterion =
-                                                if rank == 0.0 { c - 1 } else { c };
+                                            last_criterion = if rank == 0.0 { c - 1 } else { c };
                                         }
                                     }
                                     OrderType::Mw => {
                                         let rank = h.add_work() as f32;
                                         if c < selection.criterion || rank > selection.rank {
-                                            selection.flaw =
-                                                Some(Flaw::OpenCondition(oc.clone()));
+                                            selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                             selection.criterion = c;
                                             selection.rank = rank;
                                             last_criterion = c;
@@ -1159,9 +1169,13 @@ impl FlawSelectionOrder {
 }
 
 /// Parses the heuristic suffix of an `LC_`/`MC_`/`LW_`/`MW_` order key.
-/// `allow_makespan` is true for LC/MC (which accept MAKESPAN in VHPOP) but
+/// `allow_makespan` is true for LC/MC but
 /// false for LW/MW. Returns `None` on an invalid suffix.
-fn parse_rank_heuristic(suffix: &str, c: &mut SelectionCriterion, allow_makespan: bool) -> Option<()> {
+fn parse_rank_heuristic(
+    suffix: &str,
+    c: &mut SelectionCriterion,
+    allow_makespan: bool,
+) -> Option<()> {
     let s = suffix.to_ascii_lowercase();
     if s == "add" {
         c.heuristic = RankHeuristic::Add;
