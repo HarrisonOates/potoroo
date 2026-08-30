@@ -114,23 +114,24 @@ fn run() -> Result<ExitCode, String> {
             }
             let (outcome, stats) = potoroo::fdr_pocl::solve_with_params(&task, &cli.params)
                 .map_err(|e| e.to_string())?;
-            let (solved, plan_len) = match outcome {
+            let (solved, plan_len, plan_cost) = match outcome {
                 potoroo::fdr_pocl::Outcome::Solved(solution) => {
                     if cli.verbosity > 0 {
                         eprintln!("Number of steps: {}", solution.operators.len());
+                        eprintln!("Plan cost: {}", solution.plan.cost());
                     }
                     println!("{}", solution.format(&task));
-                    (true, solution.operators.len())
+                    (true, solution.operators.len(), solution.plan.cost())
                 }
                 potoroo::fdr_pocl::Outcome::LimitReached => {
                     println!("no plan");
                     println!(";Search limit reached.");
-                    (false, 0)
+                    (false, 0, 0)
                 }
                 potoroo::fdr_pocl::Outcome::NoSolution => {
                     println!("no plan");
                     println!(";Problem has no solution.");
-                    (false, 0)
+                    (false, 0, 0)
                 }
             };
             let ms = timer.elapsed().as_millis();
@@ -139,13 +140,14 @@ fn run() -> Result<ExitCode, String> {
                 let label = format!("FDR:{}({})", cli.algorithm_name, cli.heuristic_name);
                 eprintln!(
                     "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":true,\
-                     \"solved\":{},\"plan_len\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
+                     \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
                     plan_len,
+                    plan_cost,
                     stats.nodes_generated,
                     stats.nodes_visited,
                     ms,
@@ -160,23 +162,24 @@ fn run() -> Result<ExitCode, String> {
             continue;
         }
         let (outcome, stats) = plan_with_stats(&ctx);
-        let (solved, plan_len) = match &outcome {
+        let (solved, plan_len, plan_cost) = match &outcome {
             Outcome::Solved(p) => {
                 if cli.verbosity > 0 {
                     eprintln!("Number of steps: {}", p.num_steps());
+                    eprintln!("Plan cost: {}", p.cost());
                 }
                 println!("{}", format_steps(&ctx, &p));
-                (true, p.num_steps())
+                (true, p.num_steps(), p.cost())
             }
             Outcome::LimitReached => {
                 println!("no plan");
                 println!(";Search limit reached.");
-                (false, 0)
+                (false, 0, 0)
             }
             Outcome::NoSolution => {
                 println!("no plan");
                 println!(";Problem has no solution.");
-                (false, 0)
+                (false, 0, 0)
             }
         };
         let ms = timer.elapsed().as_millis();
@@ -190,13 +193,14 @@ fn run() -> Result<ExitCode, String> {
             let label = format!("{}({})", cli.algorithm_name, cli.heuristic_name);
             eprintln!(
                 "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
-                 \"plan_len\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
+                 \"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
                  \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{}}}",
                 json_escape(&problem.name),
                 json_escape(&label),
                 cli.params.ground_actions,
                 solved,
                 plan_len,
+                plan_cost,
                 stats.nodes_generated,
                 stats.nodes_visited,
                 ms,
@@ -420,6 +424,7 @@ fn long_to_short(name: &str) -> Result<String, String> {
 
 fn parse_action_cost(v: &str) -> Result<ActionCost, String> {
     match v.to_ascii_uppercase().as_str() {
+        "TASK" | "PDDL" => Ok(ActionCost::Task),
         "UNIT" => Ok(ActionCost::Unit),
         "DURATION" => Ok(ActionCost::Duration),
         "RELATIVE" => Ok(ActionCost::Relative),
@@ -454,7 +459,7 @@ fn print_help() {
         "usage: {PACKAGE} [options] [file ...]\n\
          \n\
          Options (classical subset):\n\
-         \x20 -a, --action-cost=COST     action cost: UNIT, DURATION, RELATIVE\n\
+         \x20 -a, --action-cost=COST     action cost: TASK, UNIT, DURATION, RELATIVE\n\
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default UCPOP)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\

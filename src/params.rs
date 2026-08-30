@@ -1,7 +1,7 @@
 //! Planning parameters.
 //!
 //! Only the classical-subset defaults are wired up: A* search, the `UCPOP`
-//! plan-ranking heuristic, the `UCPOP` flaw-selection order, unit action cost,
+//! plan-ranking heuristic, the `UCPOP` flaw-selection order, task action cost,
 //! weight 1, and lifted actions. IDA*/hill-climbing and ground-action toggling
 //! exist as fields; only A* is exercised on the default path.
 
@@ -40,7 +40,9 @@ pub enum SearchAlgorithm {
 /// Action cost model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionCost {
-    /// Every action costs one (the default).
+    /// Use the PDDL/SAS+ operator cost (the default). Costless tasks supply one.
+    Task,
+    /// Every action costs one, ignoring declared task costs.
     Unit,
     /// Durative cost (deferred).
     Duration,
@@ -69,13 +71,24 @@ impl Default for Parameters {
         Parameters {
             search_algorithm: SearchAlgorithm::A,
             heuristic: Heuristic::parse("UCPOP").expect("UCPOP is a valid heuristic"),
-            action_cost: ActionCost::Unit,
+            action_cost: ActionCost::Task,
             weight: 1.0,
             flaw_orders: vec![
                 FlawSelectionOrder::parse("UCPOP").expect("UCPOP is a valid flaw order")
             ],
             search_limits: vec![usize::MAX],
             ground_actions: false,
+        }
+    }
+}
+
+impl ActionCost {
+    /// Resolves a declared task cost under this command-line cost model.
+    pub fn resolve(self, task_cost: usize) -> usize {
+        match self {
+            ActionCost::Task => task_cost,
+            ActionCost::Unit => 1,
+            ActionCost::Duration | ActionCost::Relative => task_cost,
         }
     }
 }

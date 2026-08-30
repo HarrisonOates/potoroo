@@ -1,7 +1,8 @@
 //! Lowering from the `pddl` crate AST to the owned data model in this crate.
 //!
 //! * Requirements are collected, ADL is expanded, and deferred (temporal /
-//!   numeric) requirements are rejected up front.
+//!   general numeric) requirements are rejected up front; restricted PDDL
+//!   action costs are lowered separately.
 //! * Types are declared, then supertypes wired with transitive closure.
 //! * Atoms over an undeclared predicate auto-declare that predicate.
 //! * `=` becomes [`Formula::Equality`]; `(not (= ..))` becomes
@@ -13,10 +14,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use pddl::{
-    AtomicFormula, ConditionalEffect, Domain as PddlDomain, EffectCondition, GoalDefinition,
-    InitElement, Literal as PddlLiteral, PreconditionGoalDefinition, PreferenceGoalDefinition,
-    PrimitiveEffect, Problem as PddlProblem, Requirement, Term as PddlTerm, Type as PddlType,
-    TypedList,
+    AssignOp, AtomicFormula, ConditionalEffect, Domain as PddlDomain, EffectCondition,
+    FluentExpression, FunctionHead, GoalDefinition, InitElement, Literal as PddlLiteral,
+    MetricFluentExpression, PreconditionGoalDefinition, PreferenceGoalDefinition, PrimitiveEffect,
+    Problem as PddlProblem, Requirement, Term as PddlTerm, Type as PddlType, TypedList,
 };
 
 use crate::action::ActionSchema;
@@ -25,7 +26,7 @@ use crate::effect::{Effect, EffectTime};
 use crate::formula::{Atom, Formula, Literal};
 use crate::functions::FunctionTable;
 use crate::predicates::PredicateTable;
-use crate::problem::{Optimization, Problem};
+use crate::problem::{Metric, Problem};
 use crate::requirements::Requirements;
 use crate::terms::{Object, Term, TermTable, Variable};
 use crate::types::{Type, Types, OBJECT};
@@ -43,6 +44,10 @@ pub enum LowerError {
     UnboundVariable(String),
     #[error("numeric/object fluent content is not supported in the classical subset: {0}")]
     UnsupportedFluent(String),
+    #[error("unsupported action-cost expression: {0}")]
+    ActionCost(String),
+    #[error("unsupported optimization metric: expected `minimize (total-cost)`")]
+    UnsupportedMetric,
     #[error("function terms are not supported in the classical subset")]
     FunctionTerm,
     #[error("preferences are not supported in the classical subset")]
@@ -89,10 +94,7 @@ impl<'a> VarScope<'a> {
     /// [`Variable`] of the given type.
     fn declare(&mut self, name: &str, ty: Type) -> Variable {
         let v = self.terms.add_variable(ty);
-        self.frames
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), v);
+        self.frames.last_mut().unwrap().insert(name.to_string(), v);
         v
     }
 
@@ -128,8 +130,8 @@ fn lower_requirements(reqs: &pddl::Requirements) -> Requirements {
             Requirement::DurationInequalities => r.duration_inequalities = true,
             Requirement::ContinuousEffects => r.continuous_effects = true,
             Requirement::TimedInitialLiterals => r.timed_initial_literals = true,
-            // Action costs use numeric fluents under the hood.
-            Requirement::ActionCosts => r.fluents = true,
+            // PDDL action costs are the one supported numeric fragment.
+            Requirement::ActionCosts => r.action_costs = true,
             // Everything else (preferences, constraints, derived predicates,
             // ...) is not part of the classical subset but does not in itself
             // make a domain temporal/numeric; it is rejected lazily if used.
@@ -265,7 +267,8 @@ fn lower_goal(
     objects: Option<&TermTable>,
 ) -> Result<Rc<Formula>, LowerError> {
     match gd {
-        GoalDefinition::AtomicFormula(af) => match lower_atomic(af, preds, scope, consts, objects)? {
+        GoalDefinition::AtomicFormula(af) => match lower_atomic(af, preds, scope, consts, objects)?
+        {
             LoweredAtomic::Atom(a) => Ok(Rc::new(Formula::Atom(a))),
             LoweredAtomic::Equality(l, r) => Ok(Formula::equality(l, r)),
         },
@@ -273,17 +276,13 @@ fn lower_goal(
             PddlLiteral::AtomicFormula(af) => {
                 match lower_atomic(af, preds, scope, consts, objects)? {
                     LoweredAtomic::Atom(a) => Ok(Rc::new(Formula::Atom(a))),
-                    LoweredAtomic::Equality(l, r) => {
-                        Ok(Formula::equality(l, r))
-                    }
+                    LoweredAtomic::Equality(l, r) => Ok(Formula::equality(l, r)),
                 }
             }
             PddlLiteral::NotAtomicFormula(af) => {
                 match lower_atomic(af, preds, scope, consts, objects)? {
                     LoweredAtomic::Atom(a) => Ok(Rc::new(Formula::Negation(a))),
-                    LoweredAtomic::Equality(l, r) => {
-                        Ok(Formula::inequality(l, r))
-                    }
+                    LoweredAtomic::Equality(l, r) => Ok(Formula::inequality(l, r)),
                 }
             }
         },
@@ -327,9 +326,9 @@ fn lower_goal(
             scope.pop();
             Ok(Rc::new(Formula::Forall { params, body: f }))
         }
-        GoalDefinition::FluentComparison(_) => {
-            Err(LowerError::UnsupportedFluent("fluent comparison".to_string()))
-        }
+        GoalDefinition::FluentComparison(_) => Err(LowerError::UnsupportedFluent(
+            "fluent comparison".to_string(),
+        )),
     }
 }
 
@@ -382,13 +381,101 @@ fn lower_primitive_effect(
                 LoweredAtomic::Equality(..) => Err(LowerError::BadEqualityTerm),
             }
         }
-        PrimitiveEffect::AssignNumericFluent(..) => {
-            Err(LowerError::UnsupportedFluent("numeric assignment".to_string()))
-        }
-        PrimitiveEffect::AssignObjectFluent(..) => {
-            Err(LowerError::UnsupportedFluent("object assignment".to_string()))
-        }
+        PrimitiveEffect::AssignNumericFluent(..) => Err(LowerError::UnsupportedFluent(
+            "numeric assignment".to_string(),
+        )),
+        PrimitiveEffect::AssignObjectFluent(..) => Err(LowerError::UnsupportedFluent(
+            "object assignment".to_string(),
+        )),
     }
+}
+
+/// Recognizes the restricted numeric effect admitted by `:action-costs`:
+/// `(increase (total-cost) N)` for a non-negative integral constant `N`.
+fn lower_action_cost_effect(
+    pe: &PrimitiveEffect,
+    enabled: bool,
+    unconditional: bool,
+) -> Result<Option<usize>, LowerError> {
+    let PrimitiveEffect::AssignNumericFluent(op, head, expression) = pe else {
+        return Ok(None);
+    };
+    if !enabled {
+        return Err(LowerError::UnsupportedFluent(
+            "numeric assignment".to_string(),
+        ));
+    }
+    if *op != AssignOp::Increase {
+        return Err(LowerError::ActionCost(
+            "only `increase` is allowed for total-cost".to_string(),
+        ));
+    }
+    let (symbol, no_arguments) = match head {
+        FunctionHead::Simple(symbol) => (symbol, true),
+        FunctionHead::WithTerms(symbol, terms) => (symbol, terms.is_empty()),
+    };
+    if !no_arguments || !s(symbol).eq_ignore_ascii_case("total-cost") {
+        return Err(LowerError::ActionCost(
+            "only the nullary `total-cost` fluent is supported".to_string(),
+        ));
+    }
+    if !unconditional {
+        return Err(LowerError::ActionCost(
+            "total-cost increases must be unconditional and unquantified".to_string(),
+        ));
+    }
+    let FluentExpression::Number(number) = expression else {
+        return Err(LowerError::ActionCost(
+            "the increase must be a numeric constant".to_string(),
+        ));
+    };
+    let value = **number;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return Err(LowerError::ActionCost(
+            "the increase must be a non-negative integer".to_string(),
+        ));
+    }
+    let value = value as u128;
+    if value > usize::MAX as u128 {
+        return Err(LowerError::ActionCost(
+            "the increase exceeds this platform's action-cost range".to_string(),
+        ));
+    }
+    Ok(Some(value as usize))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_effect_item(
+    pe: &PrimitiveEffect,
+    out: &mut Vec<Effect>,
+    preds: &mut PredicateTable,
+    scope: &VarScope,
+    consts: &TermTable,
+    objects: Option<&TermTable>,
+    parameters: &[Variable],
+    condition: &Rc<Formula>,
+    action_costs: bool,
+    cost: &mut usize,
+) -> Result<(), LowerError> {
+    if let Some(increase) = lower_action_cost_effect(
+        pe,
+        action_costs,
+        parameters.is_empty() && condition.tautology(),
+    )? {
+        *cost = cost
+            .checked_add(increase)
+            .ok_or_else(|| LowerError::ActionCost("action cost overflows usize".to_string()))?;
+        return Ok(());
+    }
+    let literal = lower_primitive_effect(pe, preds, scope, consts, objects)?;
+    out.push(Effect {
+        parameters: parameters.to_vec(),
+        condition: condition.clone(),
+        literal,
+        when: EffectTime::AtEnd,
+        link_condition: Rc::new(Formula::True),
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,26 +489,39 @@ fn lower_conditional_effect(
     objects: Option<&TermTable>,
     parameters: &[Variable],
     condition: &Rc<Formula>,
+    action_costs: bool,
+    cost: &mut usize,
 ) -> Result<(), LowerError> {
     match ce {
-        ConditionalEffect::Effect(pe) => {
-            let literal = lower_primitive_effect(pe, preds, scope, consts, objects)?;
-            out.push(Effect {
-                parameters: parameters.to_vec(),
-                condition: condition.clone(),
-                literal,
-                when: EffectTime::AtEnd,
-                link_condition: Rc::new(Formula::True),
-            });
-            Ok(())
-        }
+        ConditionalEffect::Effect(pe) => lower_effect_item(
+            pe,
+            out,
+            preds,
+            scope,
+            consts,
+            objects,
+            parameters,
+            condition,
+            action_costs,
+            cost,
+        ),
         ConditionalEffect::Forall(fa) => {
             scope.push();
             let mut params = parameters.to_vec();
             params.extend(declare_typed_variables(&fa.variables, types, scope)?);
             for inner in fa.effects.iter() {
                 lower_conditional_effect(
-                    inner, out, preds, types, scope, consts, objects, &params, condition,
+                    inner,
+                    out,
+                    preds,
+                    types,
+                    scope,
+                    consts,
+                    objects,
+                    &params,
+                    condition,
+                    action_costs,
+                    cost,
                 )?;
             }
             scope.pop();
@@ -433,25 +533,33 @@ fn lower_conditional_effect(
             let combined = Formula::and(condition.clone(), guard);
             match &w.effect {
                 EffectCondition::Single(pe) => {
-                    let literal = lower_primitive_effect(pe, preds, scope, consts, objects)?;
-                    out.push(Effect {
-                        parameters: parameters.to_vec(),
-                        condition: combined,
-                        literal,
-                        when: EffectTime::AtEnd,
-                        link_condition: Rc::new(Formula::True),
-                    });
+                    lower_effect_item(
+                        pe,
+                        out,
+                        preds,
+                        scope,
+                        consts,
+                        objects,
+                        parameters,
+                        &combined,
+                        action_costs,
+                        cost,
+                    )?;
                 }
                 EffectCondition::All(pes) => {
                     for pe in pes {
-                        let literal = lower_primitive_effect(pe, preds, scope, consts, objects)?;
-                        out.push(Effect {
-                            parameters: parameters.to_vec(),
-                            condition: combined.clone(),
-                            literal,
-                            when: EffectTime::AtEnd,
-                            link_condition: Rc::new(Formula::True),
-                        });
+                        lower_effect_item(
+                            pe,
+                            out,
+                            preds,
+                            scope,
+                            consts,
+                            objects,
+                            parameters,
+                            &combined,
+                            action_costs,
+                            cost,
+                        )?;
                     }
                 }
             }
@@ -561,7 +669,7 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
 
         // Each schema gets its own variable scope.
         let mut term_table = TermTable::new();
-        let (parameters, precondition, effects) = {
+        let (parameters, precondition, effects, cost) = {
             let mut scope = VarScope::new(&mut term_table);
             // Declare schema parameters in the base frame.
             let parameters = declare_typed_variables(action.parameters(), &mut types, &mut scope)?;
@@ -576,6 +684,9 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             )?;
 
             let mut effects = Vec::new();
+            // In an action-cost domain, omitting the total-cost increase means
+            // zero. Ordinary classical actions retain unit cost.
+            let mut cost = if requirements.action_costs { 0 } else { 1 };
             if let Some(effs) = action.effect() {
                 let no_params: Vec<Variable> = Vec::new();
                 let truth = Rc::new(Formula::True);
@@ -590,12 +701,14 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
                         None,
                         &no_params,
                         &truth,
+                        requirements.action_costs,
+                        &mut cost,
                     )?;
                 }
             }
             // Compute effect link conditions (e.g. move's (not (= ?from ?to))).
             crate::effect::strengthen_effects(&mut effects, &precondition);
-            (parameters, precondition, effects)
+            (parameters, precondition, effects, cost)
         };
 
         let schema = ActionSchema {
@@ -605,6 +718,7 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             var_types: term_table.variable_types().to_vec(),
             precondition,
             effects,
+            cost,
         };
         actions_by_name.insert(name, id);
         actions.push(schema);
@@ -649,6 +763,7 @@ fn lower_objects_into(
 pub fn lower_problem(p: &PddlProblem, domain: &Domain) -> Result<Problem, LowerError> {
     let requirements = lower_requirements(p.requirements());
     requirements.reject_deferred()?;
+    let action_costs = domain.requirements.action_costs || requirements.action_costs;
 
     // Working copies of the mutable tables. The domain stays immutable; we copy
     // the parts we may extend (types for object types, predicates for
@@ -676,6 +791,7 @@ pub fn lower_problem(p: &PddlProblem, domain: &Domain) -> Result<Problem, LowerE
             &mut predicates,
             &domain.constants,
             &objects,
+            action_costs,
         )?;
     }
 
@@ -694,11 +810,21 @@ pub fn lower_problem(p: &PddlProblem, domain: &Domain) -> Result<Problem, LowerE
     };
     let goal_var_types = goal_term_table.variable_types().to_vec();
 
-    // Metric (recorded only).
-    let metric = p.metric_spec().as_ref().map(|m| match m.optimization() {
-        pddl::Optimization::Minimize => Optimization::Minimize,
-        pddl::Optimization::Maximize => Optimization::Maximize,
-    });
+    let metric = match p.metric_spec().as_ref() {
+        None => None,
+        Some(metric)
+            if action_costs
+                && metric.optimization() == pddl::Optimization::Minimize
+                && matches!(
+                    metric.expression(),
+                    MetricFluentExpression::Function(symbol, names)
+                        if names.is_empty() && s(symbol).eq_ignore_ascii_case("total-cost")
+                ) =>
+        {
+            Some(Metric::MinimizeTotalCost)
+        }
+        Some(_) => return Err(LowerError::UnsupportedMetric),
+    };
 
     Ok(Problem {
         name: p.name().as_ref().to_string(),
@@ -714,6 +840,7 @@ pub fn lower_problem(p: &PddlProblem, domain: &Domain) -> Result<Problem, LowerE
 }
 
 /// Lowers a single init element into a ground atom or fluent value.
+#[allow(clippy::too_many_arguments)]
 fn lower_init_element(
     el: &InitElement,
     atoms: &mut std::collections::HashSet<Atom>,
@@ -722,6 +849,7 @@ fn lower_init_element(
     preds: &mut PredicateTable,
     consts: &TermTable,
     objects: &TermTable,
+    action_costs: bool,
 ) -> Result<(), LowerError> {
     match el {
         InitElement::Literal(lit) => {
@@ -762,14 +890,26 @@ fn lower_init_element(
         InitElement::At(..) => Err(LowerError::UnsupportedRequirement(
             "timed-initial-literals".to_string(),
         )),
-        InitElement::IsValue(..) | InitElement::IsObject(..) => {
-            Err(LowerError::UnsupportedFluent("init fluent value".to_string()))
+        InitElement::IsValue(term, value)
+            if action_costs
+                && term.names().is_empty()
+                && s(term.symbol()).eq_ignore_ascii_case("total-cost")
+                && **value == 0.0 =>
+        {
+            Ok(())
         }
+        InitElement::IsValue(..) | InitElement::IsObject(..) => Err(LowerError::UnsupportedFluent(
+            "init fluent value".to_string(),
+        )),
     }
 }
 
 /// Resolves a ground object name against problem objects then domain constants.
-fn resolve_object(name: &str, consts: &TermTable, objects: &TermTable) -> Result<Object, LowerError> {
+fn resolve_object(
+    name: &str,
+    consts: &TermTable,
+    objects: &TermTable,
+) -> Result<Object, LowerError> {
     objects
         .find_object(Some(consts), name)
         .ok_or_else(|| LowerError::UnknownObject(name.to_string()))

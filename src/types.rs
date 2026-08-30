@@ -105,9 +105,12 @@ impl Types {
         }
         // Make every subtype of type1 a subtype of every supertype of type2.
         let n = self.names.len();
-        let subs: Vec<usize> = (0..n).filter(|&k| self.subtype[k][type1.0 as usize]).collect();
-        let supers: Vec<usize> =
-            (0..n).filter(|&l| self.subtype[type2.0 as usize][l]).collect();
+        let subs: Vec<usize> = (0..n)
+            .filter(|&k| self.subtype[k][type1.0 as usize])
+            .collect();
+        let supers: Vec<usize> = (0..n)
+            .filter(|&l| self.subtype[type2.0 as usize][l])
+            .collect();
         for &k in &subs {
             for &l in &supers {
                 self.subtype[k][l] = true;
@@ -179,6 +182,31 @@ impl Types {
         } else {
             None
         }
+    }
+
+    /// Enumerates declared simple types, including the built-in `object`.
+    pub fn simple_types(&self) -> impl Iterator<Item = Type> + '_ {
+        (0..self.names.len()).map(|index| Type(index as i32))
+    }
+
+    /// Returns the immediate simple supertypes of `ty`, reconstructed from the
+    /// stored transitive closure. This is primarily used by faithful PDDL
+    /// emission; emitting every type directly below `object` would change the
+    /// set of legal grounded action instances.
+    pub fn direct_supertypes(&self, ty: Type) -> Vec<Type> {
+        assert!(ty.simple(), "direct_supertypes requires a simple type");
+        self.simple_types()
+            .filter(|&supertype| {
+                supertype != ty
+                    && self.subtype(ty, supertype)
+                    && !self.simple_types().any(|middle| {
+                        middle != ty
+                            && middle != supertype
+                            && self.subtype(ty, middle)
+                            && self.subtype(middle, supertype)
+                    })
+            })
+            .collect()
     }
 }
 

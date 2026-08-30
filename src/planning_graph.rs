@@ -12,8 +12,10 @@ use crate::bindings::{Bindings, TypeContext};
 use crate::chain;
 use crate::effect::Effect;
 use crate::formula::{Atom, Formula, Literal};
-use crate::instantiate::{instantiate_atom, instantiate_effect, instantiate_formula,
-                         precondition_consistent};
+use crate::instantiate::{
+    instantiate_atom, instantiate_effect, instantiate_formula, precondition_consistent,
+};
+use crate::params::ActionCost;
 use crate::plan::{Plan, StepAction, INIT_ID};
 use crate::predicates::{Predicate, PredicateTable};
 use crate::terms::{Object, Term, Variable};
@@ -156,9 +158,7 @@ impl PlanningGraph {
         for effect in init_action.effects.iter() {
             let atom = effect.literal.atom().clone();
             if predicates.is_static(atom.predicate) {
-                pg.atom_values
-                    .entry(atom)
-                    .or_insert(HeuristicValue::ZERO);
+                pg.atom_values.entry(atom).or_insert(HeuristicValue::ZERO);
             } else {
                 pg.atom_values
                     .entry(atom)
@@ -190,10 +190,10 @@ impl PlanningGraph {
                     }
                     // Effect condition achievable: add the precondition value.
                     cond_value.add_assign(&pre_value);
-                    // makespan: threshold + min_duration (0 for classical) plus
-                    // unit cost.
+                    // Makespan remains a classical unit layer; additive cost
+                    // uses the task's declared action cost.
                     cond_value.increase_makespan(THRESHOLD);
-                    cond_value.increase_cost(1.0); // UNIT_COST: d = 1.
+                    cond_value.increase_cost(action.cost as f32);
 
                     let literal = &effect.literal;
                     match literal {
@@ -306,6 +306,8 @@ impl PlanningGraph {
         init_action: &Rc<StepAction>,
         schemas: &[ActionSchema],
         get_objects: impl Fn(Type) -> Vec<Object>,
+        cost_model: ActionCost,
+        task_costs: bool,
     ) -> PlanningGraph {
         let mut pg = PlanningGraph {
             atom_values: HashMap::new(),
@@ -350,10 +352,16 @@ impl PlanningGraph {
             let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
 
             for schema in schemas {
+                let action_cost = if task_costs {
+                    cost_model.resolve(schema.cost)
+                } else {
+                    1
+                };
                 let mut je = JoinEnum::new(schema, &atoms_by_pred, &type_domains, &type_sets);
                 je.run(&mut |subst, _tuple| {
                     apply_schema_tuple(
                         schema,
+                        action_cost,
                         subst,
                         &pg,
                         predicates,
@@ -720,10 +728,11 @@ impl PlanningGraph {
     /// (a relaxation; the classical benchmark goals are positive).
     pub fn relaxed_plan_size(
         &self,
-        ctx: &TypeContext,
+        search_ctx: &crate::search::SearchContext,
         plan: &Plan,
         reuse: bool,
     ) -> Option<f32> {
+        let ctx = search_ctx.type_ctx();
         let bindings = plan.bindings.clone();
         let mut chosen: HashSet<usize> = HashSet::new();
         let mut achieved: HashSet<Atom> = HashSet::new();
@@ -731,7 +740,7 @@ impl PlanningGraph {
 
         // Seed the worklist with the open conditions' positive goal atoms.
         for oc in chain::iter(plan.open_conds()) {
-            if let Some(g) = self.goal_atom(&oc.condition, oc.step_id, ctx, &bindings) {
+            if let Some(g) = self.goal_atom(&oc.condition, oc.step_id, &ctx, &bindings) {
                 worklist.push_back(g);
             }
         }
@@ -750,7 +759,7 @@ impl PlanningGraph {
                 achieved.insert(g);
                 continue;
             }
-            match self.cheapest_achiever(&g) {
+            match self.cheapest_achiever(&g, search_ctx) {
                 None => return None, // unreachable: relaxed dead end
                 Some((ai, pre_atoms)) => {
                     achieved.insert(g);
@@ -763,7 +772,12 @@ impl PlanningGraph {
                 }
             }
         }
-        Some(chosen.len() as f32)
+        Some(
+            chosen
+                .into_iter()
+                .map(|index| search_ctx.action_cost(&self.actions[index]) as f32)
+                .sum(),
+        )
     }
 
     /// Resolves a (possibly lifted) atomic open condition to the cheapest ground
@@ -821,7 +835,11 @@ impl PlanningGraph {
     /// The cheapest achiever of a ground goal atom: the `(action index, positive
     /// precondition atoms)` minimising the additive cost of the action's
     /// preconditions. `None` if no reachable achiever exists.
-    fn cheapest_achiever(&self, g: &Atom) -> Option<(usize, Vec<Atom>)> {
+    fn cheapest_achiever(
+        &self,
+        g: &Atom,
+        search_ctx: &crate::search::SearchContext,
+    ) -> Option<(usize, Vec<Atom>)> {
         let mut best: Option<(usize, Vec<Atom>, f32)> = None;
         for &(ai, ei) in self.pos_achievers.get(&g.predicate).into_iter().flatten() {
             let action = &self.actions[ai];
@@ -830,7 +848,7 @@ impl PlanningGraph {
                 continue;
             }
             let pre_atoms = positive_precondition_atoms(&action.precondition);
-            let mut cost = 0.0f32;
+            let mut cost = search_ctx.action_cost(action) as f32;
             let mut reachable = true;
             for p in &pre_atoms {
                 let c = self.heuristic_value_atom(p, 0, None).add_cost();
@@ -1178,7 +1196,9 @@ impl<'a> JoinEnum<'a> {
 }
 
 /// Groups the currently-reachable atoms by predicate for the join.
-fn atoms_by_predicate(atom_values: &HashMap<Atom, HeuristicValue>) -> HashMap<Predicate, Vec<&Atom>> {
+fn atoms_by_predicate(
+    atom_values: &HashMap<Atom, HeuristicValue>,
+) -> HashMap<Predicate, Vec<&Atom>> {
     let mut map: HashMap<Predicate, Vec<&Atom>> = HashMap::new();
     for atom in atom_values.keys() {
         map.entry(atom.predicate).or_default().push(atom);
@@ -1192,6 +1212,7 @@ fn atoms_by_predicate(atom_values: &HashMap<Atom, HeuristicValue>) -> HashMap<Pr
 #[allow(clippy::too_many_arguments)]
 fn apply_schema_tuple(
     schema: &ActionSchema,
+    action_cost: usize,
     subst: &HashMap<Variable, Object>,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
@@ -1217,7 +1238,7 @@ fn apply_schema_tuple(
         }
         cond_value.add_assign(&pre_value);
         cond_value.increase_makespan(THRESHOLD);
-        cond_value.increase_cost(1.0);
+        cond_value.increase_cost(action_cost as f32);
 
         let lit = match &effect.literal {
             Literal::Atom(a) => {
@@ -1321,6 +1342,7 @@ fn collect_reachable_tuple(
         arguments: tuple.to_vec(),
         precondition: ground_pre,
         effects,
+        cost: schema.cost,
         var_types: Vec::new(),
     }));
 }

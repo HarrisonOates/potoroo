@@ -195,7 +195,7 @@ impl Heuristic {
         let mut addr_work = 0i32;
         // i32::MAX as f32 (the C++ `std::numeric_limits<int>::max()` comparison).
         let int_max_f = i32::MAX as f32;
-        let steps = plan.num_steps() as f32;
+        let g = plan.cost() as f32;
 
         for &h in &self.h {
             match h {
@@ -223,12 +223,12 @@ impl Heuristic {
                 }
                 HVal::SPlusOc => {
                     let hterm = weight * plan.num_open_conds() as f32;
-                    rank.push(steps + hterm);
+                    rank.push(g + hterm);
                     grank.push(hterm);
                 }
                 HVal::Ucpop => {
                     let hterm = weight * (plan.num_open_conds() + plan.num_unsafes()) as f32;
-                    rank.push(steps + hterm);
+                    rank.push(g + hterm);
                     grank.push(hterm);
                 }
                 HVal::Add | HVal::AddCost | HVal::AddWork => {
@@ -263,7 +263,7 @@ impl Heuristic {
                     match h {
                         HVal::Add => {
                             rank.push(if cost_fin {
-                                steps + weight * add_cost
+                                g + weight * add_cost
                             } else {
                                 f32::INFINITY
                             });
@@ -313,7 +313,7 @@ impl Heuristic {
                     match h {
                         HVal::Addr => {
                             rank.push(if cost_fin {
-                                steps + weight * addr_cost
+                                g + weight * addr_cost
                             } else {
                                 f32::INFINITY
                             });
@@ -338,9 +338,9 @@ impl Heuristic {
                 HVal::Relax | HVal::RelaxR => {
                     let pg = pg.expect("RELAX heuristic requires a planning graph");
                     let reuse = matches!(h, HVal::RelaxR);
-                    match pg.relaxed_plan_size(ctx, plan, reuse) {
+                    match pg.relaxed_plan_size(search_ctx, plan, reuse) {
                         Some(v) => {
-                            rank.push(steps + weight * v);
+                            rank.push(g + weight * v);
                             grank.push(weight * v);
                         }
                         None => {
@@ -422,7 +422,7 @@ fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuris
         external::run_fd_heuristic(&domain_pddl, &problem_pddl, backend)
     };
     match result {
-        Ok(HResult::Finite(h)) => plan.num_steps() as f32 + weight * h,
+        Ok(HResult::Finite(h)) => plan.cost() as f32 + weight * h,
         Ok(HResult::Infinite) => f32::INFINITY,
         Err(e) => {
             eprintln!("COMPILE heuristic: Fast Downward error: {e}");

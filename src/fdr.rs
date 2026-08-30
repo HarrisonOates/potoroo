@@ -5,7 +5,7 @@
 //! translator's invariant groups. A [`Fact`] is therefore an equality
 //! `variable = value`, and an [`Effect`] is an assignment to one variable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -58,6 +58,16 @@ pub struct Operator {
     pub cost: usize,
 }
 
+/// One grounded SAS+ axiom rule. Derived variables are reset to their default
+/// (last) value before the rule closure is evaluated in each state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Axiom {
+    pub conditions: Vec<Fact>,
+    pub variable: usize,
+    pub pre: usize,
+    pub post: usize,
+}
+
 impl Operator {
     /// Returns the complete applicability condition: prevail facts plus the
     /// pre-values embedded in effects, with at most one value per variable.
@@ -86,13 +96,12 @@ pub struct Task {
     pub initial: Vec<usize>,
     pub goals: Vec<Fact>,
     pub operators: Vec<Operator>,
+    pub axioms: Vec<Axiom>,
 }
 
 impl Task {
     /// Parses Fast Downward's SAS+ format version 3.
     ///
-    /// Derived variables/axioms are currently rejected: supporting them requires
-    /// causal links over derived facts, not merely parsing their syntax.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         let mut lines = Lines::new(input);
         lines.marker("begin_version")?;
@@ -111,9 +120,9 @@ impl Task {
             lines.marker("begin_variable")?;
             let name = lines.next("variable name")?.to_string();
             let axiom_layer = lines.isize("axiom layer")?;
-            if axiom_layer != -1 {
+            if axiom_layer < -1 {
                 return Err(lines.error(format!(
-                    "derived variable `{name}` is not supported by ground FDR POCL"
+                    "variable `{name}` has invalid axiom layer {axiom_layer}"
                 )));
             }
             let domain_size = lines.usize("variable domain size")?;
@@ -191,10 +200,42 @@ impl Task {
         }
 
         let num_axioms = lines.usize("axiom count")?;
-        if num_axioms != 0 {
-            return Err(lines.error(format!(
-                "{num_axioms} SAS+ axiom(s) are not supported by ground FDR POCL"
-            )));
+        let mut axioms = Vec::with_capacity(num_axioms);
+        for _ in 0..num_axioms {
+            lines.marker("begin_rule")?;
+            let num_conditions = lines.usize("axiom condition count")?;
+            let mut conditions = Vec::with_capacity(num_conditions);
+            for _ in 0..num_conditions {
+                let fact = lines.fact("axiom condition")?;
+                validate_fact(&variables, fact, &lines)?;
+                conditions.push(fact);
+            }
+            let effect_line = lines.next("axiom effect")?;
+            let fields = effect_line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(lines.error(format!(
+                    "axiom effect has {} field(s), expected 3",
+                    fields.len()
+                )));
+            }
+            let parse_field = |field: &str, what: &str| {
+                field.parse::<usize>().map_err(|_| ParseError {
+                    line: lines.line_number(),
+                    message: format!("invalid {what} `{field}`"),
+                })
+            };
+            let variable = parse_field(fields[0], "axiom variable")?;
+            let pre = parse_field(fields[1], "axiom old value")?;
+            let post = parse_field(fields[2], "axiom new value")?;
+            validate_fact(&variables, Fact::new(variable, pre), &lines)?;
+            validate_fact(&variables, Fact::new(variable, post), &lines)?;
+            lines.marker("end_rule")?;
+            axioms.push(Axiom {
+                conditions,
+                variable,
+                pre,
+                post,
+            });
         }
         if let Some(extra) = lines.remaining_nonempty() {
             return Err(lines.error(format!("unexpected trailing input `{extra}`")));
@@ -205,6 +246,7 @@ impl Task {
             initial,
             goals,
             operators,
+            axioms,
         })
     }
 
@@ -219,6 +261,152 @@ impl Task {
     pub fn num_facts(&self) -> usize {
         self.variables.iter().map(|v| v.values.len()).sum()
     }
+
+    pub fn is_derived_variable(&self, variable: usize) -> bool {
+        self.axioms.iter().any(|axiom| axiom.variable == variable)
+    }
+
+    pub fn default_value(&self, variable: usize) -> usize {
+        self.variables[variable].values.len() - 1
+    }
+
+    /// Resets derived variables and computes the grounded axiom closure.
+    pub fn close_axioms(&self, state: &mut [usize]) {
+        for (variable, value) in state.iter_mut().enumerate().take(self.variables.len()) {
+            if self.is_derived_variable(variable) {
+                *value = self.default_value(variable);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for axiom in &self.axioms {
+                if state[axiom.variable] == axiom.pre
+                    && axiom
+                        .conditions
+                        .iter()
+                        .all(|fact| state[fact.variable] == fact.value)
+                    && state[axiom.variable] != axiom.post
+                {
+                    state[axiom.variable] = axiom.post;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Returns a DNF of conjunctions over non-derived facts that establish a
+    /// derived equality. `None` means `fact` is not derived. Default values are
+    /// supported by making every rule for a non-default value false.
+    pub fn derived_supports(&self, fact: Fact) -> Option<Vec<Vec<Fact>>> {
+        if !self.is_derived_variable(fact.variable) {
+            return None;
+        }
+        let mut memo = HashMap::new();
+        let mut active = HashSet::new();
+        Some(self.support_fact(fact, &mut memo, &mut active))
+    }
+
+    fn support_fact(
+        &self,
+        fact: Fact,
+        memo: &mut HashMap<Fact, Vec<Vec<Fact>>>,
+        active: &mut HashSet<Fact>,
+    ) -> Vec<Vec<Fact>> {
+        if let Some(cached) = memo.get(&fact) {
+            return cached.clone();
+        }
+        if !self.is_derived_variable(fact.variable) {
+            return vec![vec![fact]];
+        }
+        if !active.insert(fact) {
+            return Vec::new();
+        }
+
+        let default = self.default_value(fact.variable);
+        let mut result = if fact.value == default {
+            let mut supports = vec![Vec::new()];
+            for axiom in self
+                .axioms
+                .iter()
+                .filter(|axiom| axiom.variable == fact.variable && axiom.post != default)
+            {
+                let mut rule_false = Vec::new();
+                for condition in &axiom.conditions {
+                    for value in 0..self.variables[condition.variable].values.len() {
+                        if value == condition.value {
+                            continue;
+                        }
+                        rule_false.extend(self.support_fact(
+                            Fact::new(condition.variable, value),
+                            memo,
+                            active,
+                        ));
+                    }
+                }
+                supports = and_dnf(supports, rule_false);
+            }
+            supports
+        } else {
+            let mut supports = Vec::new();
+            for axiom in self
+                .axioms
+                .iter()
+                .filter(|axiom| axiom.variable == fact.variable && axiom.post == fact.value)
+            {
+                let mut body = vec![Vec::new()];
+                for condition in &axiom.conditions {
+                    body = and_dnf(body, self.support_fact(*condition, memo, active));
+                }
+                supports.extend(body);
+            }
+            deduplicate_dnf(supports)
+        };
+        result = deduplicate_dnf(result);
+        active.remove(&fact);
+        memo.insert(fact, result.clone());
+        result
+    }
+}
+
+fn and_dnf(left: Vec<Vec<Fact>>, right: Vec<Vec<Fact>>) -> Vec<Vec<Fact>> {
+    let mut result = Vec::new();
+    for lhs in &left {
+        for rhs in &right {
+            let mut values = BTreeMap::new();
+            let mut consistent = true;
+            for fact in lhs.iter().chain(rhs) {
+                if values
+                    .insert(fact.variable, fact.value)
+                    .is_some_and(|old| old != fact.value)
+                {
+                    consistent = false;
+                    break;
+                }
+            }
+            if consistent {
+                result.push(
+                    values
+                        .into_iter()
+                        .map(|(variable, value)| Fact::new(variable, value))
+                        .collect(),
+                );
+            }
+        }
+    }
+    deduplicate_dnf(result)
+}
+
+fn deduplicate_dnf(mut clauses: Vec<Vec<Fact>>) -> Vec<Vec<Fact>> {
+    for clause in &mut clauses {
+        clause.sort_unstable_by_key(|fact| (fact.variable, fact.value));
+        clause.dedup();
+    }
+    clauses.sort();
+    clauses.dedup();
+    clauses
 }
 
 fn parse_effect(
@@ -464,9 +652,63 @@ end_operator
     }
 
     #[test]
-    fn rejects_derived_variables() {
+    fn accepts_an_unused_axiom_layer() {
         let sas = THREE_LOCATION_TASK.replacen("location\n-1", "location\n0", 1);
-        let err = Task::parse(&sas).unwrap_err();
-        assert!(err.message.contains("derived variable"));
+        assert!(Task::parse(&sas).is_ok());
+    }
+
+    #[test]
+    fn parses_and_expands_binary_axiom_supports() {
+        let sas = "begin_version
+3
+end_version
+begin_metric
+0
+end_metric
+2
+begin_variable
+p
+-1
+2
+p-true
+p-false
+end_variable
+begin_variable
+d
+0
+2
+d-true
+d-false
+end_variable
+0
+begin_state
+1
+1
+end_state
+begin_goal
+1
+1 0
+end_goal
+0
+1
+begin_rule
+1
+0 0
+1 1 0
+end_rule
+";
+        let task = Task::parse(sas).unwrap();
+        assert_eq!(task.axioms.len(), 1);
+        assert_eq!(
+            task.derived_supports(Fact::new(1, 0)).unwrap(),
+            vec![vec![Fact::new(0, 0)]]
+        );
+        assert_eq!(
+            task.derived_supports(Fact::new(1, 1)).unwrap(),
+            vec![vec![Fact::new(0, 1)]]
+        );
+        let mut state = vec![0, 1];
+        task.close_axioms(&mut state);
+        assert_eq!(state, vec![0, 0]);
     }
 }

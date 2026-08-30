@@ -17,6 +17,7 @@ use crate::formula::{Formula, Literal};
 use crate::instantiate::{instantiate_effect, instantiate_formula, precondition_consistent};
 use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
+use crate::problem::Metric;
 use crate::problem::Problem;
 use crate::terms::{Object, Term, Variable};
 use crate::types::{Type, OBJECT};
@@ -91,6 +92,7 @@ impl<'a> SearchContext<'a> {
             arguments: Vec::new(),
             precondition: problem.goal.clone(),
             effects: Vec::new(),
+            cost: 0,
             var_types: problem.goal_var_types.clone(),
         });
         // Init action: effects = init atoms (positive), in declaration order.
@@ -105,6 +107,7 @@ impl<'a> SearchContext<'a> {
             arguments: Vec::new(),
             precondition: Rc::new(Formula::True),
             effects: init_effects,
+            cost: 0,
             var_types: Vec::new(),
         });
 
@@ -236,6 +239,7 @@ impl<'a> SearchContext<'a> {
             arguments: tuple.to_vec(),
             precondition,
             effects,
+            cost: schema.cost,
             var_types: Vec::new(),
         }))
     }
@@ -254,11 +258,8 @@ impl<'a> SearchContext<'a> {
     }
 
     fn try_fd_reachable_ground_actions(&self) -> Option<Vec<Rc<StepAction>>> {
-        // Emit the *original* problem as PDDL by compiling the empty initial plan
-        // (no committed steps, links, indicators, or guards).
-        let initial = Plan::make_initial_plan(self)?;
-        let compiled = crate::compile::CompiledProblem::compile_opts(&initial, self, false);
-        let (domain_pddl, problem_pddl) = compiled.emit_pddl(self);
+        let (domain_pddl, problem_pddl) =
+            crate::pddl_emit::emit_original(self.domain, self.problem);
         let sas = crate::external::run_fd_translate(&domain_pddl, &problem_pddl).ok()?;
 
         // Build case-insensitive name lookups for schemas and objects.
@@ -334,10 +335,22 @@ impl<'a> SearchContext<'a> {
                 &self.init_action,
                 &self.domain.actions,
                 |ty| self.compatible_objects(ty),
+                self.params.action_cost,
+                self.problem.metric == Some(Metric::MinimizeTotalCost),
             );
             *self.planning_graph.borrow_mut() = Some(Rc::new(pg));
         }
         self.planning_graph.borrow().clone().unwrap()
+    }
+
+    /// Effective cost of inserting an action under the selected cost model.
+    pub fn action_cost(&self, action: &StepAction) -> usize {
+        let declared = if self.problem.metric == Some(Metric::MinimizeTotalCost) {
+            action.cost
+        } else {
+            1
+        };
+        self.params.action_cost.resolve(declared)
     }
 
     /// Returns the constant base of the SAS⁺ causal-link compilation (ground
@@ -457,6 +470,7 @@ fn schema_to_action(schema: &ActionSchema) -> StepAction {
         arguments: Vec::new(),
         precondition: schema.precondition.clone(),
         effects: schema.effects.clone(),
+        cost: schema.cost,
         var_types: schema.var_types.clone(),
     }
 }
@@ -1006,6 +1020,7 @@ fn step_instantiation(ctx: &SearchContext, plan: &Rc<Plan>) -> Option<Rc<Plan>> 
     Some(Rc::new(Plan {
         steps: plan.steps.clone(),
         num_steps: plan.num_steps,
+        cost: plan.cost,
         links: plan.links.clone(),
         num_links: plan.num_links,
         orderings: plan.orderings.clone(),

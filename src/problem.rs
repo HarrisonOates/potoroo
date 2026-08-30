@@ -7,11 +7,10 @@ use crate::expressions::Fluent;
 use crate::formula::{Atom, Formula};
 use crate::terms::TermTable;
 
-/// Optimization direction for a metric.
+/// Supported classical optimization metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Optimization {
-    Minimize,
-    Maximize,
+pub enum Metric {
+    MinimizeTotalCost,
 }
 
 /// A lowered problem.
@@ -31,14 +30,15 @@ pub struct Problem {
     /// achiever-map iteration and plan-id tie-breaking, so we preserve it
     /// alongside the set used for membership tests.
     pub init_order: Vec<Atom>,
-    /// Initial numeric fluent assignments (carried, never evaluated in the
-    /// classical subset).
+    /// Initial general numeric fluent assignments. The supported total-cost
+    /// initialization is normalized away during lowering.
     pub init_values: Vec<(Fluent, f64)>,
     pub goal: Rc<Formula>,
     /// Types of any variables introduced while lowering the goal (existential
     /// quantifiers), indexed by variable index. Used for type reasoning at the
     /// goal step.
     pub goal_var_types: Vec<crate::types::Type>,
-    /// Optional optimization metric (recorded, not used by classical search).
-    pub metric: Option<Optimization>,
+    /// Optional optimization metric. The classical subset supports only
+    /// `(:metric minimize (total-cost))`.
+    pub metric: Option<Metric>,
 }

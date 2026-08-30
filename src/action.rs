@@ -20,6 +20,8 @@ pub struct ActionSchema {
     pub var_types: Vec<crate::types::Type>,
     pub precondition: Rc<Formula>,
     pub effects: Vec<Effect>,
+    /// Declared PDDL action cost. Costless classical domains use one.
+    pub cost: usize,
 }
 
 /// A fully ground action, produced by instantiation.
@@ -30,4 +32,5 @@ pub struct GroundAction {
     pub arguments: Vec<Object>,
     pub precondition: Rc<Formula>,
     pub effects: Vec<Effect>,
+    pub cost: usize,
 }

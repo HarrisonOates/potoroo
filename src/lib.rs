@@ -1,8 +1,8 @@
 //! A partial-order causal-link planner for the classical planning subset.
 //!
 //! The classical subset targets STRIPS + ADL with lifted and ground actions;
-//! durative/temporal and numeric features are deferred and rejected at lowering
-//! time.
+//! durative/temporal and general numeric features are deferred and rejected at
+//! lowering time; the restricted PDDL `total-cost` fragment is supported.
 
 pub mod action;
 pub mod bindings;
@@ -20,11 +20,12 @@ pub mod formula;
 pub mod functions;
 pub mod heuristics;
 pub(crate) mod instantiate;
-pub mod lplan;
 pub(crate) mod lmcut;
+pub mod lplan;
 pub mod orderings;
 pub mod params;
 pub mod parser;
+pub mod pddl_emit;
 pub mod plan;
 pub mod planning_graph;
 pub mod predicates;

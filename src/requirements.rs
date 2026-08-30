@@ -12,6 +12,8 @@ pub struct Requirements {
     pub existential_preconditions: bool,
     pub universal_preconditions: bool,
     pub conditional_effects: bool,
+    /// The restricted PDDL action-cost fragment (`total-cost` only).
+    pub action_costs: bool,
     pub fluents: bool,
     pub durative_actions: bool,
     pub duration_inequalities: bool,
@@ -43,7 +45,8 @@ impl Requirements {
     }
 
     /// Rejects requirements outside the classical subset. Durative/temporal and
-    /// numeric-fluent features are deferred (see the crate-level scope notes).
+    /// general numeric-fluent features are deferred; restricted action costs
+    /// have their own flag and remain supported.
     pub fn reject_deferred(&self) -> Result<(), LowerError> {
         let unsupported = [
             (self.fluents, "fluents"),

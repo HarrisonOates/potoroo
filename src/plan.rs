@@ -38,6 +38,8 @@ pub struct StepAction {
     pub precondition: Rc<Formula>,
     /// Effects (the init atoms for the init step; empty for the goal step).
     pub effects: Vec<Effect>,
+    /// Declared task cost. Synthetic init/goal actions have zero cost.
+    pub cost: usize,
     /// Variable types in this action's scope, indexed by variable index.
     pub var_types: Vec<crate::types::Type>,
 }
@@ -85,6 +87,8 @@ impl PartialEq for Link {
 pub struct Plan {
     pub steps: Option<Rc<Chain<Step>>>,
     pub num_steps: usize,
+    /// Accumulated cost of committed real steps.
+    pub cost: usize,
     pub links: Option<Rc<Chain<Link>>>,
     pub num_links: usize,
     pub orderings: Rc<BinaryOrderings>,
@@ -100,6 +104,9 @@ pub struct Plan {
 impl Plan {
     pub fn num_steps(&self) -> usize {
         self.num_steps
+    }
+    pub fn cost(&self) -> usize {
+        self.cost
     }
     pub fn num_open_conds(&self) -> usize {
         self.num_open_conds
@@ -205,6 +212,7 @@ impl Plan {
     fn new(
         steps: Option<Rc<Chain<Step>>>,
         num_steps: usize,
+        cost: usize,
         links: Option<Rc<Chain<Link>>>,
         num_links: usize,
         orderings: Rc<BinaryOrderings>,
@@ -217,6 +225,7 @@ impl Plan {
         Rc::new(Plan {
             steps,
             num_steps,
+            cost,
             links,
             num_links,
             orderings,
@@ -266,6 +275,7 @@ impl Plan {
         let bindings = bindings.add(&ctx.type_ctx(), &new_bindings, false)?;
         Some(Plan::new(
             steps,
+            0,
             0,
             None,
             0,
@@ -345,6 +355,7 @@ impl Plan {
             plans.push(Plan::new(
                 self.steps.clone(),
                 self.num_steps,
+                self.cost,
                 self.links.clone(),
                 self.num_links,
                 self.orderings.clone(),
@@ -422,6 +433,7 @@ impl Plan {
                 plans.push(Plan::new(
                     self.steps.clone(),
                     self.num_steps,
+                    self.cost,
                     self.links.clone(),
                     self.num_links,
                     self.orderings.clone(),
@@ -493,6 +505,7 @@ impl Plan {
             plans.push(Plan::new(
                 self.steps.clone(),
                 self.num_steps,
+                self.cost,
                 self.links.clone(),
                 self.num_links,
                 new_orderings,
@@ -555,6 +568,7 @@ impl Plan {
                     plans.push(Plan::new(
                         self.steps.clone(),
                         self.num_steps,
+                        self.cost,
                         self.links.clone(),
                         self.num_links,
                         self.orderings.clone(),
@@ -597,6 +611,7 @@ impl Plan {
                 plans.push(Plan::new(
                     self.steps.clone(),
                     self.num_steps,
+                    self.cost,
                     self.links.clone(),
                     self.num_links,
                     self.orderings.clone(),
@@ -758,6 +773,7 @@ impl Plan {
                 plans.push(Plan::new(
                     self.steps.clone(),
                     self.num_steps,
+                    self.cost,
                     new_links,
                     self.num_links + 1,
                     self.orderings.clone(),
@@ -835,6 +851,7 @@ impl Plan {
         let is_new_step = step.id > self.num_steps;
         let mut new_steps = self.steps.clone();
         let mut new_num_steps = self.num_steps;
+        let mut new_cost = self.cost;
         if is_new_step {
             if !add_goal(
                 ctx,
@@ -849,6 +866,7 @@ impl Plan {
             }
             new_steps = chain::cons(step.clone(), new_steps);
             new_num_steps += 1;
+            new_cost = new_cost.saturating_add(ctx.action_cost(&step.action));
         }
 
         let bindings = match self.bindings.add(&ctx.type_ctx(), &new_bindings, false) {
@@ -908,6 +926,7 @@ impl Plan {
         plans.push(Plan::new(
             new_steps,
             new_num_steps,
+            new_cost,
             new_links,
             self.num_links + 1,
             new_orderings,

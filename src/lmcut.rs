@@ -11,6 +11,7 @@ use std::collections::BinaryHeap;
 use thiserror::Error;
 
 use crate::fdr::{Fact, Task};
+use crate::params::ActionCost;
 
 const UNREACHED: u32 = u32::MAX;
 
@@ -20,6 +21,8 @@ pub(crate) enum BuildError {
         "operator `{operator}` has conditional effects, which native LM-cut does not yet support"
     )]
     ConditionalEffects { operator: String },
+    #[error("operator `{operator}` cost {cost} exceeds native LM-cut's u32 range")]
+    ActionCostTooLarge { operator: String, cost: usize },
     #[error("LM-cut action references fact {fact}, but the task has only {num_facts} facts")]
     InvalidFact { fact: usize, num_facts: usize },
 }
@@ -293,7 +296,7 @@ pub(crate) struct FdrLmCut {
 }
 
 impl FdrLmCut {
-    pub(crate) fn new(task: &Task) -> Result<Self, BuildError> {
+    pub(crate) fn new(task: &Task, action_cost: ActionCost) -> Result<Self, BuildError> {
         let mut offsets = Vec::with_capacity(task.variables.len());
         let mut num_facts = 0usize;
         for variable in &task.variables {
@@ -313,6 +316,12 @@ impl FdrLmCut {
                     operator: operator.name.clone(),
                 });
             }
+            let resolved_cost = action_cost.resolve(operator.cost);
+            let cost =
+                u32::try_from(resolved_cost).map_err(|_| BuildError::ActionCostTooLarge {
+                    operator: operator.name.clone(),
+                    cost: resolved_cost,
+                })?;
             actions.push(RelaxedAction::new(
                 operator.preconditions().into_iter().map(encode).collect(),
                 operator
@@ -320,13 +329,32 @@ impl FdrLmCut {
                     .iter()
                     .map(|effect| encode(effect.assignment()))
                     .collect(),
-                1,
+                cost,
             ));
+        }
+        for (variable, values) in task.variables.iter().enumerate() {
+            if !task.is_derived_variable(variable) {
+                continue;
+            }
+            for value in 0..values.values.len() {
+                let fact = Fact::new(variable, value);
+                for support in task
+                    .derived_supports(fact)
+                    .expect("derived variable has support clauses")
+                {
+                    actions.push(RelaxedAction::new(
+                        support.into_iter().map(encode).collect(),
+                        vec![encode(fact)],
+                        0,
+                    ));
+                }
+            }
         }
         let initial = task
             .initial
             .iter()
             .enumerate()
+            .filter(|(variable, _)| !task.is_derived_variable(*variable))
             .map(|(variable, &value)| offsets[variable] + value)
             .collect();
 

@@ -15,14 +15,13 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::compile::CompiledProblem;
 use crate::external::FdError;
 use crate::fdr::{Fact, ParseError, Task};
 use crate::heuristics::{HVal, OrderType, SelectionCriterion};
 use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
 use crate::params::{ActionCost, Parameters, SearchAlgorithm};
-use crate::plan::{Plan as LiteralPlan, GOAL_ID, INIT_ID};
+use crate::plan::{GOAL_ID, INIT_ID};
 use crate::search::SearchContext;
 
 /// A committed real step. Init and goal are represented by [`INIT_ID`] and
@@ -67,6 +66,8 @@ pub struct PartialPlan {
     pub open_conditions: Rc<Vec<OpenCondition>>,
     pub orderings: Rc<BinaryOrderings>,
     threats: Rc<Vec<Threat>>,
+    /// Accumulated cost of committed operators.
+    pub cost: usize,
     next_step_id: usize,
     id: usize,
 }
@@ -88,6 +89,7 @@ impl PartialPlan {
             ),
             orderings: Rc::new(BinaryOrderings::new()),
             threats: Rc::new(Vec::new()),
+            cost: 0,
             next_step_id: 1,
             id: 0,
         }
@@ -263,6 +265,10 @@ impl PartialPlan {
         self.steps.len()
     }
 
+    pub fn cost(&self) -> usize {
+        self.cost
+    }
+
     fn num_open_conditions(&self) -> usize {
         self.open_conditions.len()
     }
@@ -309,10 +315,7 @@ pub enum Outcome {
 /// Translates the original ground problem through Fast Downward and retains its
 /// complete finite-domain representation.
 pub fn translate(ctx: &SearchContext<'_>) -> Result<Task, Error> {
-    let initial = LiteralPlan::make_initial_plan(ctx)
-        .ok_or_else(|| Error::Unsupported("the initial POCL goal is inconsistent".to_string()))?;
-    let compiled = CompiledProblem::compile_opts(&initial, ctx, false);
-    let (domain_pddl, problem_pddl) = compiled.emit_pddl(ctx);
+    let (domain_pddl, problem_pddl) = crate::pddl_emit::emit_original(ctx.domain, ctx.problem);
     let sas = crate::external::run_fd_translate(&domain_pddl, &problem_pddl)?;
     Ok(Task::parse(&sas)?)
 }
@@ -334,7 +337,7 @@ pub fn solve_with_params(
     task: &Task,
     params: &Parameters,
 ) -> Result<(Outcome, SearchStats), Error> {
-    let planner = Planner::new(task);
+    let planner = Planner::with_action_cost(task, params.action_cost);
     planner.validate_params(params)?;
     Ok(planner.solve(params))
 }
@@ -351,14 +354,36 @@ struct Planner<'a> {
     variable_has_effect: Vec<bool>,
     operator_preconditions: Vec<Vec<Fact>>,
     effect_requirements: Vec<Vec<Vec<Fact>>>,
+    derived_supports: HashMap<Fact, Vec<Vec<Fact>>>,
     base_relaxed: RelaxedValues,
     lmcut: Result<FdrLmCut, LmCutBuildError>,
+    action_cost: ActionCost,
 }
 
 impl<'a> Planner<'a> {
+    #[cfg(test)]
     fn new(task: &'a Task) -> Self {
+        Self::with_action_cost(task, ActionCost::Task)
+    }
+
+    fn with_action_cost(task: &'a Task, action_cost: ActionCost) -> Self {
         let mut achievers: HashMap<Fact, Vec<Achiever>> = HashMap::new();
         let mut variable_has_effect = vec![false; task.variables.len()];
+        let mut derived_supports = HashMap::new();
+        for (variable, values) in task.variables.iter().enumerate() {
+            if !task.is_derived_variable(variable) {
+                continue;
+            }
+            variable_has_effect[variable] = true;
+            for value in 0..values.values.len() {
+                let fact = Fact::new(variable, value);
+                derived_supports.insert(
+                    fact,
+                    task.derived_supports(fact)
+                        .expect("derived variable has support expansion"),
+                );
+            }
+        }
         let operator_preconditions = task
             .operators
             .iter()
@@ -384,8 +409,9 @@ impl<'a> Planner<'a> {
                     .collect()
             })
             .collect::<Vec<_>>();
-        let base_relaxed = build_base_relaxed_values(task, &effect_requirements);
-        let lmcut = FdrLmCut::new(task);
+        let base_relaxed =
+            build_base_relaxed_values(task, &effect_requirements, &derived_supports, action_cost);
+        let lmcut = FdrLmCut::new(task, action_cost);
         for (operator_index, operator) in task.operators.iter().enumerate() {
             for (effect_index, effect) in operator.effects.iter().enumerate() {
                 variable_has_effect[effect.variable] = true;
@@ -404,8 +430,10 @@ impl<'a> Planner<'a> {
             variable_has_effect,
             operator_preconditions,
             effect_requirements,
+            derived_supports,
             base_relaxed,
             lmcut,
+            action_cost,
         }
     }
 
@@ -420,9 +448,12 @@ impl<'a> Planner<'a> {
                 "one search limit is required per flaw-selection order".to_string(),
             ));
         }
-        if params.action_cost != ActionCost::Unit {
+        if matches!(
+            params.action_cost,
+            ActionCost::Duration | ActionCost::Relative
+        ) {
             return Err(Error::Unsupported(
-                "finite-domain POCL currently supports unit action costs only".to_string(),
+                "finite-domain POCL supports PDDL task costs or explicit unit costs".to_string(),
             ));
         }
         for term in params.heuristic.terms() {
@@ -696,6 +727,22 @@ impl<'a> Planner<'a> {
 
     fn resolve_open(&self, plan: &PartialPlan, open_index: usize) -> Vec<PartialPlan> {
         let open = plan.open_conditions[open_index].clone();
+        if let Some(supports) = self.derived_supports.get(&open.condition) {
+            return supports
+                .iter()
+                .map(|support| {
+                    let mut child = plan.clone();
+                    Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
+                    for &condition in support {
+                        child.push_open(OpenCondition {
+                            consumer: open.consumer,
+                            condition,
+                        });
+                    }
+                    child
+                })
+                .collect();
+        }
         let mut children = Vec::new();
 
         if let Some(achievers) = self.achievers.get(&open.condition) {
@@ -802,6 +849,9 @@ impl<'a> Planner<'a> {
         let mut child = plan.clone();
         child.orderings = orderings;
         child.next_step_id += 1;
+        child.cost = child
+            .cost
+            .saturating_add(self.action_cost.resolve(operator.cost));
         Rc::make_mut(&mut child.steps).push(Step {
             id: new_id,
             operator: achiever.operator,
@@ -933,7 +983,8 @@ impl<'a> Planner<'a> {
                 if refinements > criterion.max_refinements {
                     continue;
                 }
-                let has_new = self.achievers.contains_key(&open.condition);
+                let has_new = self.achievers.contains_key(&open.condition)
+                    || self.derived_supports.contains_key(&open.condition);
                 let has_reuse = self.has_reuse(plan, open);
                 let estimate = if let Some(estimates) = &relaxed {
                     match criterion.order {
@@ -1010,6 +1061,9 @@ impl<'a> Planner<'a> {
     }
 
     fn open_refinement_count(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
+        if let Some(supports) = self.derived_supports.get(&open.condition) {
+            return i32::try_from(supports.len()).unwrap_or(i32::MAX);
+        }
         let mut count =
             i32::from(self.task.initial[open.condition.variable] == open.condition.value);
         if let Some(achievers) = self.achievers.get(&open.condition) {
@@ -1068,7 +1122,7 @@ impl<'a> Planner<'a> {
     }
 
     fn compute_rank_both(&self, plan: &PartialPlan, params: &Parameters) -> (Vec<f32>, Vec<f32>) {
-        let steps = plan.num_steps() as f32;
+        let g = plan.cost() as f32;
         let opens = plan.num_open_conditions();
         let threats = plan.threats.len();
         let mut rank = Vec::with_capacity(params.heuristic.terms().len());
@@ -1105,35 +1159,21 @@ impl<'a> Planner<'a> {
                 }
                 HVal::SPlusOc => {
                     let h = params.weight * opens as f32;
-                    rank.push(steps + h);
+                    rank.push(g + h);
                     grank.push(h);
                 }
                 HVal::Ucpop => {
                     let h = params.weight * (opens + threats) as f32;
-                    rank.push(steps + h);
+                    rank.push(g + h);
                     grank.push(h);
                 }
                 HVal::Add | HVal::AddCost | HVal::AddWork => {
                     let estimate = add.get_or_insert_with(|| self.open_estimate(plan, false));
-                    push_add_rank(
-                        &mut rank,
-                        &mut grank,
-                        *term,
-                        *estimate,
-                        steps,
-                        params.weight,
-                    );
+                    push_add_rank(&mut rank, &mut grank, *term, *estimate, g, params.weight);
                 }
                 HVal::Addr | HVal::AddrCost | HVal::AddrWork => {
                     let estimate = addr.get_or_insert_with(|| self.open_estimate(plan, true));
-                    push_add_rank(
-                        &mut rank,
-                        &mut grank,
-                        *term,
-                        *estimate,
-                        steps,
-                        params.weight,
-                    );
+                    push_add_rank(&mut rank, &mut grank, *term, *estimate, g, params.weight);
                 }
                 HVal::Relax | HVal::RelaxR => {
                     let reuse = matches!(term, HVal::RelaxR);
@@ -1143,7 +1183,7 @@ impl<'a> Planner<'a> {
                         *relax.get_or_insert_with(|| self.relaxed_plan_size(plan, false))
                     };
                     let h = estimate.map_or(f32::INFINITY, |value| params.weight * value);
-                    rank.push(if h.is_finite() { steps + h } else { h });
+                    rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
                 HVal::LmCut | HVal::LmCutR => {
@@ -1154,7 +1194,7 @@ impl<'a> Planner<'a> {
                         *lmcut.get_or_insert_with(|| self.lmcut_estimate(plan, false))
                     };
                     let h = estimate.map_or(f32::INFINITY, |value| params.weight * value);
-                    rank.push(if h.is_finite() { steps + h } else { h });
+                    rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
                 HVal::SampleFf(_) | HVal::Lplan | HVal::Compile(_) => {
@@ -1225,7 +1265,13 @@ impl<'a> Planner<'a> {
             }
         }
         if changed {
-            saturate_relaxed_values(self.task, &self.effect_requirements, &mut values);
+            saturate_relaxed_values(
+                self.task,
+                &self.effect_requirements,
+                &self.derived_supports,
+                &mut values,
+                self.action_cost,
+            );
         }
         Cow::Owned(values)
     }
@@ -1259,8 +1305,30 @@ impl<'a> Planner<'a> {
             if achieved.contains(&goal) {
                 continue;
             }
-            if self.task.initial[goal.variable] == goal.value || reusable.contains(&goal) {
+            if (!self.task.is_derived_variable(goal.variable)
+                && self.task.initial[goal.variable] == goal.value)
+                || reusable.contains(&goal)
+            {
                 achieved.insert(goal);
+                continue;
+            }
+
+            if let Some(supports) = self.derived_supports.get(&goal) {
+                let support = supports.iter().min_by(|left, right| {
+                    let cost = |clause: &&Vec<Fact>| {
+                        clause
+                            .iter()
+                            .map(|fact| self.base_relaxed.cost[fact.variable][fact.value])
+                            .sum::<f32>()
+                    };
+                    cost(left).total_cmp(&cost(right))
+                })?;
+                achieved.insert(goal);
+                for &requirement in support.iter() {
+                    if !achieved.contains(&requirement) {
+                        worklist.push(requirement);
+                    }
+                }
                 continue;
             }
 
@@ -1274,7 +1342,12 @@ impl<'a> Planner<'a> {
             }
         }
 
-        Some(chosen_operators.len() as f32)
+        Some(
+            chosen_operators
+                .into_iter()
+                .map(|operator| self.action_cost.resolve(self.task.operators[operator].cost) as f32)
+                .sum(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1371,6 +1444,7 @@ fn linearize_and_validate(plan: &PartialPlan, task: &Task) -> Option<Vec<usize>>
     let mut state = task.initial.clone();
     let mut operators = Vec::with_capacity(steps.len());
     for step in steps {
+        task.close_axioms(&mut state);
         let operator = &task.operators[step.operator];
         if operator
             .preconditions()
@@ -1395,6 +1469,8 @@ fn linearize_and_validate(plan: &PartialPlan, task: &Task) -> Option<Vec<usize>>
         }
         operators.push(step.operator);
     }
+
+    task.close_axioms(&mut state);
 
     task.goals
         .iter()
@@ -1482,7 +1558,12 @@ struct RelaxedValues {
     achiever: Vec<Vec<Option<Achiever>>>,
 }
 
-fn build_base_relaxed_values(task: &Task, effect_requirements: &[Vec<Vec<Fact>>]) -> RelaxedValues {
+fn build_base_relaxed_values(
+    task: &Task,
+    effect_requirements: &[Vec<Vec<Fact>>],
+    derived_supports: &HashMap<Fact, Vec<Vec<Fact>>>,
+    action_cost: ActionCost,
+) -> RelaxedValues {
     let mut values = RelaxedValues {
         cost: task
             .variables
@@ -1501,23 +1582,34 @@ fn build_base_relaxed_values(task: &Task, effect_requirements: &[Vec<Vec<Fact>>]
             .collect(),
     };
     for (variable, &value) in task.initial.iter().enumerate() {
+        if task.is_derived_variable(variable) {
+            continue;
+        }
         values.cost[variable][value] = 0.0;
         values.work[variable][value] = 0;
     }
-    saturate_relaxed_values(task, effect_requirements, &mut values);
+    saturate_relaxed_values(
+        task,
+        effect_requirements,
+        derived_supports,
+        &mut values,
+        action_cost,
+    );
     values
 }
 
 fn saturate_relaxed_values(
     task: &Task,
     effect_requirements: &[Vec<Vec<Fact>>],
+    derived_supports: &HashMap<Fact, Vec<Vec<Fact>>>,
     values: &mut RelaxedValues,
+    action_cost: ActionCost,
 ) {
     loop {
         let mut changed = false;
         for (operator_index, operator) in task.operators.iter().enumerate() {
             for (effect_index, effect) in operator.effects.iter().enumerate() {
-                let mut cost = 1.0f32;
+                let mut cost = action_cost.resolve(operator.cost) as f32;
                 let mut work = 1i32;
                 for fact in &effect_requirements[operator_index][effect_index] {
                     cost += values.cost[fact.variable][fact.value];
@@ -1533,6 +1625,24 @@ fn saturate_relaxed_values(
                 }
                 if work < values.work[effect.variable][effect.post] {
                     values.work[effect.variable][effect.post] = work;
+                    changed = true;
+                }
+            }
+        }
+        for (&fact, supports) in derived_supports {
+            for support in supports {
+                let mut cost = 0.0f32;
+                let mut work = 0i32;
+                for condition in support {
+                    cost += values.cost[condition.variable][condition.value];
+                    work = work.saturating_add(values.work[condition.variable][condition.value]);
+                }
+                if cost < values.cost[fact.variable][fact.value] {
+                    values.cost[fact.variable][fact.value] = cost;
+                    changed = true;
+                }
+                if work < values.work[fact.variable][fact.value] {
+                    values.work[fact.variable][fact.value] = work;
                     changed = true;
                 }
             }
@@ -1682,6 +1792,7 @@ mod tests {
                     cost: 1,
                 },
             ],
+            axioms: vec![],
         }
     }
 
@@ -1723,6 +1834,7 @@ mod tests {
                     cost: 1,
                 },
             ],
+            axioms: vec![],
         }
     }
 
@@ -1759,6 +1871,7 @@ mod tests {
                 ],
                 cost: 1,
             }],
+            axioms: vec![],
         }
     }
 
@@ -1942,6 +2055,7 @@ mod tests {
                 effect: 0,
                 link: 0,
             }]),
+            cost: 2,
             next_step_id: 3,
             id: 0,
         };
@@ -1981,6 +2095,7 @@ mod tests {
             open_conditions: Rc::new(vec![open.clone()]),
             orderings,
             threats: Rc::new(vec![]),
+            cost: 1,
             next_step_id: 2,
             id: 0,
         };

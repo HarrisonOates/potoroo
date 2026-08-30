@@ -170,7 +170,7 @@ impl SampleFfModel {
 /// fall back to `num_steps + weight * num_open_conds`.
 pub fn sample_ff_rank(plan: &Plan, ctx: &SearchContext, weight: f32, k: usize) -> f32 {
     if !ctx.params.ground_actions {
-        return plan.num_steps() as f32 + weight * plan.num_open_conds() as f32;
+        return plan.cost() as f32 + weight * plan.num_open_conds() as f32;
     }
     let model = ctx.sample_ff_model();
 
@@ -205,7 +205,7 @@ pub fn sample_ff_rank(plan: &Plan, ctx: &SearchContext, weight: f32, k: usize) -
             Some((count, _)) => count as f32,
             None => plan.num_open_conds() as f32,
         };
-        return plan.num_steps() as f32 + weight * h;
+        return plan.cost() as f32 + weight * h;
     }
 
     // Step id ↦ index into `committed`/`resolved`, for mapping a sampled
@@ -230,7 +230,7 @@ pub fn sample_ff_rank(plan: &Plan, ctx: &SearchContext, weight: f32, k: usize) -
         // No feasible sample: not provably dead, fall back to #open-conditions.
         None => plan.num_open_conds() as f32,
     };
-    plan.num_steps() as f32 + weight * h
+    plan.cost() as f32 + weight * h
 }
 
 /// Estimates one linearization (paper §IV-B): the total relaxed plan steps to

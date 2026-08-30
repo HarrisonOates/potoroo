@@ -13,6 +13,7 @@ The name comes from the [potoroo](https://en.wikipedia.org/wiki/Potoroo), a smal
 
 - **Full POCL search** with lifted and grounded action modes
 - **Reachability-based grounder** via Fast Downward's translator when in ground mode (`-g`), with fallback to naive instantiation
+- **PDDL action costs** end-to-end in lifted and finite-domain search
 - **All historical heuristics** discussed in the position paper by Howsam, Oates and Bercher (HSDIP 2026)
 - **Flaw-selection DSL** with all orders from the VHPOP and UCPOP literature
 - **Composable heuristics** — combine any two with `/`
@@ -114,16 +115,19 @@ The finite-domain path consumes the normal search configuration: A*/IDA*/HC,
 BFS, GBFS, lazy/dual-queue GBFS, ALT, search weights and limits, and the
 flaw-order DSL. Cheap structural heuristics, `ADD`/`ADDR`, joint FF-style
 `RELAX`/`RELAXR` extraction, and native `LMCUT`/`LMCUTR` (including composed
-ranks) are implemented directly over finite-domain facts. It currently uses
-unit action costs, rejects SAS+ axioms/derived variables and the
-representation-specific `SAMPLE_FF`, `LPLAN`, and `COMPILE*` heuristics, and
-conservatively treats conditional assignments as potential threats. Native
-LM-cut currently requires unconditional SAS+ effects.
+ranks) are implemented directly over finite-domain facts. Declared PDDL/SAS+
+operator costs are used by default, with `-a UNIT` available as an override.
+Fast Downward-generated axiom variables (used when normalizing quantified and
+disjunctive formulas) are expanded into base-fact support clauses at the
+consumer. The representation-specific `SAMPLE_FF`, `LPLAN`, and `COMPILE*`
+heuristics remain unavailable on FDR nodes, and conditional assignments are
+conservatively treated as potential threats. Native LM-cut currently requires
+unconditional SAS+ effects.
 
 | Native FDR heuristic | Description |
 |------|-------------|
 | `LMCUT` | Joint LM-cut estimate for all open conditions, starting from the problem initial state |
-| `LMCUTR` | Reuse-aware LM-cut: committed-step effects are free; an admissible lower bound on additional steps under unit costs |
+| `LMCUTR` | Reuse-aware LM-cut: committed-step effects are free; an admissible lower bound on additional task cost |
 
 These are direct POCL open-condition relaxations and are distinct from
 `COMPILE_LMCUT`, which evaluates LM-cut on the causal-link compilation.
@@ -149,7 +153,7 @@ On failure: `no plan` followed by the reason.
 Set `POTOROO_STATS_JSON=1` to emit a machine-readable JSON line on stderr:
 
 ```json
-STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len":6,"nodes_generated":142,"nodes_visited":38,"wall_ms":12}
+STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len":6,"plan_cost":11,"nodes_generated":142,"nodes_visited":38,"wall_ms":12}
 ```
 
 ---
@@ -158,7 +162,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 
 | Flag | Long form | Argument | Description | Default |
 |------|-----------|----------|-------------|---------|
-| `-a` | `--action-cost` | `UNIT`\|`DURATION`\|`RELATIVE` | Action cost model | `UNIT` |
+| `-a` | `--action-cost` | `TASK`\|`UNIT`\|`DURATION`\|`RELATIVE` | Action cost model (`TASK` respects PDDL `total-cost`) | `TASK` |
 | `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `UCPOP` |
 | — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
@@ -182,7 +186,7 @@ These run in O(|plan|) time with no planning graph.
 
 | Name | Description |
 |------|-------------|
-| `UCPOP` | `steps + weight × (open-conditions + unsafe-links)` — the heuristic from the original UCPOP planner. **Default.** |
+| `UCPOP` | `committed-cost + weight × (open-conditions + unsafe-links)` — the heuristic from the original UCPOP planner. **Default.** |
 | `OC` | Open-condition count |
 | `UC` | Unsafe-link (threat) count |
 | `BUC` | Binary unsafe count (0 if no threats, 1 otherwise) |
@@ -195,13 +199,13 @@ These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is
 
 | Name | Description |
 |------|-------------|
-| `ADD` | Additive heuristic: sum of ADD-layer costs for all open conditions. `steps + weight × h_add` |
+| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add` |
 | `ADD_COST` | ADD cost term only (no step count) |
 | `ADD_WORK` | ADD work: total operator count in the ADD relaxed plan |
 | `ADDR` | Additive heuristic with action reuse: only new operators count toward the estimate |
 | `ADDR_COST` | ADDR cost only |
 | `ADDR_WORK` | ADDR work |
-| `RELAX` | Delete-relaxed plan size (FF-style joint extraction): `steps + weight × |π_relax|` |
+| `RELAX` | Delete-relaxed plan cost (FF-style joint extraction): `committed-cost + weight × cost(π_relax)` |
 | `RELAXR` | RELAX with reuse (only new operators in the extracted relaxed plan) |
 
 ### Lplan LP heuristic
