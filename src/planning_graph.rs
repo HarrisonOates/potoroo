@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
-use crate::bindings::{Bindings, TypeContext};
+use crate::bindings::{AtomPattern, Bindings, TypeContext};
 use crate::chain;
 use crate::effect::Effect;
+use crate::fasthash::FastMap;
 use crate::formula::{Atom, Formula, Literal};
 use crate::instantiate::{
     instantiate_atom, instantiate_effect, instantiate_formula, precondition_consistent,
@@ -124,11 +125,107 @@ pub fn hv_min(v1: HeuristicValue, v2: HeuristicValue) -> HeuristicValue {
 /* ====================================================================== */
 /* PlanningGraph */
 
+/// Which of the graph's two relations a lookup reads: the atoms the relaxed
+/// graph can achieve, or the ones it can negate.
+#[derive(Debug, Clone, Copy)]
+enum Relation {
+    Positive,
+    Negated,
+}
+
+/// A positional index over one predicate's reachable ground atoms:
+/// `positions[argument]` maps an object to the atoms carrying it there, as
+/// ascending indices into the predicate's atom list.
+///
+/// Lifted lookups resolve an open condition to an [`AtomPattern`] in which some
+/// argument positions are fixed to objects. Probing the index on a fixed
+/// position replaces a scan of the whole relation with a scan of one posting
+/// list, which is what makes `at(truck1, ?loc)` cost the truck's locations
+/// rather than every location of every truck.
+#[derive(Debug, Default)]
+struct AtomIndex {
+    positions: Vec<FastMap<Object, Vec<u32>>>,
+}
+
+impl AtomIndex {
+    fn build(atoms: &[Atom]) -> AtomIndex {
+        let arity = atoms.first().map_or(0, |atom| atom.terms.len());
+        let mut positions = vec![FastMap::default(); arity];
+        for (position, atom) in atoms.iter().enumerate() {
+            for (argument, &term) in atom.terms.iter().enumerate() {
+                if let Term::Object(object) = term {
+                    positions[argument]
+                        .entry(object)
+                        .or_insert_with(Vec::new)
+                        .push(position as u32);
+                }
+            }
+        }
+        AtomIndex { positions }
+    }
+
+    /// The shortest posting list among the pattern's fixed positions, or `None`
+    /// when the pattern fixes nothing and the whole relation must be scanned. A
+    /// fixed position whose object never occurs there yields an empty list,
+    /// which decides the lookup outright.
+    fn candidates(&self, pattern: &AtomPattern) -> Option<&[u32]> {
+        const NONE: &[u32] = &[];
+        let mut best: Option<&[u32]> = None;
+        for (position, object) in pattern.bound_positions() {
+            let posting = self
+                .positions
+                .get(position)
+                .and_then(|by_object| by_object.get(&object))
+                .map_or(NONE, |atoms| atoms.as_slice());
+            if best.is_none_or(|shortest| posting.len() < shortest.len()) {
+                best = Some(posting);
+            }
+        }
+        best
+    }
+}
+
+/// The `Bindings::unify` oracle that [`PlanningGraph::for_each_match`] checks
+/// [`AtomPattern::matches`] against in debug builds.
+fn unifies(
+    ctx: &TypeContext,
+    bindings: &Bindings,
+    atom: &Atom,
+    step_id: usize,
+    candidate: &Atom,
+) -> bool {
+    bindings.unify(
+        ctx,
+        &Literal::Atom(atom.clone()),
+        step_id,
+        &Literal::Atom(candidate.clone()),
+        0,
+    )
+}
+
+/// Groups ground atoms by predicate and indexes each resulting relation.
+fn group_by_predicate<'a>(
+    atoms: impl Iterator<Item = &'a Atom>,
+) -> (HashMap<Predicate, Vec<Atom>>, FastMap<Predicate, AtomIndex>) {
+    let mut table: HashMap<Predicate, Vec<Atom>> = HashMap::new();
+    for atom in atoms {
+        table.entry(atom.predicate).or_default().push(atom.clone());
+    }
+    let index = table
+        .iter()
+        .map(|(&predicate, atoms)| (predicate, AtomIndex::build(atoms)))
+        .collect();
+    (table, index)
+}
+
 pub struct PlanningGraph {
     atom_values: HashMap<Atom, HeuristicValue>,
     negation_values: HashMap<Atom, HeuristicValue>,
     predicate_atoms: HashMap<Predicate, Vec<Atom>>,
     predicate_negations: HashMap<Predicate, Vec<Atom>>,
+    /// Positional indexes over the two relations above, parallel to them.
+    atom_index: FastMap<Predicate, AtomIndex>,
+    negation_index: FastMap<Predicate, AtomIndex>,
     /// The ground actions the graph was built from (for relaxed-plan extraction
     /// by the Relax heuristic; unused by the additive heuristics).
     actions: Vec<Rc<StepAction>>,
@@ -150,6 +247,8 @@ impl PlanningGraph {
             negation_values: HashMap::new(),
             predicate_atoms: HashMap::new(),
             predicate_negations: HashMap::new(),
+            atom_index: FastMap::default(),
+            negation_index: FastMap::default(),
             actions: Vec::new(),
             pos_achievers: HashMap::new(),
         };
@@ -264,18 +363,12 @@ impl PlanningGraph {
         }
 
         // Map predicates to achievable ground atoms (heuristics.cc:702-718).
-        for atom in pg.atom_values.keys() {
-            pg.predicate_atoms
-                .entry(atom.predicate)
-                .or_default()
-                .push(atom.clone());
-        }
-        for atom in pg.negation_values.keys() {
-            pg.predicate_negations
-                .entry(atom.predicate)
-                .or_default()
-                .push(atom.clone());
-        }
+        let (atoms, atom_index) = group_by_predicate(pg.atom_values.keys());
+        pg.predicate_atoms = atoms;
+        pg.atom_index = atom_index;
+        let (negations, negation_index) = group_by_predicate(pg.negation_values.keys());
+        pg.predicate_negations = negations;
+        pg.negation_index = negation_index;
 
         // Index positive add effects by predicate for relaxed-plan extraction.
         pg.actions = actions.to_vec();
@@ -314,6 +407,8 @@ impl PlanningGraph {
             negation_values: HashMap::new(),
             predicate_atoms: HashMap::new(),
             predicate_negations: HashMap::new(),
+            atom_index: FastMap::default(),
+            negation_index: FastMap::default(),
             actions: Vec::new(),
             pos_achievers: HashMap::new(),
         };
@@ -385,18 +480,12 @@ impl PlanningGraph {
         }
 
         // Build predicate-to-atom indexes (same as `build`).
-        for atom in pg.atom_values.keys() {
-            pg.predicate_atoms
-                .entry(atom.predicate)
-                .or_default()
-                .push(atom.clone());
-        }
-        for atom in pg.negation_values.keys() {
-            pg.predicate_negations
-                .entry(atom.predicate)
-                .or_default()
-                .push(atom.clone());
-        }
+        let (atoms, atom_index) = group_by_predicate(pg.atom_values.keys());
+        pg.predicate_atoms = atoms;
+        pg.atom_index = atom_index;
+        let (negations, negation_index) = group_by_predicate(pg.negation_values.keys());
+        pg.predicate_negations = negations;
+        pg.negation_index = negation_index;
 
         // Collect the reachable ground actions for relaxed-plan extraction.
         // Only tuples whose precondition has finite value at convergence are
@@ -434,6 +523,71 @@ impl PlanningGraph {
         pg
     }
 
+    /// Visits the reachable atoms of `predicate` that unify with `pattern`,
+    /// narrowing the scan through the positional index whenever the pattern
+    /// fixes an argument; `visit` returns `false` to stop early. Visit order
+    /// matches a full relation scan, because posting lists are built in
+    /// relation order, so callers that break ties by position are unaffected.
+    ///
+    /// Debug builds cross-check each visited candidate against `unifies`, and
+    /// check that narrowing dropped no atom the full scan would have matched.
+    fn for_each_match(
+        &self,
+        relation: Relation,
+        predicate: Predicate,
+        ctx: &TypeContext,
+        pattern: &mut AtomPattern,
+        unifies: impl Fn(&Atom) -> bool,
+        mut visit: impl FnMut(&Atom) -> bool,
+    ) {
+        let (table, index) = match relation {
+            Relation::Positive => (&self.predicate_atoms, &self.atom_index),
+            Relation::Negated => (&self.predicate_negations, &self.negation_index),
+        };
+        let Some(atoms) = table.get(&predicate) else {
+            return;
+        };
+        let candidates = index
+            .get(&predicate)
+            .and_then(|index| index.candidates(pattern));
+
+        #[cfg(debug_assertions)]
+        if let Some(candidates) = candidates {
+            for (position, atom) in atoms.iter().enumerate() {
+                assert!(
+                    !pattern.matches(ctx, &atom.terms) || candidates.contains(&(position as u32)),
+                    "the positional index dropped a matching atom"
+                );
+            }
+        }
+
+        let mut scan = |atom: &Atom| {
+            let matched = pattern.matches(ctx, &atom.terms);
+            debug_assert_eq!(
+                matched,
+                unifies(atom),
+                "AtomPattern::matches diverged from Bindings::unify"
+            );
+            !matched || visit(atom)
+        };
+        match candidates {
+            Some(candidates) => {
+                for &position in candidates {
+                    if !scan(&atoms[position as usize]) {
+                        return;
+                    }
+                }
+            }
+            None => {
+                for atom in atoms {
+                    if !scan(atom) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn heuristic_value_atom(
         &self,
         atom: &Atom,
@@ -460,29 +614,17 @@ impl PlanningGraph {
                     return self.heuristic_value_atom(&ground, 0, None);
                 }
                 let mut value = HeuristicValue::INFINITE;
-                if let Some(ground_atoms) = self.predicate_atoms.get(&atom.predicate) {
-                    for a in ground_atoms {
-                        let m = pattern.matches(ctx, &a.terms);
-                        debug_assert_eq!(
-                            m,
-                            b.unify(
-                                ctx,
-                                &Literal::Atom(atom.clone()),
-                                step_id,
-                                &Literal::Atom(a.clone()),
-                                0
-                            ),
-                            "AtomPattern::matches diverged from Bindings::unify"
-                        );
-                        if m {
-                            let v = self.heuristic_value_atom(a, 0, None);
-                            value = hv_min(value, v);
-                            if value.zero() {
-                                return value;
-                            }
-                        }
-                    }
-                }
+                self.for_each_match(
+                    Relation::Positive,
+                    atom.predicate,
+                    ctx,
+                    &mut pattern,
+                    |candidate| unifies(ctx, b, atom, step_id, candidate),
+                    |candidate| {
+                        value = hv_min(value, self.heuristic_value_atom(candidate, 0, None));
+                        !value.zero()
+                    },
+                );
                 value
             }
         }
@@ -526,29 +668,17 @@ impl PlanningGraph {
                     };
                 }
                 let mut value = HeuristicValue::INFINITE;
-                if let Some(ground_atoms) = self.predicate_negations.get(&atom.predicate) {
-                    for a in ground_atoms {
-                        let m = pattern.matches(ctx, &a.terms);
-                        debug_assert_eq!(
-                            m,
-                            b.unify(
-                                ctx,
-                                &Literal::Atom(atom.clone()),
-                                step_id,
-                                &Literal::Atom(a.clone()),
-                                0
-                            ),
-                            "AtomPattern::matches diverged from Bindings::unify"
-                        );
-                        if m {
-                            let v = self.heuristic_value_atom(a, 0, None);
-                            value = hv_min(value, v);
-                            if value.zero() {
-                                return value;
-                            }
-                        }
-                    }
-                }
+                self.for_each_match(
+                    Relation::Negated,
+                    atom.predicate,
+                    ctx,
+                    &mut pattern,
+                    |candidate| unifies(ctx, b, atom, step_id, candidate),
+                    |candidate| {
+                        value = hv_min(value, self.heuristic_value_atom(candidate, 0, None));
+                        !value.zero()
+                    },
+                );
                 value
             }
         }
@@ -809,26 +939,20 @@ impl PlanningGraph {
         // Lifted: pick the cheapest reachable ground atom that unifies.
         let mut best: Option<(Atom, f32)> = None;
         let mut pattern = bindings.resolve_pattern(ctx, &atom.terms, step_id);
-        for a in self.predicate_atoms.get(&atom.predicate)? {
-            let m = pattern.matches(ctx, &a.terms);
-            debug_assert_eq!(
-                m,
-                bindings.unify(
-                    ctx,
-                    &Literal::Atom(atom.clone()),
-                    step_id,
-                    &Literal::Atom(a.clone()),
-                    0
-                ),
-                "AtomPattern::matches diverged from Bindings::unify"
-            );
-            if m {
-                let c = self.heuristic_value_atom(a, 0, None).add_cost();
-                if best.as_ref().map_or(true, |(_, bc)| c < *bc) {
-                    best = Some((a.clone(), c));
+        self.for_each_match(
+            Relation::Positive,
+            atom.predicate,
+            ctx,
+            &mut pattern,
+            |candidate| unifies(ctx, bindings, atom, step_id, candidate),
+            |candidate| {
+                let cost = self.heuristic_value_atom(candidate, 0, None).add_cost();
+                if best.as_ref().is_none_or(|(_, best_cost)| cost < *best_cost) {
+                    best = Some((candidate.clone(), cost));
                 }
-            }
-        }
+                true
+            },
+        );
         best.map(|(a, _)| a)
     }
 

@@ -1091,6 +1091,20 @@ impl AtomPattern {
             .collect()
     }
 
+    /// The argument positions the pattern fixes to an object. These are the
+    /// positions a relation index can probe; the remaining positions still need
+    /// [`AtomPattern::matches`] for their type, equality-class and
+    /// non-codesignation constraints.
+    pub fn bound_positions(&self) -> impl Iterator<Item = (usize, Object)> + '_ {
+        self.terms
+            .iter()
+            .enumerate()
+            .filter_map(|(position, term)| match term {
+                PatTerm::Obj(object) => Some((position, *object)),
+                PatTerm::Var { .. } => None,
+            })
+    }
+
     /// Whether a ground candidate's terms unify with the pattern under the
     /// bindings it was resolved against.
     pub fn matches(&mut self, ctx: &TypeContext, ground_terms: &[Term]) -> bool {
