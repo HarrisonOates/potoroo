@@ -8,7 +8,7 @@
 //! already an object, so the same interface degenerates to constant equality
 //! checks.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
@@ -331,17 +331,17 @@ struct VarsetIndex {
     ncd_constants: FastMap<StepVariable, Vec<Object>>,
 }
 
-/// Chains shorter than this are scanned linearly: for them the hash-map
-/// builds cost more than the scans they replace.
-const INDEX_THRESHOLD: usize = 64;
+/// Chains shorter than this are scanned linearly: for them the hash-map build
+/// costs more than the scans it replaces. Above it an index is built on first
+/// use — children then inherit it (see [`Bindings::add`]), so the build is
+/// amortised over a whole subtree rather than repeated per node.
+const INDEX_THRESHOLD: usize = 8;
 
 /// Number of lookups on one `Bindings` before its chain is worth indexing.
 /// Plans that are ranked once and parked (or expanded with few unifications)
 /// stay on linear scans; lookup-heavy evaluations (e.g. the reuse-aware
 /// heuristics probing every step effect per open condition) promote quickly
 /// and amortise the build.
-const PROMOTE_AFTER: u32 = 48;
-
 /// Longest prefix of not-yet-indexed varsets tolerated in front of an
 /// inherited index before the chain is re-indexed from scratch. Bounds the
 /// per-`resolve_pattern` exclusion scan, while amortising the O(chain)
@@ -353,15 +353,15 @@ const MAX_INDEX_PREFIX: usize = 32;
 /// the hash maps.
 const MAX_OVERLAY: usize = 96;
 
-/// Flat lookup entries for the varsets newer than a shared [`VarsetIndex`],
-/// ordered oldest→newest (lookups iterate in reverse so the newest class
-/// wins, matching a head-first scan). `depth` is the node's distance from the
-/// chain tail — stable as children cons more varsets on — and converts to a
-/// head-relative position as `num_varsets - 1 - depth`.
+/// Lookup entries for the varsets newer than a shared [`VarsetIndex`].
+/// Entries are inserted oldest→newest so that the newest class overwrites any
+/// older one and wins, matching a head-first scan. `depth` is the node's
+/// distance from the chain tail — stable as children cons more varsets on —
+/// and converts to a head-relative position as `num_varsets - 1 - depth`.
 #[derive(Debug, Default, Clone)]
 struct Overlay {
-    vars: Vec<(StepVariable, u32, Rc<Chain<Varset>>)>,
-    objs: Vec<(Object, u32, Rc<Chain<Varset>>)>,
+    vars: FastMap<StepVariable, (u32, Rc<Chain<Varset>>)>,
+    objs: FastMap<Object, (u32, Rc<Chain<Varset>>)>,
 }
 
 /// Whether a chain is worth indexing (cached alongside the index itself).
@@ -399,10 +399,8 @@ fn lookup_var_in(
             overlay,
             ix,
         } => {
-            for (sv, depth, node) in overlay.vars.iter().rev() {
-                if sv.0 == var && sv.1 == step_id {
-                    return Some((num_varsets - 1 - *depth as usize, node.clone()));
-                }
+            if let Some((depth, node)) = overlay.vars.get(&(var, step_id)) {
+                return Some((num_varsets - 1 - *depth as usize, node.clone()));
             }
             ix.vars
                 .get(&(var, step_id))
@@ -425,10 +423,8 @@ fn lookup_obj_in(
             overlay,
             ix,
         } => {
-            for (o, depth, node) in overlay.objs.iter().rev() {
-                if *o == obj {
-                    return Some((num_varsets - 1 - *depth as usize, node.clone()));
-                }
+            if let Some((depth, node)) = overlay.objs.get(&obj) {
+                return Some((num_varsets - 1 - *depth as usize, node.clone()));
             }
             ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))
         }
@@ -480,12 +476,9 @@ pub struct Bindings {
     /// Chain length, maintained incrementally so the index/scan decision is
     /// O(1) — short chains never touch the cache below.
     num_varsets: usize,
-    /// Lookups performed so far; long chains promote to an index only after
-    /// `PROMOTE_AFTER` of them (see `index_state`).
-    probes: Cell<u32>,
-    /// Lookup index, built after enough lookups on a long chain. Dropped after
-    /// each plan ranking (see `clear_index`) so the many queued-but-never-
-    /// expanded plans don't retain an O(chain) side table each.
+    /// Lookup index, built on first use once the chain reaches
+    /// [`INDEX_THRESHOLD`] and thereafter inherited by descendants, so parked
+    /// plans share one table rather than each holding their own.
     index: RefCell<Option<IndexState>>,
 }
 
@@ -503,13 +496,6 @@ impl Bindings {
         }
         if let Some(s) = self.index.borrow().as_ref() {
             return s.clone();
-        }
-        // Long chain, no index yet: only build one once this instance has
-        // seen enough lookups to amortise the build.
-        let probes = self.probes.get();
-        if probes < PROMOTE_AFTER {
-            self.probes.set(probes + 1);
-            return IndexState::Small;
         }
         let state = {
             let mut ix = VarsetIndex::default();
@@ -833,13 +819,15 @@ impl Bindings {
                             nodes.push(n.clone());
                             cur = &n.tail;
                         }
+                        // Oldest first, so a newer class overwrites an older
+                        // entry for the same key and wins the lookup.
                         for (i, n) in nodes.iter().enumerate().rev() {
                             let depth = (num_varsets - 1 - i) as u32;
                             for sv in chain::iter(&n.head.cd_set) {
-                                ov.vars.push((*sv, depth, n.clone()));
+                                ov.vars.insert(*sv, (depth, n.clone()));
                             }
                             if let Some(c) = n.head.constant {
-                                ov.objs.push((c, depth, n.clone()));
+                                ov.objs.insert(c, (depth, n.clone()));
                             }
                         }
                         (ov.vars.len() + ov.objs.len() <= MAX_OVERLAY).then(|| {
@@ -859,7 +847,6 @@ impl Bindings {
                 varsets,
                 high_step,
                 num_varsets,
-                probes: Cell::new(0),
                 index: RefCell::new(index),
             })
         })
