@@ -148,15 +148,17 @@ struct AtomIndex {
 }
 
 impl AtomIndex {
-    fn build(atoms: &[Atom]) -> AtomIndex {
-        let arity = atoms.first().map_or(0, |atom| atom.terms.len());
-        let mut positions = vec![FastMap::default(); arity];
-        for (position, atom) in atoms.iter().enumerate() {
+    fn build<'a>(atoms: impl Iterator<Item = &'a Atom>) -> AtomIndex {
+        let mut positions: Vec<FastMap<Object, Vec<u32>>> = Vec::new();
+        for (position, atom) in atoms.enumerate() {
+            if positions.len() < atom.terms.len() {
+                positions.resize_with(atom.terms.len(), FastMap::default);
+            }
             for (argument, &term) in atom.terms.iter().enumerate() {
                 if let Term::Object(object) = term {
                     positions[argument]
                         .entry(object)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(position as u32);
                 }
             }
@@ -164,14 +166,14 @@ impl AtomIndex {
         AtomIndex { positions }
     }
 
-    /// The shortest posting list among the pattern's fixed positions, or `None`
-    /// when the pattern fixes nothing and the whole relation must be scanned. A
-    /// fixed position whose object never occurs there yields an empty list,
-    /// which decides the lookup outright.
-    fn candidates(&self, pattern: &AtomPattern) -> Option<&[u32]> {
+    /// The shortest posting list among the argument positions the caller has
+    /// already fixed to an object, or `None` when nothing is fixed and the whole
+    /// relation must be scanned. A fixed position whose object never occurs
+    /// there yields an empty list, which decides the lookup outright.
+    fn candidates(&self, bound: impl Iterator<Item = (usize, Object)>) -> Option<&[u32]> {
         const NONE: &[u32] = &[];
         let mut best: Option<&[u32]> = None;
-        for (position, object) in pattern.bound_positions() {
+        for (position, object) in bound {
             let posting = self
                 .positions
                 .get(position)
@@ -179,6 +181,9 @@ impl AtomIndex {
                 .map_or(NONE, |atoms| atoms.as_slice());
             if best.is_none_or(|shortest| posting.len() < shortest.len()) {
                 best = Some(posting);
+            }
+            if best.is_some_and(<[u32]>::is_empty) {
+                break;
             }
         }
         best
@@ -213,7 +218,7 @@ fn group_by_predicate<'a>(
     }
     let index = table
         .iter()
-        .map(|(&predicate, atoms)| (predicate, AtomIndex::build(atoms)))
+        .map(|(&predicate, atoms)| (predicate, AtomIndex::build(atoms.iter())))
         .collect();
     (table, index)
 }
@@ -549,7 +554,7 @@ impl PlanningGraph {
         };
         let candidates = index
             .get(&predicate)
-            .and_then(|index| index.candidates(pattern));
+            .and_then(|index| index.candidates(pattern.bound_positions()));
 
         #[cfg(debug_assertions)]
         if let Some(candidates) = candidates {
@@ -1171,8 +1176,8 @@ struct JoinEnum<'a> {
     /// Positive precondition conjuncts (the join queries).
     join: Vec<&'a Atom>,
     used: Vec<bool>,
-    /// Currently-reachable ground atoms, by predicate.
-    atoms_by_pred: &'a HashMap<Predicate, Vec<&'a Atom>>,
+    /// Currently-reachable ground atoms, by predicate, with their indexes.
+    atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
     /// Type-compatible objects per parameter type (for the membership check on
     /// join-bound objects, and for enumerating join-unconstrained parameters).
     type_domains: &'a HashMap<Type, Vec<Object>>,
@@ -1183,7 +1188,7 @@ struct JoinEnum<'a> {
 impl<'a> JoinEnum<'a> {
     fn new(
         schema: &'a ActionSchema,
-        atoms_by_pred: &'a HashMap<Predicate, Vec<&'a Atom>>,
+        atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
         type_domains: &'a HashMap<Type, Vec<Object>>,
         type_sets: &'a HashMap<Type, HashSet<Object>>,
     ) -> Self {
@@ -1220,7 +1225,10 @@ impl<'a> JoinEnum<'a> {
                 .iter()
                 .filter(|t| matches!(t, Term::Variable(v) if !self.subst.contains_key(v)))
                 .count();
-            let cands = self.atoms_by_pred.get(&ja.predicate).map_or(0, |v| v.len());
+            let cands = self
+                .atoms_by_pred
+                .get(&ja.predicate)
+                .map_or(0, |relation| relation.atoms.len());
             let key = (unbound, cands);
             if pick.map_or(true, |(_, k)| key < k) {
                 pick = Some((i, key));
@@ -1233,63 +1241,89 @@ impl<'a> JoinEnum<'a> {
             return;
         };
         self.used[i] = true;
-        let ja: &Atom = self.join[i];
-        // Copy the candidate list (references only) so the loop doesn't hold a
-        // borrow of `self` across the recursive call.
-        let cands: Vec<&Atom> = self
-            .atoms_by_pred
-            .get(&ja.predicate)
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        {
-            'cand: for ga in cands {
-                // Match the conjunct against the ground candidate under the
-                // partial substitution, binding its unbound variables.
-                let mut newly_bound: Vec<Variable> = Vec::new();
-                let mut ok = true;
-                for (t, gt) in ja.terms.iter().zip(ga.terms.iter()) {
-                    let Term::Object(o) = gt else {
-                        ok = false;
-                        break;
-                    };
-                    match t {
-                        Term::Object(p) => {
-                            if p != o {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        Term::Variable(v) => match self.subst.get(v) {
-                            Some(b) => {
-                                if b != o {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            None => {
-                                // The Cartesian enumeration only ever tried
-                                // objects from the parameter's type domain.
-                                if !self.type_sets[&self.var_type(*v)].contains(o) {
-                                    for v in newly_bound {
-                                        self.subst.remove(&v);
-                                    }
-                                    continue 'cand;
-                                }
-                                self.subst.insert(*v, *o);
-                                newly_bound.push(*v);
-                            }
-                        },
+        let ja: &'a Atom = self.join[i];
+        // `atoms_by_pred` outlives `self`, so copying the reference out lets the
+        // candidate loop borrow the relation across the recursive call instead
+        // of cloning it at every join step.
+        let relations = self.atoms_by_pred;
+        if let Some(relation) = relations.get(&ja.predicate) {
+            // Probe the index with the conjunct's constants plus the variables
+            // the partial substitution has already bound: the deeper the join
+            // recursion, the more selective the probe. Positions still free stay
+            // open and are matched candidate by candidate.
+            let bound = ja.terms.iter().enumerate().filter_map(|(position, term)| {
+                let object = match term {
+                    Term::Object(object) => *object,
+                    Term::Variable(variable) => *self.subst.get(variable)?,
+                };
+                Some((position, object))
+            });
+            match relation.index.candidates(bound) {
+                Some(candidates) => {
+                    for &position in candidates {
+                        self.match_candidate(ja, relation.atoms[position as usize], visit);
                     }
                 }
-                if ok {
-                    self.run(visit);
-                }
-                for v in newly_bound {
-                    self.subst.remove(&v);
+                None => {
+                    for &candidate in &relation.atoms {
+                        self.match_candidate(ja, candidate, visit);
+                    }
                 }
             }
         }
         self.used[i] = false;
+    }
+
+    /// Matches one join conjunct against a ground candidate under the partial
+    /// substitution, recursing when it unifies and undoing its bindings after.
+    fn match_candidate(
+        &mut self,
+        conjunct: &'a Atom,
+        candidate: &'a Atom,
+        visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object]),
+    ) {
+        let mut newly_bound: Vec<Variable> = Vec::new();
+        let mut ok = true;
+        for (t, gt) in conjunct.terms.iter().zip(candidate.terms.iter()) {
+            let Term::Object(o) = gt else {
+                ok = false;
+                break;
+            };
+            match t {
+                Term::Object(p) => {
+                    if p != o {
+                        ok = false;
+                        break;
+                    }
+                }
+                Term::Variable(v) => match self.subst.get(v) {
+                    Some(b) => {
+                        if b != o {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        // The Cartesian enumeration only ever tried objects
+                        // from the parameter's type domain.
+                        if !self.type_sets[&self.var_type(*v)].contains(o) {
+                            for v in newly_bound {
+                                self.subst.remove(&v);
+                            }
+                            return;
+                        }
+                        self.subst.insert(*v, *o);
+                        newly_bound.push(*v);
+                    }
+                },
+            }
+        }
+        if ok {
+            self.run(visit);
+        }
+        for v in newly_bound {
+            self.subst.remove(&v);
+        }
     }
 
     /// Enumerates parameters not bound by any join conjunct over their type
@@ -1310,8 +1344,9 @@ impl<'a> JoinEnum<'a> {
             return;
         }
         let v = params[k];
-        let domain = self.type_domains[&self.var_type(v)].clone();
-        for obj in domain {
+        let ty = self.var_type(v);
+        let domains = self.type_domains;
+        for &obj in &domains[&ty] {
             self.subst.insert(v, obj);
             self.enumerate_rest(k + 1, visit);
         }
@@ -1319,15 +1354,28 @@ impl<'a> JoinEnum<'a> {
     }
 }
 
-/// Groups the currently-reachable atoms by predicate for the join.
+/// One predicate's currently-reachable atoms, with the positional index the
+/// join probes with the variables its partial substitution has already bound.
+struct JoinRelation<'a> {
+    atoms: Vec<&'a Atom>,
+    index: AtomIndex,
+}
+
+/// Groups the currently-reachable atoms by predicate for the join, indexing
+/// each relation.
 fn atoms_by_predicate(
     atom_values: &HashMap<Atom, HeuristicValue>,
-) -> HashMap<Predicate, Vec<&Atom>> {
-    let mut map: HashMap<Predicate, Vec<&Atom>> = HashMap::new();
+) -> FastMap<Predicate, JoinRelation<'_>> {
+    let mut map: FastMap<Predicate, Vec<&Atom>> = FastMap::default();
     for atom in atom_values.keys() {
         map.entry(atom.predicate).or_default().push(atom);
     }
-    map
+    map.into_iter()
+        .map(|(predicate, atoms)| {
+            let index = AtomIndex::build(atoms.iter().copied());
+            (predicate, JoinRelation { atoms, index })
+        })
+        .collect()
 }
 
 /// Per-tuple processing of `apply_schema_tuples`: updates `new_atom_values` /
