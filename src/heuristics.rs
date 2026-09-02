@@ -779,8 +779,9 @@ impl FlawSelectionOrder {
     }
 
     /// Parsed criteria for search representations that implement their own
-    /// flaw objects. SAS+ threats are ground and therefore non-separable, but
-    /// the ordering and refinement-count rules are otherwise shared.
+    /// flaw objects. A ground SAS+ threat has no unifier to separate, so `{s}`
+    /// selects the threats resolvable by confrontation instead; the ordering
+    /// and refinement-count rules are otherwise shared.
     pub(crate) fn criteria(&self) -> &[SelectionCriterion] {
         &self.selection_criteria
     }

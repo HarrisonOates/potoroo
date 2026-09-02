@@ -6,6 +6,17 @@
 //! explicit delete fact. The refinement semantics stay representation-specific,
 //! while plan ranking, flaw-order configuration, search algorithms, limits, and
 //! statistics follow the main search implementation.
+//!
+//! Threats from conditional assignments also admit *confrontation*, UCPOP's
+//! resolver for conditional effects, which VHPOP folds into separation: the
+//! effect only clobbers the link when all of its conditions hold, so committing
+//! the threatening step to another value of a condition variable disarms it
+//! without ordering the step out of the protected interval. Over a finite
+//! domain the negated antecedent `y != c` is the disjunction over the remaining
+//! values of `y`, so each alternative becomes a refinement of its own rather
+//! than a disjunctive open condition. By the same reading, an effect whose
+//! antecedent is already contradicted at its step can never fire and is not
+//! reported as a threat.
 
 use std::borrow::Cow;
 use std::cmp::Ordering as CmpOrdering;
@@ -66,6 +77,9 @@ pub struct PartialPlan {
     pub open_conditions: Rc<Vec<OpenCondition>>,
     pub orderings: Rc<BinaryOrderings>,
     threats: Rc<Vec<Threat>>,
+    /// Conditional effects `(step, effect)` that a confrontation refinement has
+    /// committed never to fire. Sorted, so membership is a binary search.
+    suppressed: Rc<Vec<(usize, usize)>>,
     /// Accumulated cost of committed operators.
     pub cost: usize,
     next_step_id: usize,
@@ -89,6 +103,7 @@ impl PartialPlan {
             ),
             orderings: Rc::new(BinaryOrderings::new()),
             threats: Rc::new(Vec::new()),
+            suppressed: Rc::new(Vec::new()),
             cost: 0,
             next_step_id: 1,
             id: 0,
@@ -119,7 +134,9 @@ impl PartialPlan {
                 for (effect_index, effect) in
                     task.operators[step.operator].effects.iter().enumerate()
                 {
-                    if effect_clobbers(effect.variable, effect.post, link.condition) {
+                    if effect_clobbers(effect.variable, effect.post, link.condition)
+                        && !self.effect_cannot_fire(task, step, effect_index)
+                    {
                         threats.push(Threat {
                             step: step.id,
                             effect: effect_index,
@@ -130,6 +147,57 @@ impl PartialPlan {
             }
         }
         threats
+    }
+
+    /// The committed step with the given id. Steps are only ever appended, so
+    /// `id` doubles as a 1-based index into [`PartialPlan::steps`].
+    fn step(&self, id: usize) -> Option<&Step> {
+        id.checked_sub(1)
+            .and_then(|index| self.steps.get(index))
+            .filter(|step| step.id == id)
+    }
+
+    /// Whether `step` is already committed to a value of `fact`'s variable
+    /// other than `fact.value`. Open conditions count as commitments: they are
+    /// only ever discharged by a causal link carrying the very same equality,
+    /// and a finite-domain variable holds one value at a time.
+    fn step_excludes(&self, step: usize, fact: Fact) -> bool {
+        let conflicts = |condition: Fact| {
+            condition.variable == fact.variable && condition.value != fact.value
+        };
+        self.open_conditions
+            .iter()
+            .any(|open| open.consumer == step && conflicts(open.condition))
+            || self
+                .links
+                .iter()
+                .any(|link| link.consumer == step && conflicts(link.condition))
+    }
+
+    /// Whether `effect` of `step` can never fire, and therefore neither
+    /// threatens a link nor establishes one: a confrontation refinement
+    /// suppressed it, or the step is already committed against one of the
+    /// effect's conditions.
+    fn effect_cannot_fire(&self, task: &Task, step: &Step, effect: usize) -> bool {
+        if self.effect_suppressed(step.id, effect) {
+            return true;
+        }
+        task.operators[step.operator].effects[effect]
+            .conditions
+            .iter()
+            .any(|&condition| self.step_excludes(step.id, condition))
+    }
+
+    fn effect_suppressed(&self, step: usize, effect: usize) -> bool {
+        !self.suppressed.is_empty() && self.suppressed.binary_search(&(step, effect)).is_ok()
+    }
+
+    fn suppress_effect(&mut self, step: usize, effect: usize) {
+        let key = (step, effect);
+        let suppressed = Rc::make_mut(&mut self.suppressed);
+        if let Err(index) = suppressed.binary_search(&key) {
+            suppressed.insert(index, key);
+        }
     }
 
     fn can_be_inside(&self, step_id: usize, link: &CausalLink) -> bool {
@@ -156,12 +224,7 @@ impl PartialPlan {
         if threat.step == link.producer || threat.step == link.consumer {
             return false;
         }
-        let Some(step) = threat
-            .step
-            .checked_sub(1)
-            .and_then(|index| self.steps.get(index))
-            .filter(|step| step.id == threat.step)
-        else {
+        let Some(step) = self.step(threat.step) else {
             return false;
         };
         let Some(effect) = task.operators[step.operator].effects.get(threat.effect) else {
@@ -169,6 +232,7 @@ impl PartialPlan {
         };
         self.can_be_inside(step.id, link)
             && effect_clobbers(effect.variable, effect.post, link.condition)
+            && !self.effect_cannot_fire(task, step, threat.effect)
     }
 
     fn retain_active_threats(&mut self, task: &Task) {
@@ -200,7 +264,9 @@ impl PartialPlan {
                 continue;
             }
             for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_clobbers(effect.variable, effect.post, link.condition) {
+                if effect_clobbers(effect.variable, effect.post, link.condition)
+                    && !self.effect_cannot_fire(task, step, effect_index)
+                {
                     additions.push(Threat {
                         step: step.id,
                         effect: effect_index,
@@ -228,7 +294,9 @@ impl PartialPlan {
                 continue;
             }
             for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_clobbers(effect.variable, effect.post, link.condition) {
+                if effect_clobbers(effect.variable, effect.post, link.condition)
+                    && !self.effect_cannot_fire(task, step, effect_index)
+                {
                     additions.push(Threat {
                         step: step.id,
                         effect: effect_index,
@@ -768,7 +836,10 @@ impl<'a> Planner<'a> {
                 ) {
                     continue;
                 }
-                for achiever in achievers.iter().filter(|a| a.operator == step.operator) {
+                for achiever in achievers.iter().filter(|a| {
+                    a.operator == step.operator
+                        && !plan.effect_cannot_fire(self.task, step, a.effect)
+                }) {
                     let effect = &self.task.operators[achiever.operator].effects[achiever.effect];
                     if let Some(child) = self.support(
                         plan,
@@ -882,9 +953,60 @@ impl<'a> Planner<'a> {
         Some(child)
     }
 
+    /// The values confrontation can demand of the threatening step: the negated
+    /// antecedent `y != c`, which over a finite domain is the disjunction over
+    /// the remaining values of `y`, one refinement per alternative. Values the
+    /// step is already committed against are skipped, since those children would
+    /// be immediately inconsistent.
+    fn confrontations(&self, plan: &PartialPlan, threat: &Threat) -> Vec<Fact> {
+        let Some(step) = plan.step(threat.step) else {
+            return Vec::new();
+        };
+        let conditions = &self.task.operators[step.operator].effects[threat.effect].conditions;
+        let mut alternatives: Vec<Fact> = Vec::new();
+        for condition in conditions {
+            for value in 0..self.task.variables[condition.variable].values.len() {
+                let alternative = Fact::new(condition.variable, value);
+                if value == condition.value
+                    || alternatives.contains(&alternative)
+                    || plan.step_excludes(threat.step, alternative)
+                {
+                    continue;
+                }
+                alternatives.push(alternative);
+            }
+        }
+        alternatives
+    }
+
     fn resolve_threat(&self, plan: &PartialPlan, threat: &Threat) -> Vec<PartialPlan> {
         let link = &plan.links[threat.link];
-        let mut children = Vec::with_capacity(2);
+        let mut children = Vec::new();
+
+        // Confrontation: UCPOP's resolver for conditional effects, which VHPOP
+        // folds into separation. Committing the threatening step to another
+        // value of one of its effect's condition variables disarms the
+        // assignment without constraining where the step may be placed. Emitted
+        // first so the newest-generated tiebreaker keeps preferring the ordering
+        // resolvers.
+        for alternative in self.confrontations(plan, threat) {
+            let mut child = plan.clone();
+            child.suppress_effect(threat.step, threat.effect);
+            // An established link already commits the step to the alternative
+            // value, so only an unsupported one needs a new open condition.
+            let linked = plan
+                .links
+                .iter()
+                .any(|link| link.consumer == threat.step && link.condition == alternative);
+            if !linked {
+                child.push_open(OpenCondition {
+                    consumer: threat.step,
+                    condition: alternative,
+                });
+            }
+            child.retain_active_threats(self.task);
+            children.push(child);
+        }
 
         // Promotion: threatening step after the consumer. No step can follow the
         // synthetic goal. Emit promotion first so the newest-generated GBFS
@@ -959,9 +1081,19 @@ impl<'a> Planner<'a> {
                 OrderType::Lc | OrderType::Mc | OrderType::Lw | OrderType::Mw
             )
             .then(|| self.relaxed_values(plan, criterion.reuse));
-            if criterion.non_separable {
+            if criterion.non_separable || criterion.separable {
                 for (index, threat) in threats.iter().enumerate() {
-                    let refinements = self.threat_refinement_count(plan, threat);
+                    // A ground threat has no unifier to separate, so
+                    // confrontability is all that remains of VHPOP's separation
+                    // refinement and is what `{s}` selects here.
+                    let confrontations = self.confrontations(plan, threat).len();
+                    let applies = (criterion.non_separable && criterion.separable)
+                        || (criterion.separable && confrontations > 0)
+                        || (criterion.non_separable && confrontations == 0);
+                    if !applies {
+                        continue;
+                    }
+                    let refinements = self.threat_refinement_count(plan, threat, confrontations);
                     if refinements <= criterion.max_refinements {
                         candidates.push(FlawCandidate {
                             flaw: SelectedFlaw::Threat(threat.clone()),
@@ -1037,11 +1169,20 @@ impl<'a> Planner<'a> {
             ) && self.task.operators[step.operator]
                 .effects
                 .iter()
-                .any(|effect| effect_clobbers(effect.variable, effect.post, open.condition))
+                .enumerate()
+                .any(|(index, effect)| {
+                    effect_clobbers(effect.variable, effect.post, open.condition)
+                        && !plan.effect_cannot_fire(self.task, step, index)
+                })
         })
     }
 
-    fn threat_refinement_count(&self, plan: &PartialPlan, threat: &Threat) -> i32 {
+    fn threat_refinement_count(
+        &self,
+        plan: &PartialPlan,
+        threat: &Threat,
+        confrontations: usize,
+    ) -> i32 {
         let link = &plan.links[threat.link];
         let demote = link.producer != INIT_ID
             && plan.orderings.possibly_before(
@@ -1057,7 +1198,9 @@ impl<'a> Planner<'a> {
                 threat.step,
                 StepTime::AtEnd,
             );
-        i32::from(demote) + i32::from(promote)
+        i32::from(demote)
+            .saturating_add(i32::from(promote))
+            .saturating_add(i32::try_from(confrontations).unwrap_or(i32::MAX))
     }
 
     fn open_refinement_count(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
@@ -1078,7 +1221,10 @@ impl<'a> Planner<'a> {
                     count = count.saturating_add(
                         achievers
                             .iter()
-                            .filter(|achiever| achiever.operator == step.operator)
+                            .filter(|achiever| {
+                                achiever.operator == step.operator
+                                    && !plan.effect_cannot_fire(self.task, step, achiever.effect)
+                            })
                             .count() as i32,
                     );
                 }
@@ -1100,9 +1246,10 @@ impl<'a> Planner<'a> {
                         StepTime::AtEnd,
                         open.consumer,
                         StepTime::AtStart,
-                    ) && achievers
-                        .iter()
-                        .any(|achiever| achiever.operator == step.operator)
+                    ) && achievers.iter().any(|achiever| {
+                        achiever.operator == step.operator
+                            && !plan.effect_cannot_fire(self.task, step, achiever.effect)
+                    })
                 })
             })
     }
@@ -1215,7 +1362,9 @@ impl<'a> Planner<'a> {
                     self.task.operators[step.operator]
                         .effects
                         .iter()
-                        .map(|effect| effect.assignment())
+                        .enumerate()
+                        .filter(|&(index, _)| !plan.effect_cannot_fire(self.task, step, index))
+                        .map(|(_, effect)| effect.assignment())
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -1253,7 +1402,10 @@ impl<'a> Planner<'a> {
         let mut values = self.base_relaxed.clone();
         let mut changed = false;
         for step in plan.steps.iter() {
-            for effect in &self.task.operators[step.operator].effects {
+            for (index, effect) in self.task.operators[step.operator].effects.iter().enumerate() {
+                if plan.effect_cannot_fire(self.task, step, index) {
+                    continue;
+                }
                 if values.cost[effect.variable][effect.post] != 0.0 {
                     values.cost[effect.variable][effect.post] = 0.0;
                     changed = true;
@@ -1287,7 +1439,9 @@ impl<'a> Planner<'a> {
                     self.task.operators[step.operator]
                         .effects
                         .iter()
-                        .map(|effect| effect.assignment())
+                        .enumerate()
+                        .filter(|&(index, _)| !plan.effect_cannot_fire(self.task, step, index))
+                        .map(|(_, effect)| effect.assignment())
                 })
                 .collect::<HashSet<_>>()
         } else {
@@ -1838,6 +1992,123 @@ mod tests {
         }
     }
 
+    /// A task solvable only by confrontation. `run` must follow `power-on` to
+    /// see `power = on`, so the conditional assignment that switches the power
+    /// back off can be neither demoted nor promoted, and the spent fuse rules
+    /// out establishing the goal with a second `power-on`. The single remaining
+    /// resolver is to commit `run` to `mode = safe`.
+    fn breaker_task() -> Task {
+        let binary = |name: &str, off: &str, on: &str| Variable {
+            name: name.to_string(),
+            values: vec![off.to_string(), on.to_string()],
+        };
+        Task {
+            variables: vec![
+                binary("power", "off", "on"),
+                binary("device", "idle", "done"),
+                binary("mode", "unsafe", "safe"),
+                binary("fuse", "intact", "spent"),
+            ],
+            initial: vec![0, 0, 0, 0],
+            goals: vec![Fact::new(0, 1), Fact::new(1, 1)],
+            operators: vec![
+                Operator {
+                    name: "power-on".to_string(),
+                    prevail: vec![],
+                    effects: vec![
+                        Effect {
+                            conditions: vec![],
+                            variable: 0,
+                            pre: Some(0),
+                            post: 1,
+                        },
+                        Effect {
+                            conditions: vec![],
+                            variable: 3,
+                            pre: Some(0),
+                            post: 1,
+                        },
+                    ],
+                    cost: 1,
+                },
+                Operator {
+                    name: "run".to_string(),
+                    prevail: vec![Fact::new(0, 1)],
+                    effects: vec![
+                        Effect {
+                            conditions: vec![],
+                            variable: 1,
+                            pre: Some(0),
+                            post: 1,
+                        },
+                        Effect {
+                            conditions: vec![Fact::new(2, 0)],
+                            variable: 0,
+                            pre: None,
+                            post: 0,
+                        },
+                    ],
+                    cost: 1,
+                },
+                Operator {
+                    name: "make-safe".to_string(),
+                    prevail: vec![],
+                    effects: vec![Effect {
+                        conditions: vec![],
+                        variable: 2,
+                        pre: Some(0),
+                        post: 1,
+                    }],
+                    cost: 1,
+                },
+            ],
+            axioms: vec![],
+        }
+    }
+
+    /// The plan in which `power-on` (step 1) supports the goal's `power = on`
+    /// and `run` (step 2) follows it, threatening that link.
+    fn trapped_breaker_plan() -> (PartialPlan, Threat) {
+        let orderings = Rc::new(BinaryOrderings::new())
+            .refine_with_step(
+                Ordering::new(1, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                1,
+            )
+            .unwrap()
+            .refine_with_step(
+                Ordering::new(2, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                2,
+            )
+            .unwrap()
+            .refine(Ordering::new(1, StepTime::AtEnd, 2, StepTime::AtStart))
+            .unwrap();
+        let threat = Threat {
+            step: 2,
+            effect: 1,
+            link: 0,
+        };
+        let plan = PartialPlan {
+            steps: Rc::new(vec![
+                Step { id: 1, operator: 0 },
+                Step { id: 2, operator: 1 },
+            ]),
+            links: Rc::new(vec![CausalLink {
+                producer: 1,
+                consumer: GOAL_ID,
+                condition: Fact::new(0, 1),
+                effect: Some(0),
+            }]),
+            open_conditions: Rc::new(vec![]),
+            orderings,
+            threats: Rc::new(vec![threat.clone()]),
+            suppressed: Rc::new(vec![]),
+            cost: 2,
+            next_step_id: 3,
+            id: 0,
+        };
+        (plan, threat)
+    }
+
     fn shared_effect_task() -> Task {
         Task {
             variables: vec![
@@ -2055,6 +2326,7 @@ mod tests {
                 effect: 0,
                 link: 0,
             }]),
+            suppressed: Rc::new(vec![]),
             cost: 2,
             next_step_id: 3,
             id: 0,
@@ -2077,6 +2349,108 @@ mod tests {
     }
 
     #[test]
+    fn confrontation_resolves_a_threat_no_ordering_can_fix() {
+        let task = breaker_task();
+        for algorithm in [
+            SearchAlgorithm::A,
+            SearchAlgorithm::Gbfs,
+            SearchAlgorithm::Bfs,
+        ] {
+            let params = Parameters {
+                search_algorithm: algorithm,
+                heuristic: Heuristic::parse("ADD").unwrap(),
+                search_limits: vec![10_000],
+                ..Parameters::default()
+            };
+            let (outcome, _) = solve_with_params(&task, &params).unwrap();
+            let Outcome::Solved(solution) = outcome else {
+                panic!("{algorithm:?} did not solve the breaker task");
+            };
+            let position = |operator: usize| {
+                solution
+                    .operators
+                    .iter()
+                    .position(|&chosen| chosen == operator)
+                    .unwrap_or_else(|| panic!("{algorithm:?} omitted operator {operator}"))
+            };
+            // `make-safe` must precede `run`, or `run` trips the breaker.
+            assert!(position(2) < position(1), "{algorithm:?} ran before making safe");
+            assert!(position(0) < position(1), "{algorithm:?} ran before powering on");
+            assert!(solution.plan.complete(&task));
+        }
+    }
+
+    #[test]
+    fn confrontation_is_the_only_resolver_of_a_trapped_conditional_effect() {
+        let task = breaker_task();
+        let planner = Planner::new(&task);
+        let (plan, threat) = trapped_breaker_plan();
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+
+        // Promotion cannot follow the goal and demotion contradicts `run`'s own
+        // ordering, so the only alternative value of `mode` is left.
+        assert_eq!(planner.confrontations(&plan, &threat), vec![Fact::new(2, 1)]);
+        let children = planner.resolve_threat(&plan, &threat);
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        assert_eq!(
+            *child.open_conditions,
+            vec![OpenCondition {
+                consumer: 2,
+                condition: Fact::new(2, 1),
+            }]
+        );
+        assert!(child.threats(&task).is_empty());
+        assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        assert!(child.effect_cannot_fire(&task, &child.steps[1], 1));
+
+        // The suppressed assignment is no longer available as a producer:
+        // reusing `run` to switch the power off drops out of the refinement
+        // count.
+        let switch_off = OpenCondition {
+            consumer: GOAL_ID,
+            condition: Fact::new(0, 0),
+        };
+        assert_eq!(
+            planner.open_refinement_count(child, &switch_off) + 1,
+            planner.open_refinement_count(&plan, &switch_off)
+        );
+    }
+
+    #[test]
+    fn a_step_committed_to_a_condition_value_has_no_confrontation() {
+        let task = breaker_task();
+        let planner = Planner::new(&task);
+        let (mut plan, threat) = trapped_breaker_plan();
+        Rc::make_mut(&mut plan.open_conditions).push(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(2, 0),
+        });
+
+        // `run` already requires `mode = unsafe`, so no alternative value is
+        // consistent and the threat is a dead end.
+        assert!(planner.confrontations(&plan, &threat).is_empty());
+        assert!(planner.resolve_threat(&plan, &threat).is_empty());
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+    }
+
+    #[test]
+    fn a_contradicted_condition_is_never_a_threat() {
+        let task = breaker_task();
+        let (mut plan, _) = trapped_breaker_plan();
+        Rc::make_mut(&mut plan.open_conditions).push(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(2, 1),
+        });
+        plan.retain_active_threats(&task);
+
+        // With `mode = safe` demanded at `run`, the conditional assignment can
+        // never fire and is not reported as a threat at all.
+        assert!(plan.threats(&task).is_empty());
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+    }
+
+    #[test]
     fn adding_a_link_discovers_threats_incrementally() {
         let task = travel_task();
         let orderings = Rc::new(BinaryOrderings::new())
@@ -2095,6 +2469,7 @@ mod tests {
             open_conditions: Rc::new(vec![open.clone()]),
             orderings,
             threats: Rc::new(vec![]),
+            suppressed: Rc::new(vec![]),
             cost: 1,
             next_step_id: 2,
             id: 0,

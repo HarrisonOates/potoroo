@@ -111,6 +111,19 @@ assigning another value to `location(truck)` is treated as a threat, without
 requiring an explicit delete proposition. With `-v`, Potoroo reports how many
 translated variables are genuinely multi-valued.
 
+Threats from conditional assignments are resolved by *confrontation* as well as
+by promotion and demotion. Confrontation is UCPOP's threat resolver for
+conditional effects, which VHPOP folds into its separation refinement: the
+effect only clobbers the link when all of its conditions hold, so the
+threatening step is committed to another value of a condition variable instead
+of being ordered out of the protected interval. Finite domains make the negated
+antecedent exact — `mode != unsafe` is the disjunction over the remaining values
+of `mode`, so each alternative is a refinement of its own rather than a
+disjunctive open condition — and by the same reading a threat is dropped
+outright once the step is already committed against one of the effect's
+conditions. A ground threat has no unifier to separate, so `{s}` selects the
+confrontable threats and `{n}` the rest.
+
 The finite-domain path consumes the normal search configuration: A*/IDA*/HC,
 BFS, GBFS, lazy/dual-queue GBFS, ALT, search weights and limits, and the
 flaw-order DSL. Cheap structural heuristics, `ADD`/`ADDR`, joint FF-style
@@ -120,8 +133,7 @@ operator costs are used by default, with `-a UNIT` available as an override.
 Fast Downward-generated axiom variables (used when normalizing quantified and
 disjunctive formulas) are expanded into base-fact support clauses at the
 consumer. The representation-specific `SAMPLE_FF`, `LPLAN`, and `COMPILE*`
-heuristics remain unavailable on FDR nodes, and conditional assignments are
-conservatively treated as potential threats. Native LM-cut currently requires
+heuristics remain unavailable on FDR nodes. Native LM-cut currently requires
 unconditional SAS+ effects.
 
 | Native FDR heuristic | Description |
