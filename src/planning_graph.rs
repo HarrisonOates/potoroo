@@ -1251,7 +1251,10 @@ struct JoinEnum<'a> {
     /// join-bound objects, and for enumerating join-unconstrained parameters).
     type_domains: &'a FastMap<Type, Vec<Object>>,
     type_sets: &'a FastMap<Type, FastSet<Object>>,
-    subst: FastMap<Variable, Object>,
+    /// Dense substitution indexed by `Variable.0`: schema variable indices are
+    /// small and contiguous, so an array beats a hash map for the per-candidate
+    /// read/write this join does at every step.
+    subst: Vec<Option<Object>>,
 }
 
 impl<'a> JoinEnum<'a> {
@@ -1293,13 +1296,14 @@ impl<'a> JoinEnum<'a> {
             atoms_by_pred,
             type_domains,
             type_sets,
-            subst: FastMap::default(),
+            subst: vec![None; var_types.len()],
         }
     }
 
-    /// Pre-binds variables fixed by an enclosing scope.
-    fn seed(&mut self, subst: &FastMap<Variable, Object>) {
-        self.subst.clone_from(subst);
+    /// Pre-binds variables fixed by an enclosing scope. `subst` is always the
+    /// same schema's dense substitution, so it's exactly as long as `self.subst`.
+    fn seed(&mut self, subst: &[Option<Object>]) {
+        self.subst.copy_from_slice(subst);
     }
 
     /// The declared type of a variable in the schema's scope.
@@ -1307,7 +1311,7 @@ impl<'a> JoinEnum<'a> {
         self.var_types[v.0 as usize]
     }
 
-    fn run(&mut self, visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object])) {
+    fn run(&mut self, visit: &mut dyn FnMut(&[Option<Object>], &[Object])) {
         // Pick the unused join conjunct with the fewest unbound variables,
         // tie-broken by smallest candidate list.
         let mut pick: Option<(usize, (usize, usize))> = None;
@@ -1318,7 +1322,7 @@ impl<'a> JoinEnum<'a> {
             let unbound = ja
                 .terms
                 .iter()
-                .filter(|t| matches!(t, Term::Variable(v) if !self.subst.contains_key(v)))
+                .filter(|t| matches!(t, Term::Variable(v) if self.subst[v.0 as usize].is_none()))
                 .count();
             let cands = self
                 .atoms_by_pred
@@ -1349,7 +1353,7 @@ impl<'a> JoinEnum<'a> {
             let bound = ja.terms.iter().enumerate().filter_map(|(position, term)| {
                 let object = match term {
                     Term::Object(object) => *object,
-                    Term::Variable(variable) => *self.subst.get(variable)?,
+                    Term::Variable(variable) => self.subst[variable.0 as usize]?,
                 };
                 Some((position, object))
             });
@@ -1375,7 +1379,7 @@ impl<'a> JoinEnum<'a> {
         &mut self,
         conjunct: &'a Atom,
         candidate: &'a Atom,
-        visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object]),
+        visit: &mut dyn FnMut(&[Option<Object>], &[Object]),
     ) {
         let mut newly_bound: Vec<Variable> = Vec::new();
         let mut ok = true;
@@ -1391,9 +1395,9 @@ impl<'a> JoinEnum<'a> {
                         break;
                     }
                 }
-                Term::Variable(v) => match self.subst.get(v) {
+                Term::Variable(v) => match self.subst[v.0 as usize] {
                     Some(b) => {
-                        if b != o {
+                        if b != *o {
                             ok = false;
                             break;
                         }
@@ -1403,11 +1407,11 @@ impl<'a> JoinEnum<'a> {
                         // from the parameter's type domain.
                         if !self.type_sets[&self.var_type(*v)].contains(o) {
                             for v in newly_bound {
-                                self.subst.remove(&v);
+                                self.subst[v.0 as usize] = None;
                             }
                             return;
                         }
-                        self.subst.insert(*v, *o);
+                        self.subst[v.0 as usize] = Some(*o);
                         newly_bound.push(*v);
                     }
                 },
@@ -1417,24 +1421,23 @@ impl<'a> JoinEnum<'a> {
             self.run(visit);
         }
         for v in newly_bound {
-            self.subst.remove(&v);
+            self.subst[v.0 as usize] = None;
         }
     }
 
     /// Enumerates parameters not bound by any join conjunct over their type
     /// domains, then emits the complete tuple.
-    fn enumerate_rest(
-        &mut self,
-        from: usize,
-        visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object]),
-    ) {
+    fn enumerate_rest(&mut self, from: usize, visit: &mut dyn FnMut(&[Option<Object>], &[Object])) {
         let params = self.params;
         let mut k = from;
-        while k < params.len() && self.subst.contains_key(&params[k]) {
+        while k < params.len() && self.subst[params[k].0 as usize].is_some() {
             k += 1;
         }
         if k == params.len() {
-            let tuple: Vec<Object> = params.iter().map(|p| self.subst[p]).collect();
+            let tuple: Vec<Object> = params
+                .iter()
+                .map(|p| self.subst[p.0 as usize].expect("param bound by join or enumeration"))
+                .collect();
             visit(&self.subst, &tuple);
             return;
         }
@@ -1442,10 +1445,10 @@ impl<'a> JoinEnum<'a> {
         let ty = self.var_type(v);
         let domains = self.type_domains;
         for &obj in &domains[&ty] {
-            self.subst.insert(v, obj);
+            self.subst[v.0 as usize] = Some(obj);
             self.enumerate_rest(k + 1, visit);
         }
-        self.subst.remove(&v);
+        self.subst[v.0 as usize] = None;
     }
 }
 
@@ -1480,7 +1483,7 @@ fn atoms_by_predicate(
 fn apply_schema_tuple(
     schema: &ActionSchema,
     action_cost: usize,
-    subst: &FastMap<Variable, Object>,
+    subst: &[Option<Object>],
     pg: &PlanningGraph,
     predicates: &PredicateTable,
     atoms_by_pred: &FastMap<Predicate, JoinRelation<'_>>,
@@ -1549,7 +1552,7 @@ fn apply_schema_tuple(
 fn apply_effect_tuple(
     effect: &Effect,
     action_cost: usize,
-    subst: &FastMap<Variable, Object>,
+    subst: &[Option<Object>],
     pre_value: &HeuristicValue,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
@@ -1613,7 +1616,7 @@ fn apply_effect_tuple(
                 .or_else(|| pg.negation_values.get(&atom))
                 .copied();
             match existing {
-None => {
+                None => {
                     // A negation is free unless the atom starts true.
                     if pg.init_atoms.contains(&atom) {
                         let mut new_value = cond_value;
@@ -1633,7 +1636,7 @@ None => {
                 }
             }
         }
-}
+    }
 }
 
 /// Per-tuple processing of `collect_reachable`: appends the ground
@@ -1642,7 +1645,7 @@ None => {
 /// relaxed-plan extraction.
 fn collect_reachable_tuple(
     schema: &ActionSchema,
-    subst: &FastMap<Variable, Object>,
+    subst: &[Option<Object>],
     tuple: &[Object],
     pg: &PlanningGraph,
     predicates: &PredicateTable,

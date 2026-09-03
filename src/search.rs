@@ -220,9 +220,9 @@ impl<'a> SearchContext<'a> {
         schema: &ActionSchema,
         tuple: &[Object],
     ) -> Option<Rc<StepAction>> {
-        let mut subst: FastMap<Variable, Object> = FastMap::default();
+        let mut subst: Vec<Option<Object>> = vec![None; schema.var_types.len()];
         for (i, &p) in schema.parameters.iter().enumerate() {
-            subst.insert(p, tuple[i]);
+            subst[p.0 as usize] = Some(tuple[i]);
         }
         if !precondition_consistent(&schema.precondition, &subst) {
             return None;
