@@ -465,7 +465,7 @@ impl PlanningGraph {
             let mut changed = false;
             let mut new_atom_values: FastMap<Atom, HeuristicValue> = FastMap::default();
             let mut new_negation_values: FastMap<Atom, HeuristicValue> = FastMap::default();
-            let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
+            let atoms_by_pred = atoms_by_predicate(&pg.atom_values, predicates.len());
 
             for schema in schemas {
                 let action_cost = if task_costs {
@@ -516,7 +516,7 @@ impl PlanningGraph {
         // included, which is the same subset that `cheapest_achiever` would
         // accept from a full ground-action list.
         let mut reachable_actions: Vec<Rc<StepAction>> = Vec::new();
-        let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
+        let atoms_by_pred = atoms_by_predicate(&pg.atom_values, predicates.len());
         for schema in schemas {
             let mut je = JoinEnum::new(schema, &atoms_by_pred, &type_domains, &type_sets);
             je.run(&mut |subst, tuple| {
@@ -1246,7 +1246,7 @@ struct JoinEnum<'a> {
     join: Vec<&'a Atom>,
     used: Vec<bool>,
     /// Currently-reachable ground atoms, by predicate, with their indexes.
-    atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
+    atoms_by_pred: &'a [Option<JoinRelation<'a>>],
     /// Type-compatible objects per parameter type (for the membership check on
     /// join-bound objects, and for enumerating join-unconstrained parameters).
     type_domains: &'a FastMap<Type, Vec<Object>>,
@@ -1260,7 +1260,7 @@ struct JoinEnum<'a> {
 impl<'a> JoinEnum<'a> {
     fn new(
         schema: &'a ActionSchema,
-        atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
+        atoms_by_pred: &'a [Option<JoinRelation<'a>>],
         type_domains: &'a FastMap<Type, Vec<Object>>,
         type_sets: &'a FastMap<Type, FastSet<Object>>,
     ) -> Self {
@@ -1281,7 +1281,7 @@ impl<'a> JoinEnum<'a> {
         var_types: &'a [Type],
         params: &'a [Variable],
         join_source: &'a Formula,
-        atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
+        atoms_by_pred: &'a [Option<JoinRelation<'a>>],
         type_domains: &'a FastMap<Type, Vec<Object>>,
         type_sets: &'a FastMap<Type, FastSet<Object>>,
     ) -> Self {
@@ -1326,7 +1326,8 @@ impl<'a> JoinEnum<'a> {
                 .count();
             let cands = self
                 .atoms_by_pred
-                .get(&ja.predicate)
+                .get(ja.predicate.0 as usize)
+                .and_then(|r| r.as_ref())
                 .map_or(0, |relation| relation.atoms.len());
             let key = (unbound, cands);
             if pick.map_or(true, |(_, k)| key < k) {
@@ -1345,7 +1346,10 @@ impl<'a> JoinEnum<'a> {
         // candidate loop borrow the relation across the recursive call instead
         // of cloning it at every join step.
         let relations = self.atoms_by_pred;
-        if let Some(relation) = relations.get(&ja.predicate) {
+        if let Some(relation) = relations
+            .get(ja.predicate.0 as usize)
+            .and_then(|r| r.as_ref())
+        {
             // Probe the index with the conjunct's constants plus the variables
             // the partial substitution has already bound: the deeper the join
             // recursion, the more selective the probe. Positions still free stay
@@ -1460,18 +1464,25 @@ struct JoinRelation<'a> {
 }
 
 /// Groups the currently-reachable atoms by predicate for the join, indexing
-/// each relation.
+/// each relation. Dense by predicate id (small and contiguous, like
+/// `Variable`/`Object`), so the join's per-conjunct relation lookup is an
+/// array index instead of a hash lookup.
 fn atoms_by_predicate(
     atom_values: &FastMap<Atom, HeuristicValue>,
-) -> FastMap<Predicate, JoinRelation<'_>> {
-    let mut map: FastMap<Predicate, Vec<&Atom>> = FastMap::default();
+    num_predicates: usize,
+) -> Vec<Option<JoinRelation<'_>>> {
+    let mut grouped: Vec<Vec<&Atom>> = vec![Vec::new(); num_predicates];
     for atom in atom_values.keys() {
-        map.entry(atom.predicate).or_default().push(atom);
+        grouped[atom.predicate.0 as usize].push(atom);
     }
-    map.into_iter()
-        .map(|(predicate, atoms)| {
+    grouped
+        .into_iter()
+        .map(|atoms| {
+            if atoms.is_empty() {
+                return None;
+            }
             let index = AtomIndex::build(atoms.iter().copied());
-            (predicate, JoinRelation { atoms, index })
+            Some(JoinRelation { atoms, index })
         })
         .collect()
 }
@@ -1486,7 +1497,7 @@ fn apply_schema_tuple(
     subst: &[Option<Object>],
     pg: &PlanningGraph,
     predicates: &PredicateTable,
-    atoms_by_pred: &FastMap<Predicate, JoinRelation<'_>>,
+    atoms_by_pred: &[Option<JoinRelation<'_>>],
     type_domains: &FastMap<Type, Vec<Object>>,
     type_sets: &FastMap<Type, FastSet<Object>>,
     new_atom_values: &mut FastMap<Atom, HeuristicValue>,
