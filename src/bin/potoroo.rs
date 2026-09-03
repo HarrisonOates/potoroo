@@ -13,7 +13,7 @@ use std::time::Instant;
 use potoroo::domain::Domain;
 use potoroo::heuristics::{FlawSelectionOrder, Heuristic};
 use potoroo::params::{ActionCost, Parameters, SearchAlgorithm};
-use potoroo::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
+use potoroo::parser::{bind_action_costs, lower_domain, lower_problem, read_pddl, ParsedUnit};
 use potoroo::problem::Problem;
 use potoroo::search::{format_steps, plan_with_stats, Outcome, SearchContext};
 
@@ -95,6 +95,16 @@ fn run() -> Result<ExitCode, String> {
 
     // Solve each problem in name order.
     for problem in problems.values() {
+        // `(increase (total-cost) (move-cost))` reads a function whose value is
+        // set by this problem's `:init`, so schema costs are resolved per
+        // problem, before anything downstream reads them.
+        bind_action_costs(
+            domains
+                .get_mut(&problem.domain_name)
+                .expect("domain was looked up during lowering"),
+            problem,
+        )
+        .map_err(|e| e.to_string())?;
         let domain = domains
             .get(&problem.domain_name)
             .expect("domain was looked up during lowering");

@@ -6,5 +6,5 @@
 pub mod lower;
 pub mod read;
 
-pub use lower::{lower_domain, lower_problem, LowerError};
+pub use lower::{bind_action_costs, lower_domain, lower_problem, LowerError};
 pub use read::{read_pddl, ParsedUnit, ReadError};

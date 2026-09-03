@@ -202,10 +202,17 @@ impl Formula {
                 }
                 result
             }
+            // A disjunction survives the effect as long as whichever disjunct
+            // held still holds. Not knowing which one that was, require of each
+            // disjunct that it was false anyway *or* that it is separated:
+            // `(!d | sep(d))`, conjoined over the disjuncts. Conjoining `!d`
+            // instead would assert that no disjunct holds, i.e. the negation of
+            // the whole disjunction -- which contradicts the very precondition
+            // being separated, so no plan using the action could ever close.
             Formula::Disjunction(ds) => {
                 let mut result = Rc::new(Formula::True);
                 for d in ds {
-                    let s = Formula::and(d.negation(), d.separator(effect_lit));
+                    let s = Formula::or(d.negation(), d.separator(effect_lit));
                     if s.contradiction() {
                         return Rc::new(Formula::False);
                     }

@@ -228,6 +228,14 @@ pub struct PlanningGraph {
     negation_values: HashMap<Atom, HeuristicValue>,
     predicate_atoms: HashMap<Predicate, Vec<Atom>>,
     predicate_negations: HashMap<Predicate, Vec<Atom>>,
+    /// The atoms true in the initial state.
+    ///
+    /// Under the closed-world assumption this is exactly what decides whether a
+    /// negated literal holds for free, so it is recorded rather than inferred
+    /// from `atom_values`: "reachable at zero cost" is not the same thing as
+    /// "true initially" once a domain declares zero-cost actions, which IPC
+    /// 2023's recharging-robots and folding both do.
+    init_atoms: HashSet<Atom>,
     /// Positional indexes over the two relations above, parallel to them.
     atom_index: FastMap<Predicate, AtomIndex>,
     negation_index: FastMap<Predicate, AtomIndex>,
@@ -252,6 +260,7 @@ impl PlanningGraph {
             negation_values: HashMap::new(),
             predicate_atoms: HashMap::new(),
             predicate_negations: HashMap::new(),
+            init_atoms: HashSet::new(),
             atom_index: FastMap::default(),
             negation_index: FastMap::default(),
             actions: Vec::new(),
@@ -261,6 +270,9 @@ impl PlanningGraph {
         // Add initial conditions at level 0 (heuristics.cc:471-485).
         for effect in init_action.effects.iter() {
             let atom = effect.literal.atom().clone();
+            if !effect.literal.negative() {
+                pg.init_atoms.insert(atom.clone());
+            }
             if predicates.is_static(atom.predicate) {
                 pg.atom_values.entry(atom).or_insert(HeuristicValue::ZERO);
             } else {
@@ -412,6 +424,7 @@ impl PlanningGraph {
             negation_values: HashMap::new(),
             predicate_atoms: HashMap::new(),
             predicate_negations: HashMap::new(),
+            init_atoms: HashSet::new(),
             atom_index: FastMap::default(),
             negation_index: FastMap::default(),
             actions: Vec::new(),
@@ -421,6 +434,9 @@ impl PlanningGraph {
         // Initialise level 0 from the init atoms.
         for effect in init_action.effects.iter() {
             let atom = effect.literal.atom().clone();
+            if !effect.literal.negative() {
+                pg.init_atoms.insert(atom.clone());
+            }
             if predicates.is_static(atom.predicate) {
                 pg.atom_values.entry(atom).or_insert(HeuristicValue::ZERO);
             } else {
@@ -434,7 +450,13 @@ impl PlanningGraph {
         // as a schema parameter, so `get_objects` is called at most once per type.
         let mut type_domains: HashMap<Type, Vec<Object>> = HashMap::new();
         for schema in schemas {
-            for &v in &schema.parameters {
+            // Quantified-effect variables are enumerated just like parameters,
+            // so their types need a domain as well.
+            let vars = schema
+                .parameters
+                .iter()
+                .chain(schema.effects.iter().flat_map(|e| e.parameters.iter()));
+            for &v in vars {
                 let ty = schema.var_types[v.0 as usize];
                 type_domains.entry(ty).or_insert_with(|| get_objects(ty));
             }
@@ -465,6 +487,9 @@ impl PlanningGraph {
                         subst,
                         &pg,
                         predicates,
+                        &atoms_by_pred,
+                        &type_domains,
+                        &type_sets,
                         &mut new_atom_values,
                         &mut new_negation_values,
                         &mut changed,
@@ -645,12 +670,12 @@ impl PlanningGraph {
             None => {
                 if let Some(v) = self.negation_values.get(atom) {
                     *v
+                } else if self.init_atoms.contains(atom) {
+                    // True from the start and nothing achieves its negation.
+                    HeuristicValue::INFINITE
                 } else {
-                    match self.atom_values.get(atom) {
-                        None => HeuristicValue::ZERO_COST_UNIT_WORK,
-                        Some(v) if !v.zero() => HeuristicValue::ZERO_COST_UNIT_WORK,
-                        Some(_) => HeuristicValue::INFINITE,
-                    }
+                    // False from the start: the negation costs nothing.
+                    HeuristicValue::ZERO_COST_UNIT_WORK
                 }
             }
             Some((ctx, b)) => {
@@ -668,8 +693,10 @@ impl PlanningGraph {
                     };
                     return if self.negation_values.contains_key(&ground) {
                         self.heuristic_value_atom(&ground, 0, None)
-                    } else {
+                    } else if self.init_atoms.contains(&ground) {
                         HeuristicValue::INFINITE
+                    } else {
+                        HeuristicValue::ZERO_COST_UNIT_WORK
                     };
                 }
                 let mut value = HeuristicValue::INFINITE;
@@ -684,6 +711,37 @@ impl PlanningGraph {
                         !value.zero()
                     },
                 );
+                if value.zero() {
+                    return value;
+                }
+                // No action achieves the negation, but under the closed-world
+                // assumption a tuple that is simply *false* initially satisfies
+                // it for free. The ground arm above decides that with one
+                // lookup in `init_atoms`. A partially-bound pattern cannot
+                // enumerate the complement of the relation, so instead count
+                // the atoms it matches that are true initially and compare
+                // against the tuples it admits: any surplus is a false atom.
+                // Without this, a negated static literal over unbound variables
+                // -- `(not (blocked ?cell ?dir))` in IPC 2023's ricochet-robots
+                // -- is valued infinite as soon as any one cell is blocked,
+                // making every reachable refinement look dead.
+                let mut initially_true = 0u64;
+                self.for_each_match(
+                    Relation::Positive,
+                    atom.predicate,
+                    ctx,
+                    &mut pattern,
+                    |candidate| unifies(ctx, b, atom, step_id, candidate),
+                    |candidate| {
+                        if self.init_atoms.contains(candidate) {
+                            initially_true += 1;
+                        }
+                        true
+                    },
+                );
+                if pattern.admitted_tuples(ctx) > initially_true {
+                    value = hv_min(value, HeuristicValue::ZERO_COST_UNIT_WORK);
+                }
                 value
             }
         }
@@ -1172,8 +1230,14 @@ fn collect_join_atoms<'a>(f: &'a Formula, out: &mut Vec<&'a Atom>) {
 /// with this join leaves the resulting planning graph unchanged while making
 /// instantiation proportional to the number of matches.
 struct JoinEnum<'a> {
-    schema: &'a ActionSchema,
-    /// Positive precondition conjuncts (the join queries).
+    /// Types of every variable in the schema's scope, indexed by variable
+    /// index. Covers schema parameters and quantified-effect variables alike.
+    var_types: &'a [Type],
+    /// The variables to enumerate: a schema's parameters, or one universally
+    /// quantified effect's own parameters.
+    params: &'a [Variable],
+    /// Positive conjuncts of the formula being joined -- a schema's
+    /// precondition, or a conditional effect's guard.
     join: Vec<&'a Atom>,
     used: Vec<bool>,
     /// Currently-reachable ground atoms, by predicate, with their indexes.
@@ -1192,11 +1256,35 @@ impl<'a> JoinEnum<'a> {
         type_domains: &'a HashMap<Type, Vec<Object>>,
         type_sets: &'a HashMap<Type, HashSet<Object>>,
     ) -> Self {
+        JoinEnum::over(
+            &schema.var_types,
+            &schema.parameters,
+            &schema.precondition,
+            atoms_by_pred,
+            type_domains,
+            type_sets,
+        )
+    }
+
+    /// Enumerates `params` against the positive conjuncts of `join_source`.
+    ///
+    /// Used both for a schema's parameters against its precondition and, with
+    /// [`JoinEnum::seed`], for a universally quantified effect's variables
+    /// against its `when` guard.
+    fn over(
+        var_types: &'a [Type],
+        params: &'a [Variable],
+        join_source: &'a Formula,
+        atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
+        type_domains: &'a HashMap<Type, Vec<Object>>,
+        type_sets: &'a HashMap<Type, HashSet<Object>>,
+    ) -> Self {
         let mut join = Vec::new();
-        collect_join_atoms(&schema.precondition, &mut join);
+        collect_join_atoms(join_source, &mut join);
         let used = vec![false; join.len()];
         JoinEnum {
-            schema,
+            var_types,
+            params,
             join,
             used,
             atoms_by_pred,
@@ -1206,10 +1294,15 @@ impl<'a> JoinEnum<'a> {
         }
     }
 
-    /// The declared type of a schema parameter (join atoms only mention
-    /// schema parameters).
+    /// Pre-binds variables fixed by an enclosing scope, so an effect's join runs
+    /// under the schema tuple that produced it.
+    fn seed(&mut self, subst: &HashMap<Variable, Object>) {
+        self.subst.clone_from(subst);
+    }
+
+    /// The declared type of a variable in the schema's scope.
     fn var_type(&self, v: Variable) -> Type {
-        self.schema.var_types[v.0 as usize]
+        self.var_types[v.0 as usize]
     }
 
     fn run(&mut self, visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object])) {
@@ -1333,7 +1426,7 @@ impl<'a> JoinEnum<'a> {
         from: usize,
         visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object]),
     ) {
-        let params = &self.schema.parameters;
+        let params = self.params;
         let mut k = from;
         while k < params.len() && self.subst.contains_key(&params[k]) {
             k += 1;
@@ -1388,6 +1481,9 @@ fn apply_schema_tuple(
     subst: &HashMap<Variable, Object>,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
+    atoms_by_pred: &FastMap<Predicate, JoinRelation<'_>>,
+    type_domains: &HashMap<Type, Vec<Object>>,
+    type_sets: &HashMap<Type, HashSet<Object>>,
     new_atom_values: &mut HashMap<Atom, HeuristicValue>,
     new_negation_values: &mut HashMap<Atom, HeuristicValue>,
     changed: &mut bool,
@@ -1403,84 +1499,145 @@ fn apply_schema_tuple(
     }
 
     for effect in &schema.effects {
-        let ground_cond = instantiate_formula(&effect.condition, subst);
-        let (mut cond_value, _) = pg.ground_formula_value(predicates, &ground_cond);
-        if cond_value.infinite() {
+        if effect.parameters.is_empty() {
+            apply_effect_tuple(
+                effect,
+                action_cost,
+                subst,
+                &pre_value,
+                pg,
+                predicates,
+                new_atom_values,
+                new_negation_values,
+                changed,
+            );
             continue;
         }
-        cond_value.add_assign(&pre_value);
-        cond_value.increase_makespan(THRESHOLD);
-        cond_value.increase_cost(action_cost as f32);
+        // A universally quantified effect: its own variables still have to be
+        // enumerated. `forall (?x) (when C(?x) E(?x))` contributes `E(o)` for
+        // every `o` whose guard is relaxed-reachable, so join the guard exactly
+        // as the precondition is joined for schema parameters, seeded with the
+        // tuple that fixed the schema's own variables. Variables the guard does
+        // not constrain fall through to their type domain, which is what an
+        // unconditional `forall` effect needs.
+        let mut je = JoinEnum::over(
+            &schema.var_types,
+            &effect.parameters,
+            &effect.condition,
+            atoms_by_pred,
+            type_domains,
+            type_sets,
+        );
+        je.seed(subst);
+        je.run(&mut |effect_subst, _tuple| {
+            apply_effect_tuple(
+                effect,
+                action_cost,
+                effect_subst,
+                &pre_value,
+                pg,
+                predicates,
+                new_atom_values,
+                new_negation_values,
+                changed,
+            );
+        });
+    }
+}
 
-        let lit = match &effect.literal {
-            Literal::Atom(a) => {
-                let ga = instantiate_atom(a, subst);
-                // Skip forall effects whose parameters are still unbound.
-                if ga.terms.iter().any(|t| t.variable()) {
-                    continue;
-                }
-                Literal::Atom(ga)
-            }
-            Literal::Negation(a) => {
-                let ga = instantiate_atom(a, subst);
-                if ga.terms.iter().any(|t| t.variable()) {
-                    continue;
-                }
-                Literal::Negation(ga)
-            }
-        };
+/// Applies one effect of one fully-substituted schema tuple to the graph.
+/// `subst` binds the schema's parameters and, for a quantified effect, its own
+/// variables too.
+#[allow(clippy::too_many_arguments)]
+fn apply_effect_tuple(
+    effect: &Effect,
+    action_cost: usize,
+    subst: &HashMap<Variable, Object>,
+    pre_value: &HeuristicValue,
+    pg: &PlanningGraph,
+    predicates: &PredicateTable,
+    new_atom_values: &mut HashMap<Atom, HeuristicValue>,
+    new_negation_values: &mut HashMap<Atom, HeuristicValue>,
+    changed: &mut bool,
+) {
+    let ground_cond = instantiate_formula(&effect.condition, subst);
+    let (mut cond_value, _) = pg.ground_formula_value(predicates, &ground_cond);
+    if cond_value.infinite() {
+        return;
+    }
+    cond_value.add_assign(pre_value);
+    cond_value.increase_makespan(THRESHOLD);
+    cond_value.increase_cost(action_cost as f32);
 
-        match lit {
-            Literal::Atom(atom) => {
-                let existing = new_atom_values
-                    .get(&atom)
-                    .or_else(|| pg.atom_values.get(&atom))
-                    .copied();
-                let mut new_value = cond_value;
-                new_value.increment_work();
-                match existing {
-                    None => {
-                        new_atom_values.insert(atom, new_value);
+    let lit = match &effect.literal {
+        Literal::Atom(a) => {
+            let ga = instantiate_atom(a, subst);
+            // A quantified variable the join left unbound cannot name a
+            // ground atom; nothing to record.
+            if ga.terms.iter().any(|t| t.variable()) {
+                return;
+            }
+            Literal::Atom(ga)
+        }
+        Literal::Negation(a) => {
+            let ga = instantiate_atom(a, subst);
+            if ga.terms.iter().any(|t| t.variable()) {
+                return;
+            }
+            Literal::Negation(ga)
+        }
+    };
+
+    match lit {
+        Literal::Atom(atom) => {
+            let existing = new_atom_values
+                .get(&atom)
+                .or_else(|| pg.atom_values.get(&atom))
+                .copied();
+            let mut new_value = cond_value;
+            new_value.increment_work();
+            match existing {
+                None => {
+                    new_atom_values.insert(atom, new_value);
+                    *changed = true;
+                }
+                Some(old_value) => {
+                    let merged = hv_min(new_value, old_value);
+                    if merged != old_value {
+                        new_atom_values.insert(atom, merged);
                         *changed = true;
-                    }
-                    Some(old_value) => {
-                        let merged = hv_min(new_value, old_value);
-                        if merged != old_value {
-                            new_atom_values.insert(atom, merged);
-                            *changed = true;
-                        }
-                    }
-                }
-            }
-            Literal::Negation(atom) => {
-                let existing = new_negation_values
-                    .get(&atom)
-                    .or_else(|| pg.negation_values.get(&atom))
-                    .copied();
-                match existing {
-                    None => {
-                        // Closed-world: only achieve the negation if the
-                        // atom is not (yet) certainly present.
-                        if pg.heuristic_value_atom(&atom, 0, None).zero() {
-                            let mut new_value = cond_value;
-                            new_value.increment_work();
-                            new_negation_values.insert(atom, new_value);
-                            *changed = true;
-                        }
-                    }
-                    Some(old_value) => {
-                        let mut new_value = cond_value;
-                        new_value.increment_work();
-                        let merged = hv_min(new_value, old_value);
-                        if merged != old_value {
-                            new_negation_values.insert(atom, merged);
-                            *changed = true;
-                        }
                     }
                 }
             }
         }
-    }
+        Literal::Negation(atom) => {
+            let existing = new_negation_values
+                .get(&atom)
+                .or_else(|| pg.negation_values.get(&atom))
+                .copied();
+            match existing {
+                None => {
+                    // Closed-world: only achieve the negation if the
+                    // atom is not (yet) certainly present.
+                    if pg.heuristic_value_atom(&atom, 0, None).zero() {
+                        let mut new_value = cond_value;
+                        new_value.increment_work();
+                        new_negation_values.insert(atom, new_value);
+                        *changed = true;
+                    }
+                }
+                Some(old_value) => {
+                    let mut new_value = cond_value;
+                    new_value.increment_work();
+                    let merged = hv_min(new_value, old_value);
+                    if merged != old_value {
+                        new_negation_values.insert(atom, merged);
+                        *changed = true;
+                    }
+                }
+            }
+        }
+}
 }
 
 /// Per-tuple processing of `collect_reachable`: appends the ground

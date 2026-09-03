@@ -390,13 +390,35 @@ fn lower_primitive_effect(
     }
 }
 
+/// The action cost accumulated while lowering one schema's effects.
+///
+/// `(increase (total-cost) N)` contributes to `constant`; the IPC idiom
+/// `(increase (total-cost) (move-cost))` names a nullary function whose value
+/// is fixed by the problem's `:init`, so it can only be recorded here and
+/// resolved later by [`bind_action_costs`].
+#[derive(Debug, Default)]
+struct CostAcc {
+    constant: usize,
+    /// Names of nullary cost functions, in occurrence order. Resolved against
+    /// the domain's [`FunctionTable`] once the effect walk is done.
+    functions: Vec<String>,
+}
+
+/// One recognized `(increase (total-cost) ...)` right-hand side.
+enum CostTerm {
+    Constant(usize),
+    /// A nullary function whose value comes from the problem's `:init`.
+    Function(String),
+}
+
 /// Recognizes the restricted numeric effect admitted by `:action-costs`:
-/// `(increase (total-cost) N)` for a non-negative integral constant `N`.
+/// `(increase (total-cost) N)` for a non-negative integral constant `N`, or
+/// `(increase (total-cost) (f))` for a nullary, state-independent function `f`.
 fn lower_action_cost_effect(
     pe: &PrimitiveEffect,
     enabled: bool,
     unconditional: bool,
-) -> Result<Option<usize>, LowerError> {
+) -> Result<Option<CostTerm>, LowerError> {
     let PrimitiveEffect::AssignNumericFluent(op, head, expression) = pe else {
         return Ok(None);
     };
@@ -424,12 +446,35 @@ fn lower_action_cost_effect(
             "total-cost increases must be unconditional and unquantified".to_string(),
         ));
     }
-    let FluentExpression::Number(number) = expression else {
-        return Err(LowerError::ActionCost(
-            "the increase must be a numeric constant".to_string(),
-        ));
+    let number = match expression {
+        FluentExpression::Number(number) => **number,
+        // `(increase (total-cost) (f))`. Only nullary `f` is supported: the
+        // cost of a lifted schema is a single number, so a function of the
+        // action's parameters would have to be resolved per ground action.
+        FluentExpression::Function(head) => {
+            let (symbol, nullary) = match head {
+                FunctionHead::Simple(symbol) => (symbol, true),
+                FunctionHead::WithTerms(symbol, terms) => (symbol, terms.is_empty()),
+            };
+            if !nullary {
+                return Err(LowerError::ActionCost(format!(
+                    "cost function `{}` takes arguments; only nullary cost functions are supported",
+                    s(symbol)
+                )));
+            }
+            return Ok(Some(CostTerm::Function(s(symbol).to_string())));
+        }
+        _ => {
+            return Err(LowerError::ActionCost(
+                "the increase must be a numeric constant or a nullary function".to_string(),
+            ))
+        }
     };
-    let value = **number;
+    Ok(Some(CostTerm::Constant(cost_value(number)?)))
+}
+
+/// Validates one action-cost number and narrows it to `usize`.
+fn cost_value(value: f32) -> Result<usize, LowerError> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
         return Err(LowerError::ActionCost(
             "the increase must be a non-negative integer".to_string(),
@@ -441,7 +486,7 @@ fn lower_action_cost_effect(
             "the increase exceeds this platform's action-cost range".to_string(),
         ));
     }
-    Ok(Some(value as usize))
+    Ok(value as usize)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -455,16 +500,21 @@ fn lower_effect_item(
     parameters: &[Variable],
     condition: &Rc<Formula>,
     action_costs: bool,
-    cost: &mut usize,
+    cost: &mut CostAcc,
 ) -> Result<(), LowerError> {
-    if let Some(increase) = lower_action_cost_effect(
+    if let Some(term) = lower_action_cost_effect(
         pe,
         action_costs,
         parameters.is_empty() && condition.tautology(),
     )? {
-        *cost = cost
-            .checked_add(increase)
-            .ok_or_else(|| LowerError::ActionCost("action cost overflows usize".to_string()))?;
+        match term {
+            CostTerm::Constant(increase) => {
+                cost.constant = cost.constant.checked_add(increase).ok_or_else(|| {
+                    LowerError::ActionCost("action cost overflows usize".to_string())
+                })?;
+            }
+            CostTerm::Function(name) => cost.functions.push(name),
+        }
         return Ok(());
     }
     let literal = lower_primitive_effect(pe, preds, scope, consts, objects)?;
@@ -490,7 +540,7 @@ fn lower_conditional_effect(
     parameters: &[Variable],
     condition: &Rc<Formula>,
     action_costs: bool,
-    cost: &mut usize,
+    cost: &mut CostAcc,
 ) -> Result<(), LowerError> {
     match ce {
         ConditionalEffect::Effect(pe) => lower_effect_item(
@@ -686,7 +736,10 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             let mut effects = Vec::new();
             // In an action-cost domain, omitting the total-cost increase means
             // zero. Ordinary classical actions retain unit cost.
-            let mut cost = if requirements.action_costs { 0 } else { 1 };
+            let mut cost = CostAcc {
+                constant: if requirements.action_costs { 0 } else { 1 },
+                functions: Vec::new(),
+            };
             if let Some(effs) = action.effect() {
                 let no_params: Vec<Variable> = Vec::new();
                 let truth = Rc::new(Formula::True);
@@ -711,6 +764,16 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             (parameters, precondition, effects, cost)
         };
 
+        // Cost functions are named in `:functions`, which is lowered above, so
+        // an unknown name here is a malformed domain rather than a deferral.
+        let mut cost_functions = Vec::with_capacity(cost.functions.len());
+        for name in &cost.functions {
+            let f = functions.find_function(name).ok_or_else(|| {
+                LowerError::ActionCost(format!("undeclared cost function `{name}`"))
+            })?;
+            cost_functions.push(f);
+        }
+
         let schema = ActionSchema {
             id,
             name: name.clone(),
@@ -718,7 +781,10 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             var_types: term_table.variable_types().to_vec(),
             precondition,
             effects,
-            cost,
+            // Unresolved until `bind_action_costs` runs against a problem.
+            cost: cost.constant,
+            cost_base: cost.constant,
+            cost_functions,
         };
         actions_by_name.insert(name, id);
         actions.push(schema);
@@ -789,6 +855,7 @@ pub fn lower_problem(p: &PddlProblem, domain: &Domain) -> Result<Problem, LowerE
             &mut init_order,
             &mut init_values,
             &mut predicates,
+            &domain.functions,
             &domain.constants,
             &objects,
             action_costs,
@@ -845,8 +912,9 @@ fn lower_init_element(
     el: &InitElement,
     atoms: &mut std::collections::HashSet<Atom>,
     order: &mut Vec<Atom>,
-    _values: &mut Vec<(crate::expressions::Fluent, f64)>,
+    values: &mut Vec<(crate::expressions::Fluent, f64)>,
     preds: &mut PredicateTable,
+    functions: &FunctionTable,
     consts: &TermTable,
     objects: &TermTable,
     action_costs: bool,
@@ -893,15 +961,77 @@ fn lower_init_element(
         InitElement::IsValue(term, value)
             if action_costs
                 && term.names().is_empty()
-                && s(term.symbol()).eq_ignore_ascii_case("total-cost")
-                && **value == 0.0 =>
+                && s(term.symbol()).eq_ignore_ascii_case("total-cost") =>
         {
+            // `total-cost` is the accumulator, not an input: the plan cost is
+            // computed from the operators, so any nonzero seed would be lost.
+            if **value != 0.0 {
+                return Err(LowerError::ActionCost(
+                    "(total-cost) must be initialized to 0".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        // `(= (f) N)` for a nullary `f`. Nothing in the classical subset can
+        // write a function, so such a value is a state-independent constant —
+        // exactly what `(increase (total-cost) (f))` reads. Values are recorded
+        // for every declared nullary function, whether or not a cost effect
+        // names it; `bind_action_costs` picks out the ones that matter.
+        InitElement::IsValue(term, value) if action_costs && term.names().is_empty() => {
+            let name = s(term.symbol());
+            let function = functions
+                .find_function(name)
+                .ok_or_else(|| LowerError::ActionCost(format!("undeclared function `{name}`")))?;
+            values.push((
+                crate::expressions::Fluent {
+                    function,
+                    terms: Vec::new(),
+                },
+                **value as f64,
+            ));
             Ok(())
         }
         InitElement::IsValue(..) | InitElement::IsObject(..) => Err(LowerError::UnsupportedFluent(
             "init fluent value".to_string(),
         )),
     }
+}
+
+/// Folds a problem's `:init` function values into its domain's action costs.
+///
+/// `(increase (total-cost) (move-cost))` names a function whose value lives in
+/// the problem, not the domain, so [`lower_domain`] can only record the
+/// reference. This resolves it, setting each schema's [`ActionSchema::cost`] to
+/// `cost_base` plus the value of every cost function it names.
+///
+/// Call this once per problem before planning. It recomputes from `cost_base`,
+/// so it is idempotent and safe to re-run when one domain serves several
+/// problems that assign different values.
+pub fn bind_action_costs(domain: &mut Domain, problem: &Problem) -> Result<(), LowerError> {
+    // Later assignments win, matching `:init` being read in order.
+    let mut values: HashMap<crate::functions::Function, f64> = HashMap::new();
+    for (fluent, value) in &problem.init_values {
+        if fluent.terms.is_empty() {
+            values.insert(fluent.function, *value);
+        }
+    }
+
+    for schema in &mut domain.actions {
+        let mut cost = schema.cost_base;
+        for &f in &schema.cost_functions {
+            let name = domain.functions.name(f);
+            let value = values.get(&f).copied().ok_or_else(|| {
+                LowerError::ActionCost(format!(
+                    "cost function `{name}` has no value in the problem's `:init`"
+                ))
+            })?;
+            cost = cost.checked_add(cost_value(value as f32)?).ok_or_else(|| {
+                LowerError::ActionCost("action cost overflows usize".to_string())
+            })?;
+        }
+        schema.cost = cost;
+    }
+    Ok(())
 }
 
 /// Resolves a ground object name against problem objects then domain constants.

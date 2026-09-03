@@ -89,6 +89,17 @@ impl<'a> TypeContext<'a> {
         }
     }
 
+    /// How many objects are compatible with `ty` and not in `excluded`.
+    /// The counting counterpart of [`TypeContext::compatible_objects`], for
+    /// callers that only need the cardinality and should not allocate.
+    pub(crate) fn count_compatible_objects(&self, ty: Type, excluded: &[Object]) -> usize {
+        self.constants
+            .owned_objects()
+            .chain(self.objects.owned_objects())
+            .filter(|(o, oty)| self.types.subtype(*oty, ty) && !excluded.contains(o))
+            .count()
+    }
+
     /// Objects compatible with `ty` (type-subtype), from objects + constants.
     pub(crate) fn compatible_objects(&self, ty: Type) -> Vec<Object> {
         let mut result = Vec::new();
@@ -1090,6 +1101,37 @@ impl AtomPattern {
                 PatTerm::Obj(object) => Some((position, *object)),
                 PatTerm::Var { .. } => None,
             })
+    }
+
+    /// An upper bound on the number of ground term tuples this pattern admits.
+    ///
+    /// Object positions contribute a single choice; each distinct variable
+    /// class contributes the objects of its type, less the constants excluded
+    /// for it. Non-codesignation *pairs* are not applied, so the count can
+    /// exceed the number of tuples [`AtomPattern::matches`] would accept. The
+    /// caller (the planning graph's negated-literal lookup) compares it against
+    /// a count of matched atoms to decide whether some admitted tuple escapes a
+    /// relation, and over-counting only relaxes that answer.
+    pub fn admitted_tuples(&self, ctx: &TypeContext) -> u64 {
+        // Classes are numbered in order of first appearance, so a term whose
+        // class equals the number collected so far is introducing it.
+        let mut class_types: Vec<Type> = Vec::new();
+        for term in &self.terms {
+            if let PatTerm::Var { class, ty } = term {
+                if *class as usize == class_types.len() {
+                    class_types.push(*ty);
+                }
+            }
+        }
+        let mut total: u64 = 1;
+        for (class, ty) in class_types.iter().enumerate() {
+            let n = ctx.count_compatible_objects(*ty, &self.excluded[class]);
+            total = total.saturating_mul(n as u64);
+            if total == 0 {
+                return 0;
+            }
+        }
+        total
     }
 
     /// Whether a ground candidate's terms unify with the pattern under the

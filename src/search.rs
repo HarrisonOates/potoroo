@@ -409,6 +409,24 @@ impl<'a> SearchContext<'a> {
             .insert(step_id, action.clone());
     }
 
+    /// Re-points the step-action map at `plan`'s own newest step.
+    ///
+    /// `step_var_types` is keyed by step id alone, but step ids are unique only
+    /// *within* one plan: every sibling refinement of a parent adds its step
+    /// with the same id, and each registers it as it is built. Without this,
+    /// the last sibling generated would decide the parameter types used to rank
+    /// all of them, so a schema's variables could be typed by a different
+    /// schema's parameters -- silently making reachable open conditions look
+    /// unreachable. A refinement adds at most one step and conses it onto the
+    /// head of the chain, so re-registering that one entry is enough.
+    pub fn register_newest_step(&self, plan: &Plan, parent_num_steps: usize) {
+        if plan.num_steps > parent_num_steps {
+            if let Some(chain) = &plan.steps {
+                self.register_step(chain.head.id, &chain.head.action);
+            }
+        }
+    }
+
     /// Allocates a fresh variable scoped to `step_id` with type `ty`, used for a
     /// universally-quantified effect instance (the renamed forall parameter).
     /// Its index lies past the step's action parameters; [`var_type`] resolves it
@@ -789,6 +807,9 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
             for new_plan in refinements {
                 // N.B. id must be set before rank is computed (rank uses serial_no).
                 new_plan.id.set(num_generated_plans);
+                // Siblings share step ids, so claim the map before this child's
+                // variables are typed by anything below.
+                ctx.register_newest_step(&new_plan, plan.num_steps);
 
                 // ALT: GBFS-ordered rank from the shared evaluation, consumed
                 // by the secondary-queue push below.
