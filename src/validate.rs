@@ -14,8 +14,9 @@
 //! release. Recomputing threats here catches exactly that class.
 
 use crate::chain;
+use crate::formula::Literal;
 use crate::orderings::StepTime;
-use crate::plan::{Link, Plan, Step};
+use crate::plan::{Link, Plan, Step, INIT_ID};
 use crate::search::SearchContext;
 
 /// Checks that `plan` is a valid POCL solution. Returns `Ok(())` if so, or
@@ -66,11 +67,29 @@ fn find_step(plan: &Plan, id: usize) -> Option<Step> {
 
 /// Whether the producer of `link` has an effect whose literal positively unifies
 /// with the link's protected condition under the plan's bindings.
+///
+/// A negative link from `INIT_ID` is a separate case: [`Plan::new_cw_link`]
+/// supports a negative open condition by the *absence* of a matching init
+/// atom under the closed-world assumption, protected by the inequality goals
+/// it adds rather than by any actual init effect -- init's effects are always
+/// positive, so `unify` below can never match a negative link condition
+/// against one (it requires matching polarity), and every task relying on
+/// this (e.g. any domain with `:negative-preconditions` whose negated
+/// preconditions are never explicitly asserted false) would otherwise be
+/// reported unsupported.
 fn link_supported(plan: &Plan, ctx: &SearchContext, link: &Link) -> bool {
     let Some(producer) = find_step(plan, link.from_id) else {
         return false;
     };
     let type_ctx = ctx.type_ctx();
+    if link.from_id == INIT_ID && link.condition.negative() {
+        let atom = Literal::Atom(link.condition.atom().clone());
+        return producer.action.effects.iter().all(|e| {
+            !plan
+                .bindings
+                .unify(&type_ctx, &e.literal, link.from_id, &atom, link.to_id)
+        });
+    }
     producer.action.effects.iter().any(|e| {
         plan.bindings
             .unify(&type_ctx, &e.literal, link.from_id, &link.condition, link.to_id)

@@ -97,3 +97,33 @@ fn sussman_valid_sample_ff_ground() {
 fn gripper_valid_sample_ff_ground() {
     check("gripper-domain.pddl", "gripper-2.pddl", "SAMPLE_FF:3", true);
 }
+
+// ---------------------------------------------------------------------------
+// Closed-world links
+// ---------------------------------------------------------------------------
+//
+// `flat-tire-domain.pddl` needs `Plan::new_cw_link`: its actions' negative
+// preconditions (e.g. `open`'s `(not (locked ?x))`) are never explicitly
+// asserted false anywhere, so they hold only by the closed-world absence of a
+// matching positive `:init` atom. No domain above exercises that path, which
+// is exactly why the validator's own gap here went unnoticed: `link_supported`
+// checked a producer's effects for one whose literal unifies with the link
+// condition, but `unify` requires matching polarity, and a closed-world link's
+// producer is `INIT_ID`, whose effects are always positive -- so it could never
+// recognize its own planner's most basic negative-precondition support and
+// reported every such solution as invalid.
+
+#[test]
+fn flat_tire_closed_world_link_valid_lifted() {
+    check("flat-tire-domain.pddl", "fix1.pddl", "ADD", false);
+}
+
+#[test]
+fn flat_tire_closed_world_link_valid_ground() {
+    check("flat-tire-domain.pddl", "fix1.pddl", "ADD", true);
+}
+
+#[test]
+fn flat_tire_closed_world_link_valid_lifted_2() {
+    check("flat-tire-domain.pddl", "fix2.pddl", "ADD", false);
+}
