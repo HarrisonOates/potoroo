@@ -1,15 +1,15 @@
 //! Schema instantiation helpers shared by the search context and the planning
 //! graph builder.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::effect::Effect;
+use crate::fasthash::FastMap;
 use crate::formula::{Atom, Formula, Literal};
 use crate::terms::{Object, Term, Variable};
 
 /// Whether a precondition's (in)equality literals are all satisfied by `subst`.
-pub(crate) fn precondition_consistent(f: &Rc<Formula>, subst: &HashMap<Variable, Object>) -> bool {
+pub(crate) fn precondition_consistent(f: &Rc<Formula>, subst: &FastMap<Variable, Object>) -> bool {
     match f.as_ref() {
         Formula::Conjunction(cs) => cs.iter().all(|c| precondition_consistent(c, subst)),
         Formula::Equality { left, right, .. } => resolve(*left, subst) == resolve(*right, subst),
@@ -18,7 +18,7 @@ pub(crate) fn precondition_consistent(f: &Rc<Formula>, subst: &HashMap<Variable,
     }
 }
 
-pub(crate) fn resolve(t: Term, subst: &HashMap<Variable, Object>) -> Term {
+pub(crate) fn resolve(t: Term, subst: &FastMap<Variable, Object>) -> Term {
     match t {
         Term::Variable(v) => subst.get(&v).map(|&o| Term::Object(o)).unwrap_or(t),
         Term::Object(_) => t,
@@ -27,7 +27,7 @@ pub(crate) fn resolve(t: Term, subst: &HashMap<Variable, Object>) -> Term {
 
 pub(crate) fn instantiate_formula(
     f: &Rc<Formula>,
-    subst: &HashMap<Variable, Object>,
+    subst: &FastMap<Variable, Object>,
 ) -> Rc<Formula> {
     match f.as_ref() {
         Formula::True | Formula::False => f.clone(),
@@ -72,14 +72,14 @@ pub(crate) fn instantiate_formula(
     }
 }
 
-pub(crate) fn instantiate_atom(a: &Atom, subst: &HashMap<Variable, Object>) -> Atom {
+pub(crate) fn instantiate_atom(a: &Atom, subst: &FastMap<Variable, Object>) -> Atom {
     Atom {
         predicate: a.predicate,
         terms: a.terms.iter().map(|&t| resolve(t, subst)).collect(),
     }
 }
 
-pub(crate) fn instantiate_effect(e: &Effect, subst: &HashMap<Variable, Object>) -> Effect {
+pub(crate) fn instantiate_effect(e: &Effect, subst: &FastMap<Variable, Object>) -> Effect {
     let literal = match &e.literal {
         Literal::Atom(a) => Literal::Atom(instantiate_atom(a, subst)),
         Literal::Negation(a) => Literal::Negation(instantiate_atom(a, subst)),

@@ -220,7 +220,7 @@ impl<'a> SearchContext<'a> {
         schema: &ActionSchema,
         tuple: &[Object],
     ) -> Option<Rc<StepAction>> {
-        let mut subst: HashMap<Variable, Object> = HashMap::new();
+        let mut subst: FastMap<Variable, Object> = FastMap::default();
         for (i, &p) in schema.parameters.iter().enumerate() {
             subst.insert(p, tuple[i]);
         }

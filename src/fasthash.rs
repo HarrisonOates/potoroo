@@ -7,10 +7,11 @@
 //! is far better and collision-free enough. We keep the default hasher for any
 //! map exposed to untrusted external input; these maps are purely internal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub type FastSet<K> = HashSet<K, BuildHasherDefault<FxHasher>>;
 
 const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 

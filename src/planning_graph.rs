@@ -4,14 +4,14 @@
 //! domain's instantiated action schemas, iterating to a fixpoint over the
 //! additive cost/work values of every reachable ground literal.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
 use crate::bindings::{AtomPattern, Bindings, TypeContext};
 use crate::chain;
 use crate::effect::Effect;
-use crate::fasthash::FastMap;
+use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Atom, Formula, Literal};
 use crate::instantiate::{
     instantiate_atom, instantiate_effect, instantiate_formula, precondition_consistent,
@@ -211,8 +211,8 @@ fn unifies(
 /// Groups ground atoms by predicate and indexes each resulting relation.
 fn group_by_predicate<'a>(
     atoms: impl Iterator<Item = &'a Atom>,
-) -> (HashMap<Predicate, Vec<Atom>>, FastMap<Predicate, AtomIndex>) {
-    let mut table: HashMap<Predicate, Vec<Atom>> = HashMap::new();
+) -> (FastMap<Predicate, Vec<Atom>>, FastMap<Predicate, AtomIndex>) {
+    let mut table: FastMap<Predicate, Vec<Atom>> = FastMap::default();
     for atom in atoms {
         table.entry(atom.predicate).or_default().push(atom.clone());
     }
@@ -224,10 +224,10 @@ fn group_by_predicate<'a>(
 }
 
 pub struct PlanningGraph {
-    atom_values: HashMap<Atom, HeuristicValue>,
-    negation_values: HashMap<Atom, HeuristicValue>,
-    predicate_atoms: HashMap<Predicate, Vec<Atom>>,
-    predicate_negations: HashMap<Predicate, Vec<Atom>>,
+    atom_values: FastMap<Atom, HeuristicValue>,
+    negation_values: FastMap<Atom, HeuristicValue>,
+    predicate_atoms: FastMap<Predicate, Vec<Atom>>,
+    predicate_negations: FastMap<Predicate, Vec<Atom>>,
     /// The atoms true in the initial state.
     ///
     /// Under the closed-world assumption this is exactly what decides whether a
@@ -235,7 +235,7 @@ pub struct PlanningGraph {
     /// from `atom_values`: "reachable at zero cost" is not the same thing as
     /// "true initially" once a domain declares zero-cost actions, which IPC
     /// 2023's recharging-robots and folding both do.
-    init_atoms: HashSet<Atom>,
+    init_atoms: FastSet<Atom>,
     /// Positional indexes over the two relations above, parallel to them.
     atom_index: FastMap<Predicate, AtomIndex>,
     negation_index: FastMap<Predicate, AtomIndex>,
@@ -244,7 +244,7 @@ pub struct PlanningGraph {
     actions: Vec<Rc<StepAction>>,
     /// Predicate -> `(action index, effect index)` of every positive add effect,
     /// for finding achievers of a goal atom during relaxed-plan extraction.
-    pos_achievers: HashMap<Predicate, Vec<(usize, usize)>>,
+    pos_achievers: FastMap<Predicate, Vec<(usize, usize)>>,
 }
 
 impl PlanningGraph {
@@ -256,15 +256,15 @@ impl PlanningGraph {
         actions: &[Rc<StepAction>],
     ) -> PlanningGraph {
         let mut pg = PlanningGraph {
-            atom_values: HashMap::new(),
-            negation_values: HashMap::new(),
-            predicate_atoms: HashMap::new(),
-            predicate_negations: HashMap::new(),
-            init_atoms: HashSet::new(),
+            atom_values: FastMap::default(),
+            negation_values: FastMap::default(),
+            predicate_atoms: FastMap::default(),
+            predicate_negations: FastMap::default(),
+            init_atoms: FastSet::default(),
             atom_index: FastMap::default(),
             negation_index: FastMap::default(),
             actions: Vec::new(),
-            pos_achievers: HashMap::new(),
+            pos_achievers: FastMap::default(),
         };
 
         // Add initial conditions at level 0 (heuristics.cc:471-485).
@@ -286,8 +286,8 @@ impl PlanningGraph {
         // (heuristics.cc:517-700).
         loop {
             let mut changed = false;
-            let mut new_atom_values: HashMap<Atom, HeuristicValue> = HashMap::new();
-            let mut new_negation_values: HashMap<Atom, HeuristicValue> = HashMap::new();
+            let mut new_atom_values: FastMap<Atom, HeuristicValue> = FastMap::default();
+            let mut new_negation_values: FastMap<Atom, HeuristicValue> = FastMap::default();
 
             for action in actions {
                 // Precondition value at this level (bindings = NULL: ground).
@@ -343,9 +343,11 @@ impl PlanningGraph {
                                 .copied();
                             match existing {
                                 None => {
-                                    // Closed world: only achieve the negation if
-                                    // the atom is not (yet) certainly present.
-                                    if pg.heuristic_value_atom(atom, 0, None).zero() {
+                                    // An atom false in the initial state already
+                                    // has a free negation by the closed-world
+                                    // default, so only an atom that starts true
+                                    // needs its deletion priced here.
+                                    if pg.init_atoms.contains(atom) {
                                         let mut new_value = cond_value;
                                         new_value.increment_work();
                                         new_negation_values.insert(atom.clone(), new_value);
@@ -420,15 +422,15 @@ impl PlanningGraph {
         task_costs: bool,
     ) -> PlanningGraph {
         let mut pg = PlanningGraph {
-            atom_values: HashMap::new(),
-            negation_values: HashMap::new(),
-            predicate_atoms: HashMap::new(),
-            predicate_negations: HashMap::new(),
-            init_atoms: HashSet::new(),
+            atom_values: FastMap::default(),
+            negation_values: FastMap::default(),
+            predicate_atoms: FastMap::default(),
+            predicate_negations: FastMap::default(),
+            init_atoms: FastSet::default(),
             atom_index: FastMap::default(),
             negation_index: FastMap::default(),
             actions: Vec::new(),
-            pos_achievers: HashMap::new(),
+            pos_achievers: FastMap::default(),
         };
 
         // Initialise level 0 from the init atoms.
@@ -448,7 +450,7 @@ impl PlanningGraph {
 
         // Pre-compute the compatible-object lists for every type that appears
         // as a schema parameter, so `get_objects` is called at most once per type.
-        let mut type_domains: HashMap<Type, Vec<Object>> = HashMap::new();
+        let mut type_domains: FastMap<Type, Vec<Object>> = FastMap::default();
         for schema in schemas {
             // Quantified-effect variables are enumerated just like parameters,
             // so their types need a domain as well.
@@ -461,7 +463,7 @@ impl PlanningGraph {
                 type_domains.entry(ty).or_insert_with(|| get_objects(ty));
             }
         }
-        let type_sets: HashMap<Type, HashSet<Object>> = type_domains
+        let type_sets: FastMap<Type, FastSet<Object>> = type_domains
             .iter()
             .map(|(ty, objs)| (*ty, objs.iter().copied().collect()))
             .collect();
@@ -469,8 +471,8 @@ impl PlanningGraph {
         // Fixpoint.
         loop {
             let mut changed = false;
-            let mut new_atom_values: HashMap<Atom, HeuristicValue> = HashMap::new();
-            let mut new_negation_values: HashMap<Atom, HeuristicValue> = HashMap::new();
+            let mut new_atom_values: FastMap<Atom, HeuristicValue> = FastMap::default();
+            let mut new_negation_values: FastMap<Atom, HeuristicValue> = FastMap::default();
             let atoms_by_pred = atoms_by_predicate(&pg.atom_values);
 
             for schema in schemas {
@@ -635,29 +637,46 @@ impl PlanningGraph {
                 // is resolved against the bindings once; per-candidate matching
                 // is then cheap positional checks instead of full unification.
                 let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
-                if let Some(terms) = pattern.object_terms() {
-                    // Fully bound: a single hash lookup decides it.
-                    let ground = Atom {
-                        predicate: atom.predicate,
-                        terms,
-                    };
-                    return self.heuristic_value_atom(&ground, 0, None);
-                }
-                let mut value = HeuristicValue::INFINITE;
-                self.for_each_match(
-                    Relation::Positive,
-                    atom.predicate,
-                    ctx,
-                    &mut pattern,
-                    |candidate| unifies(ctx, b, atom, step_id, candidate),
-                    |candidate| {
-                        value = hv_min(value, self.heuristic_value_atom(candidate, 0, None));
-                        !value.zero()
-                    },
-                );
-                value
+                self.positive_value_for(atom, step_id, ctx, b, &mut pattern)
             }
         }
+    }
+
+    /// Minimum value over the reachable ground atoms `pattern` admits.
+    ///
+    /// Split out of [`PlanningGraph::heuristic_value_atom`] so the negated-literal
+    /// lookup can reuse a pattern it has already resolved. Resolving one walks
+    /// the varset chain and rebuilds the per-class exclusion lists, which costs
+    /// considerably more than the scan it feeds.
+    fn positive_value_for(
+        &self,
+        atom: &Atom,
+        step_id: usize,
+        ctx: &TypeContext,
+        b: &Bindings,
+        pattern: &mut AtomPattern,
+    ) -> HeuristicValue {
+        if let Some(terms) = pattern.object_terms() {
+            // Fully bound: a single hash lookup decides it.
+            let ground = Atom {
+                predicate: atom.predicate,
+                terms,
+            };
+            return self.heuristic_value_atom(&ground, 0, None);
+        }
+        let mut value = HeuristicValue::INFINITE;
+        self.for_each_match(
+            Relation::Positive,
+            atom.predicate,
+            ctx,
+            pattern,
+            |candidate| unifies(ctx, b, atom, step_id, candidate),
+            |candidate| {
+                value = hv_min(value, self.heuristic_value_atom(candidate, 0, None));
+                !value.zero()
+            },
+        );
+        value
     }
 
     pub fn heuristic_value_negation(
@@ -679,10 +698,15 @@ impl PlanningGraph {
                 }
             }
             Some((ctx, b)) => {
-                if !self.heuristic_value_atom(atom, step_id, bindings).zero() {
+                // One resolution feeds both the positive guard below and the
+                // negated scan further down.
+                let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
+                if !self
+                    .positive_value_for(atom, step_id, ctx, b, &mut pattern)
+                    .zero()
+                {
                     return HeuristicValue::ZERO;
                 }
-                let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
                 if let Some(terms) = pattern.object_terms() {
                     // Fully bound: decide membership in the negation table
                     // directly (the scan below values candidates through
@@ -927,8 +951,8 @@ impl PlanningGraph {
     ) -> Option<f32> {
         let ctx = search_ctx.type_ctx();
         let bindings = plan.bindings.clone();
-        let mut chosen: HashSet<usize> = HashSet::new();
-        let mut achieved: HashSet<Atom> = HashSet::new();
+        let mut chosen: FastSet<usize> = FastSet::default();
+        let mut achieved: FastSet<Atom> = FastSet::default();
         let mut worklist: VecDeque<Atom> = VecDeque::new();
 
         // Seed the worklist with the open conditions' positive goal atoms.
@@ -1244,17 +1268,17 @@ struct JoinEnum<'a> {
     atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
     /// Type-compatible objects per parameter type (for the membership check on
     /// join-bound objects, and for enumerating join-unconstrained parameters).
-    type_domains: &'a HashMap<Type, Vec<Object>>,
-    type_sets: &'a HashMap<Type, HashSet<Object>>,
-    subst: HashMap<Variable, Object>,
+    type_domains: &'a FastMap<Type, Vec<Object>>,
+    type_sets: &'a FastMap<Type, FastSet<Object>>,
+    subst: FastMap<Variable, Object>,
 }
 
 impl<'a> JoinEnum<'a> {
     fn new(
         schema: &'a ActionSchema,
         atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
-        type_domains: &'a HashMap<Type, Vec<Object>>,
-        type_sets: &'a HashMap<Type, HashSet<Object>>,
+        type_domains: &'a FastMap<Type, Vec<Object>>,
+        type_sets: &'a FastMap<Type, FastSet<Object>>,
     ) -> Self {
         JoinEnum::over(
             &schema.var_types,
@@ -1276,8 +1300,8 @@ impl<'a> JoinEnum<'a> {
         params: &'a [Variable],
         join_source: &'a Formula,
         atoms_by_pred: &'a FastMap<Predicate, JoinRelation<'a>>,
-        type_domains: &'a HashMap<Type, Vec<Object>>,
-        type_sets: &'a HashMap<Type, HashSet<Object>>,
+        type_domains: &'a FastMap<Type, Vec<Object>>,
+        type_sets: &'a FastMap<Type, FastSet<Object>>,
     ) -> Self {
         let mut join = Vec::new();
         collect_join_atoms(join_source, &mut join);
@@ -1290,13 +1314,13 @@ impl<'a> JoinEnum<'a> {
             atoms_by_pred,
             type_domains,
             type_sets,
-            subst: HashMap::new(),
+            subst: FastMap::default(),
         }
     }
 
     /// Pre-binds variables fixed by an enclosing scope, so an effect's join runs
     /// under the schema tuple that produced it.
-    fn seed(&mut self, subst: &HashMap<Variable, Object>) {
+    fn seed(&mut self, subst: &FastMap<Variable, Object>) {
         self.subst.clone_from(subst);
     }
 
@@ -1305,7 +1329,7 @@ impl<'a> JoinEnum<'a> {
         self.var_types[v.0 as usize]
     }
 
-    fn run(&mut self, visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object])) {
+    fn run(&mut self, visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object])) {
         // Pick the unused join conjunct with the fewest unbound variables,
         // tie-broken by smallest candidate list.
         let mut pick: Option<(usize, (usize, usize))> = None;
@@ -1373,7 +1397,7 @@ impl<'a> JoinEnum<'a> {
         &mut self,
         conjunct: &'a Atom,
         candidate: &'a Atom,
-        visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object]),
+        visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object]),
     ) {
         let mut newly_bound: Vec<Variable> = Vec::new();
         let mut ok = true;
@@ -1424,7 +1448,7 @@ impl<'a> JoinEnum<'a> {
     fn enumerate_rest(
         &mut self,
         from: usize,
-        visit: &mut dyn FnMut(&HashMap<Variable, Object>, &[Object]),
+        visit: &mut dyn FnMut(&FastMap<Variable, Object>, &[Object]),
     ) {
         let params = self.params;
         let mut k = from;
@@ -1457,7 +1481,7 @@ struct JoinRelation<'a> {
 /// Groups the currently-reachable atoms by predicate for the join, indexing
 /// each relation.
 fn atoms_by_predicate(
-    atom_values: &HashMap<Atom, HeuristicValue>,
+    atom_values: &FastMap<Atom, HeuristicValue>,
 ) -> FastMap<Predicate, JoinRelation<'_>> {
     let mut map: FastMap<Predicate, Vec<&Atom>> = FastMap::default();
     for atom in atom_values.keys() {
@@ -1478,14 +1502,14 @@ fn atoms_by_predicate(
 fn apply_schema_tuple(
     schema: &ActionSchema,
     action_cost: usize,
-    subst: &HashMap<Variable, Object>,
+    subst: &FastMap<Variable, Object>,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
     atoms_by_pred: &FastMap<Predicate, JoinRelation<'_>>,
-    type_domains: &HashMap<Type, Vec<Object>>,
-    type_sets: &HashMap<Type, HashSet<Object>>,
-    new_atom_values: &mut HashMap<Atom, HeuristicValue>,
-    new_negation_values: &mut HashMap<Atom, HeuristicValue>,
+    type_domains: &FastMap<Type, Vec<Object>>,
+    type_sets: &FastMap<Type, FastSet<Object>>,
+    new_atom_values: &mut FastMap<Atom, HeuristicValue>,
+    new_negation_values: &mut FastMap<Atom, HeuristicValue>,
     changed: &mut bool,
 ) {
     if !precondition_consistent(&schema.precondition, subst) {
@@ -1552,12 +1576,12 @@ fn apply_schema_tuple(
 fn apply_effect_tuple(
     effect: &Effect,
     action_cost: usize,
-    subst: &HashMap<Variable, Object>,
+    subst: &FastMap<Variable, Object>,
     pre_value: &HeuristicValue,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
-    new_atom_values: &mut HashMap<Atom, HeuristicValue>,
-    new_negation_values: &mut HashMap<Atom, HeuristicValue>,
+    new_atom_values: &mut FastMap<Atom, HeuristicValue>,
+    new_negation_values: &mut FastMap<Atom, HeuristicValue>,
     changed: &mut bool,
 ) {
     let ground_cond = instantiate_formula(&effect.condition, subst);
@@ -1617,9 +1641,15 @@ fn apply_effect_tuple(
                 .copied();
             match existing {
                 None => {
-                    // Closed-world: only achieve the negation if the
-                    // atom is not (yet) certainly present.
-                    if pg.heuristic_value_atom(&atom, 0, None).zero() {
+                    // An atom false in the initial state already has a free
+                    // negation by the closed-world default, so only an atom that
+                    // starts true needs its deletion priced here. Testing
+                    // `init_atoms` rather than a zero *cost* keeps this in step
+                    // with `heuristic_value_negation`: with zero-cost actions the
+                    // two differ, and an entry recorded for an atom that is false
+                    // initially would shadow the free default with a positive
+                    // cost.
+                    if pg.init_atoms.contains(&atom) {
                         let mut new_value = cond_value;
                         new_value.increment_work();
                         new_negation_values.insert(atom, new_value);
@@ -1646,7 +1676,7 @@ fn apply_effect_tuple(
 /// relaxed-plan extraction.
 fn collect_reachable_tuple(
     schema: &ActionSchema,
-    subst: &HashMap<Variable, Object>,
+    subst: &FastMap<Variable, Object>,
     tuple: &[Object],
     pg: &PlanningGraph,
     predicates: &PredicateTable,
