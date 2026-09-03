@@ -1255,6 +1255,13 @@ struct JoinEnum<'a> {
     /// small and contiguous, so an array beats a hash map for the per-candidate
     /// read/write this join does at every step.
     subst: Vec<Option<Object>>,
+    /// Shared LIFO stack of variables newly bound by the in-progress
+    /// `match_candidate` calls, one contiguous run per call (nested calls push
+    /// and pop their own before returning, so it always nests correctly). A
+    /// single growable buffer reused across every candidate probed, instead of
+    /// a fresh `Vec` per call -- this join tries many candidates that fail
+    /// after binding one or two variables.
+    bound_stack: Vec<Variable>,
 }
 
 impl<'a> JoinEnum<'a> {
@@ -1297,6 +1304,7 @@ impl<'a> JoinEnum<'a> {
             type_domains,
             type_sets,
             subst: vec![None; var_types.len()],
+            bound_stack: Vec::new(),
         }
     }
 
@@ -1385,7 +1393,7 @@ impl<'a> JoinEnum<'a> {
         candidate: &'a Atom,
         visit: &mut dyn FnMut(&[Option<Object>], &[Object]),
     ) {
-        let mut newly_bound: Vec<Variable> = Vec::new();
+        let mark = self.bound_stack.len();
         let mut ok = true;
         for (t, gt) in conjunct.terms.iter().zip(candidate.terms.iter()) {
             let Term::Object(o) = gt else {
@@ -1410,13 +1418,14 @@ impl<'a> JoinEnum<'a> {
                         // The Cartesian enumeration only ever tried objects
                         // from the parameter's type domain.
                         if !self.type_sets[&self.var_type(*v)].contains(o) {
-                            for v in newly_bound {
+                            for &v in &self.bound_stack[mark..] {
                                 self.subst[v.0 as usize] = None;
                             }
+                            self.bound_stack.truncate(mark);
                             return;
                         }
                         self.subst[v.0 as usize] = Some(*o);
-                        newly_bound.push(*v);
+                        self.bound_stack.push(*v);
                     }
                 },
             }
@@ -1424,9 +1433,10 @@ impl<'a> JoinEnum<'a> {
         if ok {
             self.run(visit);
         }
-        for v in newly_bound {
+        for &v in &self.bound_stack[mark..] {
             self.subst[v.0 as usize] = None;
         }
+        self.bound_stack.truncate(mark);
     }
 
     /// Enumerates parameters not bound by any join conjunct over their type
