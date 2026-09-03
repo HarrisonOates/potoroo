@@ -390,18 +390,12 @@ fn reports_a_cost_function_the_problem_never_assigns() {
     assert!(message.contains("drive-cost"), "unexpected error: {message}");
 }
 
-/// Two schemas achieve `cursor`, and their parameter at index 1 is a `marker`
-/// in one and a `slot` in the other -- sibling types, so neither substitutes
-/// for the other. Both are generated as step 1 of sibling refinements of the
-/// same parent, and `step_var_types` is keyed by step id alone, so whichever
-/// registers last would type *both* children's variables. Typing `pick`'s `?m`
-/// as `place`'s `?t` makes the `(tagged ?m)` lookup match no ground atom, so
-/// `pick` is ranked unreachable and dropped -- and since `place` really is
-/// dead, the search then reports no solution for a one-step task.
-///
-/// This is IPC 2023's folding domain in miniature, where `rotate`'s
-/// `?fromdir - direction` was being typed as `rotate-first-pass`'s `?n1 - node`.
-/// `place` is declared second so it is the sibling that registers last.
+/// `pick` and `place` are sibling refinements of the same parent, each adding
+/// step 1: `pick`'s `?m` is a `marker`, `place`'s `?t` is a `slot`. If the
+/// last-registered sibling's types leaked into the other, `pick`'s `(tagged
+/// ?m)` would match nothing and the whole task would look unsolvable, as
+/// folding's `rotate`/`rotate-first-pass` did. `place` is declared second so
+/// it's the one that would register last.
 const SIBLING_TYPE_DOMAIN: &str = r#"
 (define (domain sibling-types)
   (:requirements :adl)
@@ -443,12 +437,10 @@ fn sibling_refinements_do_not_share_each_others_parameter_types() {
     assert_eq!(solution.num_steps(), 1);
 }
 
-/// `(not (WALL ?c))` over an unbound `?c`, where `WALL` is static. The negation
-/// of a static atom can only ever hold because the atom is *absent*, and the
-/// relaxed graph tracks only negations some action achieves -- so the lookup has
-/// to reason about the tuples the pattern admits but the relation does not
-/// contain. Valuing it infinite makes ADD prune every move, as it did on IPC
-/// 2023's ricochet-robots.
+/// `(not (WALL ?c))` over an unbound `?c`, where `WALL` is static: it can only
+/// hold by absence, which the relaxed graph must reason about since it tracks
+/// only negations an action achieves. Otherwise infinite, pruning every move,
+/// as on IPC 2023's ricochet-robots.
 const NEGATED_STATIC_DOMAIN: &str = r#"
 (define (domain negated-static)
   (:requirements :adl)
@@ -483,12 +475,9 @@ fn negated_static_literal_over_unbound_variables_is_reachable() {
     assert_eq!(solution.num_steps(), 1);
 }
 
-/// A parameterless action whose whole effect is `forall`-`when`, as in IPC
-/// 2023's rubiks-cube. The relaxed graph enumerates schema parameters from the
-/// precondition; a quantified effect's own variables need enumerating too, or
-/// the action contributes nothing and everything downstream of it looks
-/// unreachable. `finish` sits downstream of `prime`'s quantified effect, so
-/// ADD has to value `(ready t1)` finitely for the plan to be found at all.
+/// `prime`'s whole effect is `forall`-`when`, as in IPC 2023's rubiks-cube.
+/// `finish` sits downstream of it, so ADD has to enumerate the quantified
+/// variables to value `(ready t1)` finitely.
 const QUANTIFIED_EFFECT_DOMAIN: &str = r#"
 (define (domain quantified-effect)
   (:requirements :adl)
@@ -527,11 +516,9 @@ fn relaxed_graph_applies_universally_quantified_effects() {
     assert_eq!(solution.num_steps(), 2);
 }
 
-/// A disjunctive precondition, as in IPC 2023's recharging-robots
-/// (`(or (CONNECTED ?from ?to) (CONNECTED ?to ?from))`). Separating an effect
-/// from such a precondition must not assert that every disjunct is false: that
-/// contradicts the precondition itself, so the step's open conditions can never
-/// all close and the search runs forever without ever completing a plan.
+/// A disjunctive precondition, as in IPC 2023's recharging-robots. Separating
+/// an effect from it must not assert every disjunct is false -- that
+/// contradicts the precondition itself, so the plan could never complete.
 const DISJUNCTIVE_PRECONDITION_DOMAIN: &str = r#"
 (define (domain disjunctive-move)
   (:requirements :adl)

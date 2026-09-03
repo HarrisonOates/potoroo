@@ -95,9 +95,7 @@ fn run() -> Result<ExitCode, String> {
 
     // Solve each problem in name order.
     for problem in problems.values() {
-        // `(increase (total-cost) (move-cost))` reads a function whose value is
-        // set by this problem's `:init`, so schema costs are resolved per
-        // problem, before anything downstream reads them.
+        // Cost functions read the problem's `:init`, so resolve per problem.
         bind_action_costs(
             domains
                 .get_mut(&problem.domain_name)

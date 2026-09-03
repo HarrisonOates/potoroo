@@ -21,17 +21,15 @@ pub struct ActionSchema {
     pub var_types: Vec<crate::types::Type>,
     pub precondition: Rc<Formula>,
     pub effects: Vec<Effect>,
-    /// Declared PDDL action cost, resolved against a problem. Costless
-    /// classical domains use one. Equals `cost_base` until
-    /// [`crate::parser::bind_action_costs`] folds in `cost_functions`.
+    /// Declared PDDL action cost. Costless classical domains use one. Equals
+    /// `cost_base` until [`crate::parser::bind_action_costs`] resolves
+    /// `cost_functions` against a problem.
     pub cost: usize,
-    /// The constant part of the declared cost, i.e. the sum of the literal `N`
-    /// in every `(increase (total-cost) N)`. Kept separately so cost binding
-    /// stays idempotent when one domain is reused across several problems.
+    /// Sum of the literal `N` in every `(increase (total-cost) N)`. Kept apart
+    /// from `cost` so rebinding is idempotent across problems.
     pub cost_base: usize,
-    /// Nullary functions summed into the cost by `(increase (total-cost) (f))`.
-    /// Their values are state-independent and come from the problem's `:init`,
-    /// so they can only be resolved once a problem is known.
+    /// Nullary functions named by `(increase (total-cost) (f))`, resolved
+    /// against a problem's `:init`.
     pub cost_functions: Vec<Function>,
 }
 

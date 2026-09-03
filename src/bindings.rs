@@ -1103,18 +1103,13 @@ impl AtomPattern {
             })
     }
 
-    /// An upper bound on the number of ground term tuples this pattern admits.
-    ///
-    /// Object positions contribute a single choice; each distinct variable
-    /// class contributes the objects of its type, less the constants excluded
-    /// for it. Non-codesignation *pairs* are not applied, so the count can
-    /// exceed the number of tuples [`AtomPattern::matches`] would accept. The
-    /// caller (the planning graph's negated-literal lookup) compares it against
-    /// a count of matched atoms to decide whether some admitted tuple escapes a
-    /// relation, and over-counting only relaxes that answer.
+    /// An upper bound on the number of ground term tuples this pattern admits:
+    /// each distinct variable class contributes its type's object count minus
+    /// its exclusions. Ignores non-codesignation pairs, so it can overcount
+    /// relative to [`AtomPattern::matches`] — harmless for callers using it as
+    /// a bound.
     pub fn admitted_tuples(&self, ctx: &TypeContext) -> u64 {
-        // Classes are numbered in order of first appearance, so a term whose
-        // class equals the number collected so far is introducing it.
+        // Classes are numbered by first appearance.
         let mut class_types: Vec<Type> = Vec::new();
         for term in &self.terms {
             if let PatTerm::Var { class, ty } = term {

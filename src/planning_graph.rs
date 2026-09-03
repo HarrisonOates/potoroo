@@ -228,13 +228,8 @@ pub struct PlanningGraph {
     negation_values: FastMap<Atom, HeuristicValue>,
     predicate_atoms: FastMap<Predicate, Vec<Atom>>,
     predicate_negations: FastMap<Predicate, Vec<Atom>>,
-    /// The atoms true in the initial state.
-    ///
-    /// Under the closed-world assumption this is exactly what decides whether a
-    /// negated literal holds for free, so it is recorded rather than inferred
-    /// from `atom_values`: "reachable at zero cost" is not the same thing as
-    /// "true initially" once a domain declares zero-cost actions, which IPC
-    /// 2023's recharging-robots and folding both do.
+    /// The atoms true in the initial state, distinct from "reachable at zero
+    /// cost" once zero-cost actions exist.
     init_atoms: FastSet<Atom>,
     /// Positional indexes over the two relations above, parallel to them.
     atom_index: FastMap<Predicate, AtomIndex>,
@@ -343,10 +338,7 @@ impl PlanningGraph {
                                 .copied();
                             match existing {
                                 None => {
-                                    // An atom false in the initial state already
-                                    // has a free negation by the closed-world
-                                    // default, so only an atom that starts true
-                                    // needs its deletion priced here.
+                                    // A negation is free unless the atom starts true.
                                     if pg.init_atoms.contains(atom) {
                                         let mut new_value = cond_value;
                                         new_value.increment_work();
@@ -642,12 +634,9 @@ impl PlanningGraph {
         }
     }
 
-    /// Minimum value over the reachable ground atoms `pattern` admits.
-    ///
-    /// Split out of [`PlanningGraph::heuristic_value_atom`] so the negated-literal
-    /// lookup can reuse a pattern it has already resolved. Resolving one walks
-    /// the varset chain and rebuilds the per-class exclusion lists, which costs
-    /// considerably more than the scan it feeds.
+    /// Minimum value over the reachable ground atoms `pattern` admits. Split out
+    /// of [`PlanningGraph::heuristic_value_atom`] so [`Self::heuristic_value_negation`]
+    /// can reuse an already-resolved pattern instead of resolving it twice.
     fn positive_value_for(
         &self,
         atom: &Atom,
@@ -698,8 +687,6 @@ impl PlanningGraph {
                 }
             }
             Some((ctx, b)) => {
-                // One resolution feeds both the positive guard below and the
-                // negated scan further down.
                 let mut pattern = b.resolve_pattern(ctx, &atom.terms, step_id);
                 if !self
                     .positive_value_for(atom, step_id, ctx, b, &mut pattern)
@@ -738,17 +725,11 @@ impl PlanningGraph {
                 if value.zero() {
                     return value;
                 }
-                // No action achieves the negation, but under the closed-world
-                // assumption a tuple that is simply *false* initially satisfies
-                // it for free. The ground arm above decides that with one
-                // lookup in `init_atoms`. A partially-bound pattern cannot
-                // enumerate the complement of the relation, so instead count
-                // the atoms it matches that are true initially and compare
-                // against the tuples it admits: any surplus is a false atom.
-                // Without this, a negated static literal over unbound variables
-                // -- `(not (blocked ?cell ?dir))` in IPC 2023's ricochet-robots
-                // -- is valued infinite as soon as any one cell is blocked,
-                // making every reachable refinement look dead.
+                // No action achieves the negation, but a tuple simply absent
+                // from the relation is free by the closed-world assumption. A
+                // partially-bound pattern can't enumerate the complement, so
+                // count matches that are true initially and compare against
+                // the tuples the pattern admits: any surplus is a false atom.
                 let mut initially_true = 0u64;
                 self.for_each_match(
                     Relation::Positive,
@@ -1290,11 +1271,9 @@ impl<'a> JoinEnum<'a> {
         )
     }
 
-    /// Enumerates `params` against the positive conjuncts of `join_source`.
-    ///
-    /// Used both for a schema's parameters against its precondition and, with
-    /// [`JoinEnum::seed`], for a universally quantified effect's variables
-    /// against its `when` guard.
+    /// Enumerates `params` against the positive conjuncts of `join_source`: a
+    /// schema's parameters against its precondition, or (with
+    /// [`JoinEnum::seed`]) a quantified effect's variables against its guard.
     fn over(
         var_types: &'a [Type],
         params: &'a [Variable],
@@ -1318,8 +1297,7 @@ impl<'a> JoinEnum<'a> {
         }
     }
 
-    /// Pre-binds variables fixed by an enclosing scope, so an effect's join runs
-    /// under the schema tuple that produced it.
+    /// Pre-binds variables fixed by an enclosing scope.
     fn seed(&mut self, subst: &FastMap<Variable, Object>) {
         self.subst.clone_from(subst);
     }
@@ -1537,13 +1515,8 @@ fn apply_schema_tuple(
             );
             continue;
         }
-        // A universally quantified effect: its own variables still have to be
-        // enumerated. `forall (?x) (when C(?x) E(?x))` contributes `E(o)` for
-        // every `o` whose guard is relaxed-reachable, so join the guard exactly
-        // as the precondition is joined for schema parameters, seeded with the
-        // tuple that fixed the schema's own variables. Variables the guard does
-        // not constrain fall through to their type domain, which is what an
-        // unconditional `forall` effect needs.
+        // A quantified effect: join its guard for its own variables too, seeded
+        // with the schema tuple's substitution.
         let mut je = JoinEnum::over(
             &schema.var_types,
             &effect.parameters,
@@ -1640,15 +1613,8 @@ fn apply_effect_tuple(
                 .or_else(|| pg.negation_values.get(&atom))
                 .copied();
             match existing {
-                None => {
-                    // An atom false in the initial state already has a free
-                    // negation by the closed-world default, so only an atom that
-                    // starts true needs its deletion priced here. Testing
-                    // `init_atoms` rather than a zero *cost* keeps this in step
-                    // with `heuristic_value_negation`: with zero-cost actions the
-                    // two differ, and an entry recorded for an atom that is false
-                    // initially would shadow the free default with a positive
-                    // cost.
+None => {
+                    // A negation is free unless the atom starts true.
                     if pg.init_atoms.contains(&atom) {
                         let mut new_value = cond_value;
                         new_value.increment_work();

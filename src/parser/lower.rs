@@ -972,11 +972,8 @@ fn lower_init_element(
             }
             Ok(())
         }
-        // `(= (f) N)` for a nullary `f`. Nothing in the classical subset can
-        // write a function, so such a value is a state-independent constant —
-        // exactly what `(increase (total-cost) (f))` reads. Values are recorded
-        // for every declared nullary function, whether or not a cost effect
-        // names it; `bind_action_costs` picks out the ones that matter.
+        // `(= (f) N)` for a nullary `f`: recorded for every declared function,
+        // whether or not a cost effect names it; `bind_action_costs` filters.
         InitElement::IsValue(term, value) if action_costs && term.names().is_empty() => {
             let name = s(term.symbol());
             let function = functions
@@ -997,16 +994,10 @@ fn lower_init_element(
     }
 }
 
-/// Folds a problem's `:init` function values into its domain's action costs.
-///
-/// `(increase (total-cost) (move-cost))` names a function whose value lives in
-/// the problem, not the domain, so [`lower_domain`] can only record the
-/// reference. This resolves it, setting each schema's [`ActionSchema::cost`] to
-/// `cost_base` plus the value of every cost function it names.
-///
-/// Call this once per problem before planning. It recomputes from `cost_base`,
-/// so it is idempotent and safe to re-run when one domain serves several
-/// problems that assign different values.
+/// Resolves each schema's [`ActionSchema::cost`] to `cost_base` plus the value
+/// of every cost function it names, read from `problem`'s `:init`. Call once
+/// per problem before planning; recomputes from `cost_base` each time, so it's
+/// safe to re-run when one domain serves several problems.
 pub fn bind_action_costs(domain: &mut Domain, problem: &Problem) -> Result<(), LowerError> {
     // Later assignments win, matching `:init` being read in order.
     let mut values: HashMap<crate::functions::Function, f64> = HashMap::new();

@@ -43,31 +43,12 @@ pub fn read_pddl(src: &str) -> Result<ParsedUnit, ReadError> {
     }
 }
 
-/// Normalize source so the `pddl` crate's parsers accept permissive PDDL input.
-///
-/// The spec treats `(` and `)` as self-delimiting tokens, so a token boundary
-/// needs no whitespace and stray whitespace at one is insignificant. The `pddl`
-/// crate's `nom` parsers are stricter: they require a separator between
-/// adjacent forms and reject padding before a closing paren. IPC 2023 exercises
-/// both — labyrinth writes `:parameters(...)` and `(card-at ?cm ?x ?y )`.
-///
-/// So this inserts a space before any `(` that is not already preceded by
-/// whitespace or `(`, and drops whitespace before any `)`. PDDL has no string
-/// literals, so no parenthesis can occur inside a token and both rewrites are
-/// semantically inert.
-///
-/// Names are also folded to lower case. PDDL identifiers -- types, constants,
-/// predicates, functions, variables, and action names alike -- are
-/// case-insensitive, but the symbol tables downstream key on the exact string,
-/// so `(NEXT ?p1 ?p2)` declared and `(next ?x ?y)` used would silently become
-/// two predicates. IPC 2023's labyrinth does exactly that. Folding here is
-/// total, which is what makes it safe: no lookup path can be missed. Nothing
-/// else in PDDL is case-sensitive, so only the spelling of names in output
-/// changes, and every mainstream planner and VAL fold the same way.
-///
-/// Comments are deleted first (keeping their terminating newline). They must
-/// not survive: deleting the whitespace before a `)` could otherwise pull the
-/// paren onto the end of a comment line and swallow it.
+/// Normalizes source for the `pddl` crate's stricter-than-spec parsers: folds
+/// identifiers to lower case (PDDL names are case-insensitive; the symbol
+/// tables downstream are not, so `NEXT`/`next` would otherwise become two
+/// predicates), inserts a space before a `(` with no preceding separator
+/// (`:parameters(...)`), and drops space before a `)` (`(at ?x ?y )`). Comments
+/// are stripped first so a dangling `)` can't get pulled onto a comment line.
 fn normalize(src: &str) -> String {
     let uncommented = strip_comments(&src.to_ascii_lowercase());
     let mut out = String::with_capacity(uncommented.len());

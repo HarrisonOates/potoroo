@@ -411,14 +411,10 @@ impl<'a> SearchContext<'a> {
 
     /// Re-points the step-action map at `plan`'s own newest step.
     ///
-    /// `step_var_types` is keyed by step id alone, but step ids are unique only
-    /// *within* one plan: every sibling refinement of a parent adds its step
-    /// with the same id, and each registers it as it is built. Without this,
-    /// the last sibling generated would decide the parameter types used to rank
-    /// all of them, so a schema's variables could be typed by a different
-    /// schema's parameters -- silently making reachable open conditions look
-    /// unreachable. A refinement adds at most one step and conses it onto the
-    /// head of the chain, so re-registering that one entry is enough.
+    /// `step_var_types` is keyed by step id alone, but ids repeat across a
+    /// parent's sibling refinements, so without this the last sibling
+    /// registered would decide the parameter types used to rank all of them.
+    /// A refinement adds at most one step, consed onto the chain's head.
     pub fn register_newest_step(&self, plan: &Plan, parent_num_steps: usize) {
         if plan.num_steps > parent_num_steps {
             if let Some(chain) = &plan.steps {

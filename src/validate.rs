@@ -68,15 +68,9 @@ fn find_step(plan: &Plan, id: usize) -> Option<Step> {
 /// Whether the producer of `link` has an effect whose literal positively unifies
 /// with the link's protected condition under the plan's bindings.
 ///
-/// A negative link from `INIT_ID` is a separate case: [`Plan::new_cw_link`]
-/// supports a negative open condition by the *absence* of a matching init
-/// atom under the closed-world assumption, protected by the inequality goals
-/// it adds rather than by any actual init effect -- init's effects are always
-/// positive, so `unify` below can never match a negative link condition
-/// against one (it requires matching polarity), and every task relying on
-/// this (e.g. any domain with `:negative-preconditions` whose negated
-/// preconditions are never explicitly asserted false) would otherwise be
-/// reported unsupported.
+/// A negative link from `INIT_ID` is the closed-world case: [`Plan::new_cw_link`]
+/// supports it by the *absence* of a matching init atom, not by any actual
+/// effect, so it needs its own check below rather than `unify`.
 fn link_supported(plan: &Plan, ctx: &SearchContext, link: &Link) -> bool {
     let Some(producer) = find_step(plan, link.from_id) else {
         return false;
