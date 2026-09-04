@@ -97,7 +97,7 @@ run_mode() {
       # rows land in the same table column as real runs.
       alg="$(echo "$alg_flags" | sed -nE 's/.*-s +([^ ]+).*/\1/p')"
       heur="$(echo "$alg_flags" | sed -nE 's/.*-h +([^ ]+).*/\1/p')"
-      alg_label="${alg:-A}(${heur:-UCPOP})"
+      alg_label="${alg:-A}(${heur:-ADDR})"
       echo "run [$mode]: $pf  $alg_flags" >&2
 
       # shellcheck disable=SC2086

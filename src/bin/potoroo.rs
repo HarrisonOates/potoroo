@@ -8,14 +8,16 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use potoroo::domain::Domain;
 use potoroo::heuristics::{FlawSelectionOrder, Heuristic};
 use potoroo::params::{ActionCost, Parameters, SearchAlgorithm};
 use potoroo::parser::{bind_action_costs, lower_domain, lower_problem, read_pddl, ParsedUnit};
 use potoroo::problem::Problem;
-use potoroo::search::{format_steps, plan_with_stats, Outcome, SearchContext};
+use potoroo::search::{
+    format_steps, plan_with_progress, plan_with_stats, Outcome, SearchContext, SearchProgress,
+};
 
 const PACKAGE: &str = "potoroo";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,8 +41,10 @@ struct Cli {
     fdr_pocl: bool,
     verbosity: u32,
     files: Vec<String>,
-    /// Raw `-h` value as given on the command line (default `UCPOP`). Only used
-    /// to label the optional `POTOROO_STATS_JSON` benchmark output.
+    /// Effective flaw-order names, retained for readable telemetry.
+    flaw_order_names: Vec<String>,
+    /// Effective `-h` value (default `ADDR`, or `ADD` with `--fdr-pocl`). Used
+    /// to label telemetry and the optional `POTOROO_STATS_JSON` output.
     heuristic_name: String,
     /// Raw `-s` value as given on the command line (default `A`). Included in the
     /// `POTOROO_STATS_JSON` output so different algorithms are distinguishable.
@@ -107,6 +111,9 @@ fn run() -> Result<ExitCode, String> {
             .get(&problem.domain_name)
             .expect("domain was looked up during lowering");
         println!(";{}", problem.name);
+        if cli.verbosity > 0 {
+            print_search_configuration(&cli);
+        }
         let timer = Instant::now();
         let ctx = SearchContext::new(domain, problem, &cli.params);
         if cli.fdr_pocl {
@@ -120,37 +127,66 @@ fn run() -> Result<ExitCode, String> {
                     task.operators.len()
                 );
             }
-            let (outcome, stats) = potoroo::fdr_pocl::solve_with_params(&task, &cli.params)
-                .map_err(|e| e.to_string())?;
-            let (solved, plan_len, plan_cost) = match outcome {
+            let search_result = if cli.verbosity > 0 {
+                let mut printer = ProgressPrinter::new(cli.verbosity);
+                let mut report = |progress| printer.report(progress);
+                potoroo::fdr_pocl::solve_with_params_and_progress(&task, &cli.params, &mut report)
+            } else {
+                potoroo::fdr_pocl::solve_with_params(&task, &cli.params)
+            };
+            let (outcome, stats) = search_result.map_err(|e| e.to_string())?;
+            let (solved, plan_len, plan_cost, status) = match outcome {
                 potoroo::fdr_pocl::Outcome::Solved(solution) => {
                     if cli.verbosity > 0 {
-                        eprintln!("Number of steps: {}", solution.operators.len());
-                        eprintln!("Plan cost: {}", solution.plan.cost());
+                        eprintln!(
+                            "Plan: {} steps | cost {}",
+                            solution.operators.len(),
+                            solution.plan.cost()
+                        );
                     }
                     println!("{}", solution.format(&task));
-                    (true, solution.operators.len(), solution.plan.cost())
+                    (
+                        true,
+                        solution.operators.len(),
+                        solution.plan.cost(),
+                        "solved",
+                    )
                 }
                 potoroo::fdr_pocl::Outcome::LimitReached => {
                     println!("no plan");
                     println!(";Search limit reached.");
-                    (false, 0, 0)
+                    (false, 0, 0, "limit reached")
                 }
                 potoroo::fdr_pocl::Outcome::NoSolution => {
                     println!("no plan");
                     println!(";Problem has no solution.");
-                    (false, 0, 0)
+                    (false, 0, 0, "no solution")
                 }
             };
             let ms = timer.elapsed().as_millis();
             println!("Time: {ms}");
+            if cli.verbosity > 0 {
+                print_search_summary(
+                    status,
+                    ms,
+                    stats.nodes_generated,
+                    stats.nodes_visited,
+                    stats.max_queued,
+                    stats.h_evals,
+                    stats.h_eval_ms,
+                    stats.pruned,
+                    stats.max_steps,
+                    stats.max_open_conditions,
+                    stats.max_threats,
+                );
+            }
             if std::env::var_os("POTOROO_STATS_JSON").is_some() {
                 let label = format!("FDR:{}({})", cli.algorithm_name, cli.heuristic_name);
                 eprintln!(
                     "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":true,\
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
-                     \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{}}}",
+                     \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
@@ -165,33 +201,54 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_steps,
                     stats.max_open_conditions,
                     stats.max_threats,
+                    stats.max_queued,
                 );
             }
             continue;
         }
-        let (outcome, stats) = plan_with_stats(&ctx);
-        let (solved, plan_len, plan_cost) = match &outcome {
+        let (outcome, stats) = if cli.verbosity > 0 {
+            let mut printer = ProgressPrinter::new(cli.verbosity);
+            let mut report = |progress| printer.report(progress);
+            plan_with_progress(&ctx, &mut report)
+        } else {
+            plan_with_stats(&ctx)
+        };
+        let (solved, plan_len, plan_cost, status) = match &outcome {
             Outcome::Solved(p) => {
                 if cli.verbosity > 0 {
-                    eprintln!("Number of steps: {}", p.num_steps());
-                    eprintln!("Plan cost: {}", p.cost());
+                    eprintln!("Plan: {} steps | cost {}", p.num_steps(), p.cost());
                 }
                 println!("{}", format_steps(&ctx, &p));
-                (true, p.num_steps(), p.cost())
+                (true, p.num_steps(), p.cost(), "solved")
             }
             Outcome::LimitReached => {
                 println!("no plan");
                 println!(";Search limit reached.");
-                (false, 0, 0)
+                (false, 0, 0, "limit reached")
             }
             Outcome::NoSolution => {
                 println!("no plan");
                 println!(";Problem has no solution.");
-                (false, 0, 0)
+                (false, 0, 0, "no solution")
             }
         };
         let ms = timer.elapsed().as_millis();
         println!("Time: {ms}");
+        if cli.verbosity > 0 {
+            print_search_summary(
+                status,
+                ms,
+                stats.nodes_generated,
+                stats.nodes_visited,
+                stats.max_queued,
+                stats.h_evals,
+                stats.h_eval_ms,
+                stats.pruned,
+                stats.max_steps,
+                stats.max_open_conditions,
+                stats.max_threats,
+            );
+        }
 
         // Machine-readable benchmark line (stderr, opt-in). Kept off stdout so
         // the differential tests still diff stdout byte-for-byte.
@@ -202,7 +259,8 @@ fn run() -> Result<ExitCode, String> {
             eprintln!(
                 "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
                  \"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
-                 \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{}}}",
+                 \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\"max_steps\":{},\
+                 \"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{}}}",
                 json_escape(&problem.name),
                 json_escape(&label),
                 cli.params.ground_actions,
@@ -215,11 +273,151 @@ fn run() -> Result<ExitCode, String> {
                 stats.h_evals,
                 stats.h_eval_ms,
                 stats.pruned,
+                stats.max_steps,
+                stats.max_open_conditions,
+                stats.max_threats,
+                stats.max_queued,
             );
         }
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Throttles the per-expansion callback into compact, line-oriented telemetry.
+/// Level 1 reports at most once a second, level 2 four times a second, and level
+/// 3 reports every expanded node for detailed debugging. The first expansion is
+/// always shown so short searches still explain what happened.
+struct ProgressPrinter {
+    interval: Duration,
+    last_report: Option<Duration>,
+}
+
+impl ProgressPrinter {
+    fn new(verbosity: u32) -> Self {
+        let interval = match verbosity {
+            0 | 1 => Duration::from_secs(1),
+            2 => Duration::from_millis(250),
+            _ => Duration::ZERO,
+        };
+        Self {
+            interval,
+            last_report: None,
+        }
+    }
+
+    fn report(&mut self, progress: SearchProgress) {
+        if self
+            .last_report
+            .is_some_and(|last| progress.elapsed.saturating_sub(last) < self.interval)
+        {
+            return;
+        }
+        self.last_report = Some(progress.elapsed);
+        eprintln!(
+            "Search [{:>7.2}s] visited {} | generated {} | queued {} | h {} evals / {} ms | pruned {} | current steps={} open={} threats={} order={}",
+            progress.elapsed.as_secs_f64(),
+            progress.nodes_visited,
+            progress.nodes_generated,
+            progress.queued,
+            progress.h_evals,
+            progress.h_eval_ms,
+            progress.pruned,
+            progress.current_steps,
+            progress.current_open_conditions,
+            progress.current_threats,
+            progress.flaw_order + 1,
+        );
+    }
+}
+
+fn print_search_configuration(cli: &Cli) {
+    let representation = if cli.fdr_pocl {
+        "finite-domain POCL"
+    } else if cli.params.ground_actions {
+        "ground literal POCL"
+    } else {
+        "lifted POCL"
+    };
+    let limits = cli
+        .params
+        .search_limits
+        .iter()
+        .map(|&limit| {
+            if limit == usize::MAX {
+                "unlimited".to_string()
+            } else {
+                limit.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let limit_label = if cli.params.flaw_orders.len() == 1 {
+        "node limit"
+    } else {
+        "node limits"
+    };
+    eprintln!(
+        "Search: {} | {}({}) | flaws {} | cost {} | weight {} | {} {}",
+        representation,
+        cli.algorithm_name,
+        cli.heuristic_name,
+        cli.flaw_order_names.join(","),
+        action_cost_name(cli.params.action_cost),
+        cli.params.weight,
+        limit_label,
+        limits,
+    );
+
+    if cli.fdr_pocl
+        || cli.params.ground_actions
+        || cli.heuristic_name.to_ascii_uppercase().contains("COMPILE")
+    {
+        eprintln!(
+            "Fast Downward: driver {} | search {}",
+            potoroo::external::fd_path(),
+            potoroo::external::downward_path(),
+        );
+    }
+}
+
+fn action_cost_name(cost: ActionCost) -> &'static str {
+    match cost {
+        ActionCost::Task => "TASK",
+        ActionCost::Unit => "UNIT",
+        ActionCost::Duration => "DURATION",
+        ActionCost::Relative => "RELATIVE",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_search_summary(
+    status: &str,
+    wall_ms: u128,
+    generated: usize,
+    visited: usize,
+    max_queued: usize,
+    h_evals: usize,
+    h_eval_ms: u128,
+    pruned: usize,
+    max_steps: usize,
+    max_open: usize,
+    max_threats: usize,
+) {
+    eprintln!(
+        "Search finished: {} in {:.2}s | visited {} | generated {} | max queued {} | h {} evals / {} ms | pruned {} | largest plan steps={} open={} threats={}",
+        status,
+        wall_ms as f64 / 1000.0,
+        visited,
+        generated,
+        max_queued,
+        h_evals,
+        h_eval_ms,
+        pruned,
+        max_steps,
+        max_open,
+        max_threats,
+    );
 }
 
 /// Minimal JSON string escaping for the opt-in `POTOROO_STATS_JSON` line. Problem
@@ -247,10 +445,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut verbosity = 0u32;
     let mut fdr_pocl = false;
     let mut files = Vec::new();
-    let mut heuristic_name = String::from("UCPOP");
+    let mut heuristic_name = String::from("ADDR");
     let mut algorithm_name = String::from("A");
+    let mut heuristic_explicit = false;
     // Track whether the user set these so repeated flags replace the defaults.
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
+    let mut flaw_order_names: Vec<String> = Vec::new();
     let mut search_limits: Vec<usize> = Vec::new();
 
     let args: Vec<String> = args.collect();
@@ -318,6 +518,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             "f" => {
                 let v = required_value!();
                 flaw_orders.push(FlawSelectionOrder::parse(&v)?);
+                flaw_order_names.push(v);
             }
             "P" => fdr_pocl = true,
             "g" => params.ground_actions = true,
@@ -325,6 +526,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 params.heuristic = Heuristic::parse(&v)?;
                 heuristic_name = v;
+                heuristic_explicit = true;
             }
             "H" => {
                 print_help();
@@ -351,8 +553,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             }
             "v" => {
                 verbosity = match inline {
+                    Some(v) if v.chars().all(|c| c == 'v') => {
+                        verbosity.saturating_add(1).saturating_add(v.len() as u32)
+                    }
                     Some(v) => v.parse().map_err(|_| format!("invalid verbosity `{v}`"))?,
-                    None => 1,
+                    None => verbosity.saturating_add(1),
                 };
             }
             "V" => {
@@ -371,17 +576,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         i += 1;
     }
 
+    // Reuse-aware ADDR is strongest on literal partial plans, but creates deep
+    // plateaus on the finite-domain representation. Plain ADD is the robust FDR
+    // default. An explicit `-h` always wins.
+    if fdr_pocl && !heuristic_explicit {
+        params.heuristic = Heuristic::parse("ADD").expect("ADD is a valid heuristic");
+        heuristic_name = "ADD".to_string();
+    }
+
     if !flaw_orders.is_empty() {
         params.flaw_orders = flaw_orders;
-    } else if !fdr_pocl && !params.ground_actions && params.heuristic.needs_planning_graph() {
-        // Lifted planning-graph runs: resolve static open conditions first.
-        // Statics only link to init, so handling them early commits variable
-        // bindings cheaply and makes the planning-graph heuristic informative
-        // (unbound atoms are otherwise valued by their most optimistic
-        // instantiation). Big measured win on logistics/hanoi; overridable
-        // with an explicit -f. The library default stays UCPOP.
-        params.flaw_orders =
-            vec![FlawSelectionOrder::parse("static").expect("static alias parses")];
+    } else {
+        flaw_order_names.push("STATIC".to_string());
     }
     if !search_limits.is_empty() {
         params.search_limits = search_limits;
@@ -400,6 +606,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         fdr_pocl,
         verbosity,
         files,
+        flaw_order_names,
         heuristic_name,
         algorithm_name,
     }))
@@ -468,15 +675,42 @@ fn print_help() {
          \n\
          Options (classical subset):\n\
          \x20 -a, --action-cost=COST     action cost: TASK, UNIT, DURATION, RELATIVE\n\
-         \x20 -f, --flaw-order=ORDER     flaw-selection order (default UCPOP)\n\
+         \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
-         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default UCPOP)\n\
+         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADDR; ADD for FDR)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
-         \x20 -v, --verbose[=N]          verbosity level\n\
+         \x20 -v, --verbose[=N]          live search telemetry (repeat for more frequent updates)\n\
          \x20 -w, --weight=W             heuristic weight (default 1)\n\
          \x20 -H, --help                 display this help and exit\n\
          \x20 -V, --version              display version and exit"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        parse_args(args.iter().map(|arg| (*arg).to_string()))
+            .expect("arguments parse")
+            .expect("arguments do not request an early exit")
+    }
+
+    #[test]
+    fn literal_cli_uses_the_addr_static_profile() {
+        let cli = cli(&[]);
+        assert_eq!(cli.heuristic_name, "ADDR");
+        assert_eq!(cli.flaw_order_names, ["STATIC"]);
+        assert_eq!(cli.params.search_algorithm, SearchAlgorithm::A);
+        assert_eq!(cli.params.action_cost, ActionCost::Task);
+        assert_eq!(cli.params.weight, 1.0);
+    }
+
+    #[test]
+    fn fdr_cli_uses_add_unless_the_heuristic_is_explicit() {
+        assert_eq!(cli(&["--fdr-pocl"]).heuristic_name, "ADD");
+        assert_eq!(cli(&["--fdr-pocl", "-h", "ADDR"]).heuristic_name, "ADDR");
+    }
 }

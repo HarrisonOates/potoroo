@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::fasthash::FastMap;
 use std::rc::Rc;
@@ -552,10 +553,53 @@ pub struct SearchStats {
     pub h_eval_ms: u128,
     /// Children discarded by relaxed-reachability pruning at generation time.
     pub pruned: usize,
+    /// Largest number of real steps seen in an expanded partial plan.
+    pub max_steps: usize,
+    /// Largest number of open conditions seen in an expanded partial plan.
+    pub max_open_conditions: usize,
+    /// Largest number of threats seen in an expanded partial plan.
+    pub max_threats: usize,
+    /// Largest primary open-list size observed during search.
+    pub max_queued: usize,
+}
+
+/// A point-in-time view of an active search, delivered after an expansion.
+///
+/// The callback APIs expose this representation-neutral snapshot so command-line
+/// clients can render useful progress without coupling either search engine to
+/// stderr, a terminal UI, or a particular logging framework.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchProgress {
+    /// Time spent in the search loop (task construction/translation excluded).
+    pub elapsed: Duration,
+    pub nodes_generated: usize,
+    pub nodes_visited: usize,
+    /// Number of nodes waiting in the primary open lists. Secondary queue
+    /// duplicates used by dual-queue algorithms are deliberately excluded.
+    pub queued: usize,
+    pub h_evals: usize,
+    pub h_eval_ms: u128,
+    pub pruned: usize,
+    /// Shape of the partial plan expanded for this update.
+    pub current_steps: usize,
+    pub current_open_conditions: usize,
+    pub current_threats: usize,
+    /// Zero-based index of the active flaw-selection order.
+    pub flaw_order: usize,
 }
 
 pub fn plan(ctx: &SearchContext) -> Outcome {
     plan_with_stats(ctx).0
+}
+
+/// Like [`plan_with_stats`], while also reporting a snapshot after each node
+/// expansion. The callback decides how often to render or persist snapshots;
+/// the search engine itself remains silent.
+pub fn plan_with_progress(
+    ctx: &SearchContext,
+    progress: &mut dyn FnMut(SearchProgress),
+) -> (Outcome, SearchStats) {
+    plan_impl(ctx, Some(progress))
 }
 
 /// Pops the next plan to expand from the primary queue (and optionally the
@@ -695,6 +739,14 @@ fn has_unreachable_new_open_cond(ctx: &SearchContext, parent: &Plan, child: &Pla
 /// Like [`plan`], but also returns the [`SearchStats`] gathered during the
 /// search. `plan` delegates here, so the two never diverge.
 pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
+    plan_impl(ctx, None)
+}
+
+fn plan_impl(
+    ctx: &SearchContext,
+    mut progress: Option<&mut dyn FnMut(SearchProgress)>,
+) -> (Outcome, SearchStats) {
+    let search_started = Instant::now();
     let n_orders = ctx.params.flaw_orders.len();
     let inf = f32::INFINITY;
 
@@ -749,6 +801,10 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
     let mut generated_plans: Vec<usize> = vec![0; n_orders];
     let mut num_generated_plans: usize = 0;
     let mut num_visited_plans: usize = 0;
+    let mut max_steps: usize = 0;
+    let mut max_open_conditions: usize = 0;
+    let mut max_threats: usize = 0;
+    let mut max_queued: usize = 0;
     let stats = std::env::var_os("POTOROO_STATS").is_some();
 
     let mut current_flaw_order: usize = 0;
@@ -778,6 +834,9 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                 break;
             }
             num_visited_plans += 1;
+            max_steps = max_steps.max(plan.num_steps());
+            max_open_conditions = max_open_conditions.max(plan.num_open_conds());
+            max_threats = max_threats.max(plan.num_unsafes());
             if is_dual || is_alt {
                 expanded_ids.insert(plan.id.get());
             }
@@ -881,6 +940,24 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
                     generated_plans[cfo] += 1;
                     num_generated_plans += 1;
                 }
+            }
+
+            let queued = queues.iter().map(BinaryHeap::len).sum();
+            max_queued = max_queued.max(queued);
+            if let Some(report) = progress.as_deref_mut() {
+                report(SearchProgress {
+                    elapsed: search_started.elapsed(),
+                    nodes_generated: num_generated_plans,
+                    nodes_visited: num_visited_plans,
+                    queued,
+                    h_evals: ctx.h_evals.get(),
+                    h_eval_ms: ctx.h_eval_nanos.get() / 1_000_000,
+                    pruned: ctx.pruned.get(),
+                    current_steps: plan.num_steps(),
+                    current_open_conditions: plan.num_open_conds(),
+                    current_threats: plan.num_unsafes(),
+                    flaw_order: current_flaw_order,
+                });
             }
 
             // Time to switch flaw orders? (limit reached, or this order has had
@@ -1002,6 +1079,10 @@ pub fn plan_with_stats(ctx: &SearchContext) -> (Outcome, SearchStats) {
         h_evals: ctx.h_evals.get(),
         h_eval_ms: ctx.h_eval_nanos.get() / 1_000_000,
         pruned: ctx.pruned.get(),
+        max_steps,
+        max_open_conditions,
+        max_threats,
+        max_queued,
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {

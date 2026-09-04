@@ -70,6 +70,18 @@ export POTOROO_FD=/path/to/downward/fast-downward.py
 export POTOROO_DOWNWARD=/path/to/downward/builds/release/bin/downward
 ```
 
+For a checkout at `./downward`, a project-local `.cargo/config.toml` can make
+both paths automatic for every `cargo run` and `cargo test`:
+
+```toml
+[env]
+POTOROO_FD = { value = "downward/fast-downward.py", relative = true }
+POTOROO_DOWNWARD = { value = "downward/builds/release/bin/downward", relative = true }
+```
+
+The local config is gitignored, so machine-specific planner paths do not leak
+into commits. Explicit shell environment variables override these defaults.
+
 ---
 
 ## Usage
@@ -83,7 +95,7 @@ Input files can also be piped via stdin (domain first, then problem).
 ### Quick examples
 
 ```bash
-# Solve the Sussman anomaly with the default UCPOP heuristic
+# Solve the Sussman anomaly with the default ADDR heuristic
 potoroo examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
 
 # Use the additive heuristic
@@ -101,6 +113,14 @@ potoroo -h "UCPOP/ADD" examples/logistics-domain.pddl examples/logistics-a.pddl
 # Ground POCL search directly over Fast Downward's SAS+ variables
 potoroo --fdr-pocl -v examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
 ```
+
+### Default search profile
+
+Potoroo defaults to lifted POCL, A* search, task action costs, weight 1, and the
+`STATIC` flaw order. Literal POCL uses the reuse-aware `ADDR` heuristic. With
+`--fdr-pocl`, Potoroo selects plain `ADD` instead: empirical sweeps found its
+finite-domain search substantially more robust than `ADDR`. Any explicit
+`-h`, `-f`, `-s`, `-a`, or `-w` option overrides the corresponding default.
 
 ### Finite-domain ground POCL
 
@@ -162,6 +182,17 @@ Time: 42
 
 On failure: `no plan` followed by the reason.
 
+Pass `-v` to see the selected search configuration, live progress on stderr,
+and a final human-readable summary. Progress includes generated, visited, and
+queued nodes; heuristic evaluations and time; pruned nodes; and the current
+partial plan's steps, open conditions, and threats. The first expansion is
+always printed, followed by updates at most once per second. Use `-vv` for
+250 ms updates or `-vvv` to print every expansion.
+
+```text
+Search [   1.00s] visited 1824 | generated 5931 | queued 4107 | h 5930 evals / 712 ms | pruned 38 | current steps=7 open=4 threats=1 order=1
+```
+
 Set `POTOROO_STATS_JSON=1` to emit a machine-readable JSON line on stderr:
 
 ```json
@@ -175,13 +206,13 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | Flag | Long form | Argument | Description | Default |
 |------|-----------|----------|-------------|---------|
 | `-a` | `--action-cost` | `TASK`\|`UNIT`\|`DURATION`\|`RELATIVE` | Action cost model (`TASK` respects PDDL `total-cost`) | `TASK` |
-| `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `UCPOP` |
+| `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `STATIC` |
 | — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
-| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `UCPOP` |
+| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADDR` (`ADD` with `--fdr-pocl`) |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
 | `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
-| `-v` | `--verbose` | [N] | Verbosity level (0–3) | 0 |
+| `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
 | `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
 | `-H` | `--help` | — | Display help and exit | |
 | `-V` | `--version` | — | Display version and exit | |
@@ -198,7 +229,7 @@ These run in O(|plan|) time with no planning graph.
 
 | Name | Description |
 |------|-------------|
-| `UCPOP` | `committed-cost + weight × (open-conditions + unsafe-links)` — the heuristic from the original UCPOP planner. **Default.** |
+| `UCPOP` | `committed-cost + weight × (open-conditions + unsafe-links)` — the heuristic from the original UCPOP planner |
 | `OC` | Open-condition count |
 | `UC` | Unsafe-link (threat) count |
 | `BUC` | Binary unsafe count (0 if no threats, 1 otherwise) |
@@ -211,10 +242,10 @@ These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is
 
 | Name | Description |
 |------|-------------|
-| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add` |
+| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **FDR default.** |
 | `ADD_COST` | ADD cost term only (no step count) |
 | `ADD_WORK` | ADD work: total operator count in the ADD relaxed plan |
-| `ADDR` | Additive heuristic with action reuse: only new operators count toward the estimate |
+| `ADDR` | Additive heuristic with action reuse: only new operators count toward the estimate. **Literal-POCL default.** |
 | `ADDR_COST` | ADDR cost only |
 | `ADDR_WORK` | ADDR work |
 | `RELAX` | Delete-relaxed plan cost (FF-style joint extraction): `committed-cost + weight × cost(π_relax)` |
@@ -262,7 +293,8 @@ The flaw-selection order (`-f`) controls which open flaw the planner chooses to 
 
 | Name | Description |
 |------|-------------|
-| `UCPOP` | `{n,s}LIFO/{o}LIFO` — threats (non-separable then separable) LIFO, then open conditions LIFO. **Default.** |
+| `STATIC` | Resolve static open conditions first, then use LIFO for threats and remaining open conditions. **Default.** |
+| `UCPOP` | `{n,s}LIFO/{o}LIFO` — threats (non-separable then separable) LIFO, then open conditions LIFO |
 | `UCPOP-LC` | `{n,s}LIFO/{o}LR` — threats LIFO, open conditions by least-refinements |
 | `UCPOP-MC` | `{n,s}LIFO/{o}MR` — threats LIFO, open conditions by most-refinements |
 | `UCPOP-LC-MC` | `{n,s}LIFO/{o}LR/{o}MR` |

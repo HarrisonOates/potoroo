@@ -28,12 +28,12 @@ use thiserror::Error;
 
 use crate::external::FdError;
 use crate::fdr::{Fact, ParseError, Task};
-use crate::heuristics::{HVal, OrderType, SelectionCriterion};
+use crate::heuristics::{HVal, Heuristic, OrderType, SelectionCriterion};
 use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
 use crate::params::{ActionCost, Parameters, SearchAlgorithm};
 use crate::plan::{GOAL_ID, INIT_ID};
-use crate::search::SearchContext;
+use crate::search::{SearchContext, SearchProgress};
 
 /// A committed real step. Init and goal are represented by [`INIT_ID`] and
 /// [`GOAL_ID`] and are not stored in this vector.
@@ -370,6 +370,7 @@ pub struct SearchStats {
     pub max_steps: usize,
     pub max_open_conditions: usize,
     pub max_threats: usize,
+    pub max_queued: usize,
     h_eval_nanos: u128,
 }
 
@@ -393,6 +394,9 @@ pub fn translate(ctx: &SearchContext<'_>) -> Result<Task, Error> {
 /// library callers that do not need the full [`Parameters`] surface.
 pub fn solve(task: &Task, node_limit: usize) -> (Outcome, SearchStats) {
     let params = Parameters {
+        // ADDR is the literal planner's default, but its reuse treatment forms
+        // poor plateaus on FDR nodes. Plain ADD is the robust FDR default.
+        heuristic: Heuristic::parse("ADD").expect("ADD is a valid heuristic"),
         search_limits: vec![node_limit],
         ..Parameters::default()
     };
@@ -405,9 +409,27 @@ pub fn solve_with_params(
     task: &Task,
     params: &Parameters,
 ) -> Result<(Outcome, SearchStats), Error> {
+    solve_impl(task, params, None)
+}
+
+/// Like [`solve_with_params`], while also reporting a representation-neutral
+/// snapshot after each node expansion.
+pub fn solve_with_params_and_progress(
+    task: &Task,
+    params: &Parameters,
+    progress: &mut dyn FnMut(SearchProgress),
+) -> Result<(Outcome, SearchStats), Error> {
+    solve_impl(task, params, Some(progress))
+}
+
+fn solve_impl(
+    task: &Task,
+    params: &Parameters,
+    progress: Option<&mut dyn FnMut(SearchProgress)>,
+) -> Result<(Outcome, SearchStats), Error> {
     let planner = Planner::with_action_cost(task, params.action_cost);
     planner.validate_params(params)?;
-    Ok(planner.solve(params))
+    Ok(planner.solve(params, progress))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -557,7 +579,12 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
-    fn solve(&self, params: &Parameters) -> (Outcome, SearchStats) {
+    fn solve(
+        &self,
+        params: &Parameters,
+        mut progress: Option<&mut dyn FnMut(SearchProgress)>,
+    ) -> (Outcome, SearchStats) {
+        let search_started = Instant::now();
         let n_orders = params.flaw_orders.len();
         let inf = f32::INFINITY;
         let alg = params.search_algorithm;
@@ -716,6 +743,24 @@ impl<'a> Planner<'a> {
                         generated_per_order[order_index] += 1;
                         stats.nodes_generated += 1;
                     }
+                }
+
+                let queued = queues.iter().map(BinaryHeap::len).sum();
+                stats.max_queued = stats.max_queued.max(queued);
+                if let Some(report) = progress.as_deref_mut() {
+                    report(SearchProgress {
+                        elapsed: search_started.elapsed(),
+                        nodes_generated: stats.nodes_generated,
+                        nodes_visited: stats.nodes_visited,
+                        queued,
+                        h_evals: stats.h_evals,
+                        h_eval_ms: stats.h_eval_ms,
+                        pruned: stats.pruned,
+                        current_steps: plan.steps.len(),
+                        current_open_conditions: plan.open_conditions.len(),
+                        current_threats: plan.threats.len(),
+                        flaw_order: current_order,
+                    });
                 }
 
                 let order_limit =
@@ -2156,6 +2201,26 @@ mod tests {
         assert_eq!(solution.operators, vec![0, 1]);
         assert!(solution.plan.complete(&task));
         assert!(stats.nodes_visited > 0);
+    }
+
+    #[test]
+    fn progress_callback_observes_fdr_expansions() {
+        let task = travel_task();
+        let params = Parameters {
+            search_limits: vec![1_000],
+            ..Parameters::default()
+        };
+        let mut updates = Vec::new();
+        let mut report = |progress| updates.push(progress);
+        let (outcome, stats) =
+            solve_with_params_and_progress(&task, &params, &mut report).unwrap();
+
+        assert!(matches!(outcome, Outcome::Solved(_)));
+        assert!(!updates.is_empty());
+        assert_eq!(updates[0].nodes_visited, 1);
+        assert_eq!(updates.last().unwrap().nodes_visited, stats.nodes_visited);
+        assert_eq!(updates.last().unwrap().nodes_generated, stats.nodes_generated);
+        assert!(stats.max_queued > 0);
     }
 
     #[test]

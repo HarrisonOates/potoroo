@@ -1,9 +1,9 @@
 //! Planning parameters.
 //!
-//! Only the classical-subset defaults are wired up: A* search, the `UCPOP`
-//! plan-ranking heuristic, the `UCPOP` flaw-selection order, task action cost,
-//! weight 1, and lifted actions. IDA*/hill-climbing and ground-action toggling
-//! exist as fields; only A* is exercised on the default path.
+//! The literal-POCL defaults are A* search, the reuse-aware `ADDR` heuristic,
+//! the static-first flaw-selection order, task action cost, weight 1, and lifted
+//! actions. The CLI substitutes plain `ADD` for finite-domain POCL, where it is
+//! substantially more robust than `ADDR`.
 
 use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
@@ -70,11 +70,11 @@ impl Default for Parameters {
     fn default() -> Self {
         Parameters {
             search_algorithm: SearchAlgorithm::A,
-            heuristic: Heuristic::parse("UCPOP").expect("UCPOP is a valid heuristic"),
+            heuristic: Heuristic::parse("ADDR").expect("ADDR is a valid heuristic"),
             action_cost: ActionCost::Task,
             weight: 1.0,
             flaw_orders: vec![
-                FlawSelectionOrder::parse("UCPOP").expect("UCPOP is a valid flaw order")
+                FlawSelectionOrder::parse("STATIC").expect("STATIC is a valid flaw order")
             ],
             search_limits: vec![usize::MAX],
             ground_actions: false,
