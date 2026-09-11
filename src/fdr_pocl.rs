@@ -93,6 +93,49 @@ fn push_cow<T: Clone>(slot: &mut Rc<Vec<T>>, value: T) {
     }
 }
 
+/// Copy-on-write `swap_remove` that leaves room for `extra` later appends.
+///
+/// Every refinement removes the open condition it resolved and then pushes the
+/// new step's preconditions. Cloning through `Rc::make_mut` leaves
+/// `len == capacity`, so those pushes reallocate the vector that was just
+/// cloned; sizing the clone for both at once costs a single allocation.
+#[inline]
+fn swap_remove_cow<T: Clone>(slot: &mut Rc<Vec<T>>, index: usize, extra: usize) {
+    match Rc::get_mut(slot) {
+        Some(vec) => {
+            vec.swap_remove(index);
+            vec.reserve(extra);
+        }
+        None => {
+            let current = &**slot;
+            let mut next = Vec::with_capacity(current.len() + extra);
+            next.extend_from_slice(current);
+            next.swap_remove(index);
+            *slot = Rc::new(next);
+        }
+    }
+}
+
+/// Copy-on-write `extend` that allocates once, and not at all when there is
+/// nothing to add -- most refinements introduce no new threat, and cloning the
+/// threat list to append zero entries is pure waste.
+#[inline]
+fn extend_cow<T: Clone>(slot: &mut Rc<Vec<T>>, items: Vec<T>) {
+    if items.is_empty() {
+        return;
+    }
+    match Rc::get_mut(slot) {
+        Some(vec) => vec.extend(items),
+        None => {
+            let current = &**slot;
+            let mut next = Vec::with_capacity(current.len() + items.len());
+            next.extend_from_slice(current);
+            next.extend(items);
+            *slot = Rc::new(next);
+        }
+    }
+}
+
 /// One immutable-by-convention finite-domain POCL search node.
 #[derive(Debug, Clone)]
 pub struct PartialPlan {
@@ -299,12 +342,12 @@ impl PartialPlan {
                 }
             }
         }
-        let threats = Rc::make_mut(&mut self.threats);
-        debug_assert!(threats
+        debug_assert!(self
+            .threats
             .last()
             .zip(additions.first())
             .is_none_or(|(existing, addition)| threat_key(existing) < threat_key(addition)));
-        threats.extend(additions);
+        extend_cow(&mut self.threats, additions);
     }
 
     fn add_step_threats(&mut self, task: &Task, step_id: usize) {
@@ -869,7 +912,7 @@ impl<'a> Planner<'a> {
                 .iter()
                 .map(|support| {
                     let mut child = plan.clone();
-                    Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
+                    swap_remove_cow(&mut child.open_conditions, open_index, support.len());
                     for &condition in support {
                         child.push_open(OpenCondition {
                             consumer: open.consumer,
@@ -952,7 +995,11 @@ impl<'a> Planner<'a> {
         ))?;
         let mut child = plan.clone();
         child.orderings = orderings;
-        Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
+        swap_remove_cow(
+            &mut child.open_conditions,
+            open_index,
+            effect_conditions.len(),
+        );
         let link_index = child.links.len();
         push_cow(&mut child.links, CausalLink {
             producer,
@@ -996,7 +1043,11 @@ impl<'a> Planner<'a> {
             id: new_id,
             operator: achiever.operator,
         });
-        Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
+        swap_remove_cow(
+            &mut child.open_conditions,
+            open_index,
+            self.operator_preconditions[achiever.operator].len() + effect.conditions.len(),
+        );
         let link_index = child.links.len();
         push_cow(&mut child.links, CausalLink {
             producer: new_id,
