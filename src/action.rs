@@ -20,7 +20,7 @@ pub struct ActionSchema {
     /// per-schema `TermTable` so binding/type reasoning works during search.
     pub var_types: Vec<crate::types::Type>,
     pub precondition: Rc<Formula>,
-    pub effects: Vec<Effect>,
+    pub effects: Vec<Rc<Effect>>,
     /// Declared PDDL action cost. Costless classical domains use one. Equals
     /// `cost_base` until [`crate::parser::bind_action_costs`] resolves
     /// `cost_functions` against a problem.
@@ -40,6 +40,6 @@ pub struct GroundAction {
     pub name: String,
     pub arguments: Vec<Object>,
     pub precondition: Rc<Formula>,
-    pub effects: Vec<Effect>,
+    pub effects: Vec<Rc<Effect>>,
     pub cost: usize,
 }

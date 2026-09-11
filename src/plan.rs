@@ -37,7 +37,7 @@ pub struct StepAction {
     /// Precondition formula (the goal formula for the goal step).
     pub precondition: Rc<Formula>,
     /// Effects (the init atoms for the init step; empty for the goal step).
-    pub effects: Vec<Effect>,
+    pub effects: Vec<Rc<Effect>>,
     /// Declared task cost. Synthetic init/goal actions have zero cost.
     pub cost: usize,
     /// Variable types in this action's scope, indexed by variable index.
