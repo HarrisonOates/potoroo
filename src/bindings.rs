@@ -502,13 +502,36 @@ impl Bindings {
     /// varset chain is immutable once the `Bindings` exists, so the cached
     /// state never goes stale.
     fn index_state(&self) -> IndexState {
+        self.with_index_state(|state| state.clone())
+    }
+
+    /// Runs `f` against the cached lookup state without cloning it out of the
+    /// cell.
+    ///
+    /// [`Bindings::index_state`] hands back an owned `IndexState`, which bumps
+    /// and then drops two `Rc`s. That is fine for callers that take it once and
+    /// use it across a region, but `find_var_node` and `find_obj_node` ask per
+    /// lookup, and lookups outnumber index construction roughly 16 to 1 -- so
+    /// that refcount traffic showed up both as time in `index_state` and as
+    /// drop glue for the `Overlay` handle.
+    fn with_index_state<R>(&self, f: impl FnOnce(&IndexState) -> R) -> R {
         if self.num_varsets < INDEX_THRESHOLD {
-            return IndexState::Small;
+            return f(&IndexState::Small);
         }
-        if let Some(s) = self.index.borrow().as_ref() {
-            return s.clone();
+        if self.index.borrow().is_none() {
+            // Built outside the borrow: construction reads `self.varsets`, and
+            // holding the cell across it would risk a double borrow.
+            let state = self.build_index();
+            *self.index.borrow_mut() = Some(state);
         }
-        let state = {
+        let cell = self.index.borrow();
+        f(cell.as_ref().expect("index built or present above"))
+    }
+
+    /// Builds the index for a long chain. The varset chain is immutable once
+    /// the `Bindings` exists, so the result never goes stale.
+    fn build_index(&self) -> IndexState {
+        {
             let mut ix = VarsetIndex::default();
             let mut pos = 0usize;
             let mut cur = self.varsets.clone();
@@ -539,21 +562,15 @@ impl Bindings {
                 overlay: Rc::new(Overlay::default()),
                 ix: Rc::new(ix),
             }
-        };
-        *self.index.borrow_mut() = Some(state.clone());
-        state
+        }
     }
 
     /// Finds the authoritative varset node (and its head-relative position)
     /// for a step-variable.
     fn find_var_node(&self, var: Variable, step_id: usize) -> Option<(usize, Rc<Chain<Varset>>)> {
-        let found = lookup_var_in(
-            &self.index_state(),
-            &self.varsets,
-            self.num_varsets,
-            var,
-            step_id,
-        );
+        let found = self.with_index_state(|state| {
+            lookup_var_in(state, &self.varsets, self.num_varsets, var, step_id)
+        });
         debug_assert!(
             {
                 let scanned = scan_var(&self.varsets, var, step_id);
@@ -571,7 +588,8 @@ impl Bindings {
     /// Finds the authoritative varset node (and its head-relative position)
     /// for a pinned constant.
     fn find_obj_node(&self, obj: Object) -> Option<(usize, Rc<Chain<Varset>>)> {
-        let found = lookup_obj_in(&self.index_state(), &self.varsets, self.num_varsets, obj);
+        let found =
+            self.with_index_state(|state| lookup_obj_in(state, &self.varsets, self.num_varsets, obj));
         debug_assert!(
             {
                 let scanned = scan_obj(&self.varsets, obj);
