@@ -1078,15 +1078,32 @@ pub struct AtomPattern {
 }
 
 impl AtomPattern {
+    /// True iff every position is already fixed to an object. Allocation-free,
+    /// so callers can test before paying for [`AtomPattern::object_terms`].
+    #[inline]
+    pub fn is_fully_bound(&self) -> bool {
+        self.terms.iter().all(|pt| matches!(pt, PatTerm::Obj(_)))
+    }
+
     /// The fully-resolved term list, or `None` if any position is unbound.
+    ///
+    /// The emptiness test comes first because `collect()` into an `Option<Vec>`
+    /// allocates the vector before it reaches the unbound position that makes it
+    /// `None` -- and in lifted search most patterns are unbound, so that
+    /// allocation was being made and thrown away on the common path.
     pub fn object_terms(&self) -> Option<Vec<Term>> {
-        self.terms
-            .iter()
-            .map(|pt| match pt {
-                PatTerm::Obj(o) => Some(Term::Object(*o)),
-                PatTerm::Var { .. } => None,
-            })
-            .collect()
+        if !self.is_fully_bound() {
+            return None;
+        }
+        Some(
+            self.terms
+                .iter()
+                .map(|pt| match pt {
+                    PatTerm::Obj(o) => Term::Object(*o),
+                    PatTerm::Var { .. } => unreachable!("checked fully bound above"),
+                })
+                .collect(),
+        )
     }
 
     /// The argument positions the pattern fixes to an object. These are the

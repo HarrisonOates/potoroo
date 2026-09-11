@@ -69,6 +69,30 @@ pub struct Threat {
     pub link: usize,
 }
 
+/// Copy-on-write append that allocates once instead of twice.
+///
+/// `Rc::make_mut(&mut v).push(x)` on a shared vector clones it at *exact*
+/// capacity and then reallocates on the push, because the clone leaves
+/// `len == capacity`. Every child plan appends to `steps`, `links` and
+/// `open_conditions`, so that doubling showed up as the largest single source
+/// of allocation traffic in the search. Building the replacement with room for
+/// the new element costs one allocation and one copy.
+#[inline]
+fn push_cow<T: Clone>(slot: &mut Rc<Vec<T>>, value: T) {
+    match Rc::get_mut(slot) {
+        // Uniquely owned (an earlier refinement in this same child already
+        // forced the copy): append in place.
+        Some(vec) => vec.push(value),
+        None => {
+            let current = &**slot;
+            let mut next = Vec::with_capacity(current.len() + 1);
+            next.extend_from_slice(current);
+            next.push(value);
+            *slot = Rc::new(next);
+        }
+    }
+}
+
 /// One immutable-by-convention finite-domain POCL search node.
 #[derive(Debug, Clone)]
 pub struct PartialPlan {
@@ -213,7 +237,7 @@ impl PartialPlan {
 
     fn push_open(&mut self, open: OpenCondition) {
         if !self.open_conditions.contains(&open) {
-            Rc::make_mut(&mut self.open_conditions).push(open);
+            push_cow(&mut self.open_conditions, open);
         }
     }
 
@@ -930,7 +954,7 @@ impl<'a> Planner<'a> {
         child.orderings = orderings;
         Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
         let link_index = child.links.len();
-        Rc::make_mut(&mut child.links).push(CausalLink {
+        push_cow(&mut child.links, CausalLink {
             producer,
             consumer,
             condition,
@@ -968,13 +992,13 @@ impl<'a> Planner<'a> {
         child.cost = child
             .cost
             .saturating_add(self.action_cost.resolve(operator.cost));
-        Rc::make_mut(&mut child.steps).push(Step {
+        push_cow(&mut child.steps, Step {
             id: new_id,
             operator: achiever.operator,
         });
         Rc::make_mut(&mut child.open_conditions).swap_remove(open_index);
         let link_index = child.links.len();
-        Rc::make_mut(&mut child.links).push(CausalLink {
+        push_cow(&mut child.links, CausalLink {
             producer: new_id,
             consumer: open.consumer,
             condition: open.condition,

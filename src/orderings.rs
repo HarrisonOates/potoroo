@@ -44,48 +44,79 @@ impl Ordering {
 }
 
 /// One row of the transitive-closure matrix, bit-packed into `u64` words.
-/// The row for step `m` (`m >= 2`) holds `2*m - 2` bits encoding `m`'s order
-/// relation with every lower-numbered step in both directions (see [`BinaryOrderings`]).
+///
+/// Rows grow lazily: `get` past the end reads as `false`, and only `set` and
+/// `or_with` extend the word vector. A step that never gains a high-numbered
+/// successor therefore never pays for one, and adding a step to the plan does
+/// not have to widen every existing row (which would clone them all and break
+/// the sharing with the parent plan).
 #[derive(Debug, Clone, Default)]
 struct Row {
     words: Vec<u64>,
 }
 
 impl Row {
-    fn with_bits(nbits: usize) -> Self {
-        Row {
-            words: vec![0u64; nbits.div_ceil(64)],
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        match self.words.get(i >> 6) {
+            Some(w) => (w >> (i & 63)) & 1 != 0,
+            None => false,
         }
     }
 
     #[inline]
-    fn get(&self, i: usize) -> bool {
-        (self.words[i >> 6] >> (i & 63)) & 1 != 0
+    fn set(&mut self, i: usize) {
+        let w = i >> 6;
+        if w >= self.words.len() {
+            self.words.resize(w + 1, 0);
+        }
+        self.words[w] |= 1u64 << (i & 63);
+    }
+
+    /// True iff every bit of `other` is already set here, so an `or_with` would
+    /// be a no-op. Checked before `Rc::make_mut` so untouched rows stay shared.
+    #[inline]
+    fn contains_all(&self, other: &Row) -> bool {
+        for (k, &ow) in other.words.iter().enumerate() {
+            if ow == 0 {
+                continue;
+            }
+            match self.words.get(k) {
+                Some(&sw) if sw & ow == ow => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     #[inline]
-    fn set(&mut self, i: usize) {
-        self.words[i >> 6] |= 1u64 << (i & 63);
+    fn or_with(&mut self, other: &Row) {
+        if other.words.len() > self.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
+        for (sw, &ow) in self.words.iter_mut().zip(other.words.iter()) {
+            *sw |= ow;
+        }
     }
 }
 
 /// Transitive-closure boolean order over real step ids.
 ///
-/// One bit-packed [`Row`] per step, shared across plans via `Rc` with
-/// copy-on-write at row granularity (`Rc::make_mut`). A `refine` only
-/// deep-copies the few rows it actually modifies; sibling plans share the rest.
-/// `rows[m - 2]` is the row for step `m` (`m` in `2..=high_id`), so
-/// `rows.len() == high_id - 1` (empty while `high_id <= 1`). Within step `m`'s
-/// row of `2*m - 2` bits: bit `k - 1` is "step `k` before step `m`" and bit
-/// `2*m - 2 - k` is "step `m` before step `k`", for each lower step `k` in
-/// `1..m`.
+/// Successor-major: `succ[k - 1]` is the bit set of steps that step `k` is
+/// ordered before, so `ordered_before(k, l)` is one bit test and propagating a
+/// new constraint is a word-wise OR of two rows rather than a bit-at-a-time
+/// double loop (`fill_transitive`).
+///
+/// Rows are shared across plans via `Rc` with copy-on-write at row granularity
+/// (`Rc::make_mut`), so a refinement deep-copies only the rows it actually
+/// changes and sibling plans share the rest.
 #[derive(Debug, Clone, Default)]
 pub struct BinaryOrderings {
     /// Highest real step id seen (0 means only init/goal). Real steps are
     /// `1..=high_id`.
     high_id: usize,
-    /// Per-step transitive-closure rows; see the type doc for the layout.
-    rows: Vec<Rc<Row>>,
+    /// Per-step successor rows; `succ.len() == high_id`.
+    succ: Vec<Rc<Row>>,
 }
 
 impl BinaryOrderings {
@@ -96,13 +127,14 @@ impl BinaryOrderings {
     /// Returns true iff real step `id1` is ordered before real step `id2`.
     /// Both ids must be real steps in `1..=high_id` (callers handle init/goal
     /// specially first).
+    #[inline]
     fn ordered_before(&self, id1: usize, id2: usize) -> bool {
         if id1 == id2 {
-            false
-        } else if id1 < id2 {
-            self.rows[id2 - 2].get(id1 - 1)
-        } else {
-            self.rows[id1 - 2].get(2 * id1 - 2 - id2)
+            return false;
+        }
+        match self.succ.get(id1 - 1) {
+            Some(row) => row.get(id2 - 1),
+            None => false,
         }
     }
 
@@ -118,6 +150,10 @@ impl BinaryOrderings {
         }
     }
 
+    // Two arms return the same value, mirroring VHPOP's `possibly_after`
+    // (orderings.cc) case-for-case; keeping the shape makes the correspondence
+    // checkable against the reference implementation.
+    #[allow(clippy::if_same_then_else)]
     pub fn possibly_after(&self, id1: usize, _t1: StepTime, id2: usize, _t2: StepTime) -> bool {
         if id1 == id2 {
             false
@@ -168,16 +204,23 @@ impl BinaryOrderings {
         new_step_id: usize,
     ) -> Option<Rc<BinaryOrderings>> {
         if new_step_id != 0 && new_step_id != GOAL_ID {
-            let mut orderings = (**self).clone();
-            if new_step_id > orderings.high_id {
-                orderings.high_id = new_step_id;
-                // Allocate the bit row for each newly introduced step. Step `m`
-                // gets a row of `2*m - 2` bits at index `m - 2`; step 1 has no row.
-                while orderings.rows.len() < new_step_id - 1 {
-                    let m = orderings.rows.len() + 2;
-                    orderings.rows.push(Rc::new(Row::with_bits(2 * m - 2)));
+            let mut orderings = if new_step_id > self.high_id {
+                // Clone straight into a vector sized for the new rows. Cloning
+                // first and resizing after would allocate twice: `Vec::clone`
+                // leaves `len == capacity`, so the resize reallocates the
+                // vector that was just built.
+                let mut succ = Vec::with_capacity(new_step_id);
+                succ.extend(self.succ.iter().cloned());
+                // Empty rows are free: a row allocates words only once the step
+                // actually gains a successor.
+                succ.resize(new_step_id, Rc::new(Row::default()));
+                BinaryOrderings {
+                    high_id: new_step_id,
+                    succ,
                 }
-            }
+            } else {
+                (**self).clone()
+            };
             if new_ordering.before_id != 0 && new_ordering.after_id != GOAL_ID {
                 orderings.fill_transitive(new_ordering);
             }
@@ -188,37 +231,44 @@ impl BinaryOrderings {
     }
 
     /// Marks `id1` before `id2`. The affected row is copied on first write via
-    /// `Rc::make_mut`, giving copy-on-write behaviour (each row is cloned at
-    /// most once per `refine`).
+    /// `Rc::make_mut`, giving copy-on-write behaviour.
+    #[cfg(test)]
     fn set_before(&mut self, id1: usize, id2: usize) {
         if id1 != id2 {
-            let i = id1.max(id2) - 2;
-            let row = Rc::make_mut(&mut self.rows[i]);
-            if id1 < id2 {
-                row.set(id1 - 1);
-            } else {
-                row.set(2 * id1 - 2 - id2);
-            }
+            Rc::make_mut(&mut self.succ[id1 - 1]).set(id2 - 1);
         }
     }
 
-    /// Updates the transitive closure given a new ordering constraint.
+    /// Updates the transitive closure given a new ordering constraint `i < j`.
+    ///
+    /// Every step at or before `i` gains every step at or after `j` as a
+    /// successor. Both sides are bit sets, so the inner update is a word-wise
+    /// OR: O(n^2 / 64) rather than the O(n^2) bit-at-a-time double loop this
+    /// replaces.
     fn fill_transitive(&mut self, ordering: Ordering) {
         let i = ordering.before_id;
         let j = ordering.after_id;
-        if !self.ordered_before(i, j) {
-            let n = self.high_id;
-            // All steps ordered before i (and i itself) must precede j and all
-            // steps ordered after j.
-            for k in 1..=n {
-                if (k == i || self.ordered_before(k, i)) && !self.ordered_before(k, j) {
-                    for l in 1..=n {
-                        if (j == l || self.ordered_before(j, l)) && !self.ordered_before(k, l) {
-                            self.set_before(k, l);
-                        }
-                    }
-                }
+        if i == j || self.ordered_before(i, j) {
+            return;
+        }
+        let n = self.high_id;
+        if i > n || j > n {
+            return;
+        }
+
+        // Successors gained by everything at or before `i`: {j} + succ(j).
+        let mut gained = (*self.succ[j - 1]).clone();
+        gained.set(j - 1);
+
+        for k in 1..=n {
+            if k != i && !self.ordered_before(k, i) {
+                continue;
             }
+            // Leave rows that already imply the new edges shared with the parent.
+            if self.succ[k - 1].contains_all(&gained) {
+                continue;
+            }
+            Rc::make_mut(&mut self.succ[k - 1]).or_with(&gained);
         }
     }
 
@@ -297,5 +347,130 @@ mod tests {
             .unwrap();
 
         assert!(Rc::ptr_eq(&refined, &redundant));
+    }
+
+    /// Naive reference closure: an n x n boolean matrix with an explicit
+    /// Floyd-Warshall pass. Deliberately the dumbest correct implementation, so
+    /// a disagreement indicts the bit-set version rather than the model.
+    struct Reference {
+        n: usize,
+        before: Vec<bool>,
+    }
+
+    impl Reference {
+        fn new(n: usize) -> Self {
+            Reference {
+                n,
+                before: vec![false; n * n],
+            }
+        }
+        fn get(&self, a: usize, b: usize) -> bool {
+            self.before[(a - 1) * self.n + (b - 1)]
+        }
+        fn set(&mut self, a: usize, b: usize) {
+            self.before[(a - 1) * self.n + (b - 1)] = true;
+        }
+        fn close(&mut self) {
+            for k in 1..=self.n {
+                for a in 1..=self.n {
+                    if self.get(a, k) {
+                        for b in 1..=self.n {
+                            if self.get(k, b) {
+                                self.set(a, b);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        /// Applies `a < b`, returning false if it would close a cycle.
+        fn refine(&mut self, a: usize, b: usize) -> bool {
+            if a == b || self.get(b, a) {
+                return false;
+            }
+            self.set(a, b);
+            self.close();
+            true
+        }
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn closure_matches_a_naive_reference_on_random_orderings() {
+        const N: usize = 40;
+        for seed in 1..60u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+
+            // Introduce all N steps first, so both models share the same universe.
+            let mut orderings = Rc::new(BinaryOrderings::new());
+            for step in 1..=N {
+                orderings = orderings
+                    .refine_with_step(
+                        Ordering::new(step, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                        step,
+                    )
+                    .expect("introducing a step is always consistent");
+            }
+            let mut reference = Reference::new(N);
+
+            for _ in 0..(N * 3) {
+                let a = (xorshift(&mut rng) as usize % N) + 1;
+                let b = (xorshift(&mut rng) as usize % N) + 1;
+                if a == b {
+                    continue;
+                }
+
+                let accepted_ref = {
+                    let mut probe = Reference {
+                        n: reference.n,
+                        before: reference.before.clone(),
+                    };
+                    probe.refine(a, b)
+                };
+                let refined =
+                    orderings.refine(Ordering::new(a, StepTime::AtEnd, b, StepTime::AtStart));
+
+                assert_eq!(
+                    refined.is_some(),
+                    accepted_ref,
+                    "seed {seed}: disagreed on whether {a} < {b} is consistent"
+                );
+                if let Some(next) = refined {
+                    reference.refine(a, b);
+                    orderings = next;
+                }
+
+                for x in 1..=N {
+                    for y in 1..=N {
+                        assert_eq!(
+                            orderings.ordered_before(x, y),
+                            reference.get(x, y),
+                            "seed {seed}: ordered_before({x}, {y}) diverged after {a} < {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_before_and_rows_grow_lazily() {
+        let mut orderings = BinaryOrderings::new();
+        orderings.high_id = 3;
+        orderings.succ.resize(3, Rc::new(Row::default()));
+        // An untouched row holds no words at all.
+        assert!(orderings.succ[0].words.is_empty());
+        assert!(!orderings.ordered_before(1, 3));
+        orderings.set_before(1, 3);
+        assert!(orderings.ordered_before(1, 3));
+        assert!(!orderings.ordered_before(3, 1));
     }
 }
