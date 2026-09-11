@@ -1,9 +1,15 @@
 //! Planning parameters.
 //!
-//! The literal-POCL defaults are A* search, the reuse-aware `ADDR` heuristic,
-//! the static-first flaw-selection order, task action cost, weight 1, and lifted
-//! actions. The CLI substitutes plain `ADD` for finite-domain POCL, where it is
-//! substantially more robust than `ADDR`.
+//! The defaults are A* search, the additive `ADD` heuristic, the static-first
+//! flaw-selection order, task action cost, weight 1, and lifted actions. The
+//! same defaults apply to every representation.
+//!
+//! `ADD` rather than the reuse-aware `ADDR`: `ADDR`'s reuse check scans every
+//! step and effect for every open condition, so its cost grows with plan size,
+//! and on some domains it buys almost nothing for that. On Gripper it is
+//! catastrophic — VHPOP 3.0 itself needs 101,595 nodes with `ADDR` against 886
+//! with `ADD` on `gripper-6`, and times out on `gripper-8`. `ADDR` remains
+//! available via `-h ADDR`; see `tests/addr_diagnostic.rs`.
 
 use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
@@ -70,7 +76,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Parameters {
             search_algorithm: SearchAlgorithm::A,
-            heuristic: Heuristic::parse("ADDR").expect("ADDR is a valid heuristic"),
+            heuristic: Heuristic::parse("ADD").expect("ADD is a valid heuristic"),
             action_cost: ActionCost::Task,
             weight: 1.0,
             flaw_orders: vec![

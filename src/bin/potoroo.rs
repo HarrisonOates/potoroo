@@ -43,8 +43,8 @@ struct Cli {
     files: Vec<String>,
     /// Effective flaw-order names, retained for readable telemetry.
     flaw_order_names: Vec<String>,
-    /// Effective `-h` value (default `ADDR`, or `ADD` with `--fdr-pocl`). Used
-    /// to label telemetry and the optional `POTOROO_STATS_JSON` output.
+    /// Effective `-h` value (default `ADD`). Used to label telemetry and the
+    /// optional `POTOROO_STATS_JSON` output.
     heuristic_name: String,
     /// Raw `-s` value as given on the command line (default `A`). Included in the
     /// `POTOROO_STATS_JSON` output so different algorithms are distinguishable.
@@ -445,9 +445,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut verbosity = 0u32;
     let mut fdr_pocl = false;
     let mut files = Vec::new();
-    let mut heuristic_name = String::from("ADDR");
+    let mut heuristic_name = String::from("ADD");
     let mut algorithm_name = String::from("A");
-    let mut heuristic_explicit = false;
     // Track whether the user set these so repeated flags replace the defaults.
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
     let mut flaw_order_names: Vec<String> = Vec::new();
@@ -526,7 +525,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 params.heuristic = Heuristic::parse(&v)?;
                 heuristic_name = v;
-                heuristic_explicit = true;
             }
             "H" => {
                 print_help();
@@ -574,14 +572,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             other => return Err(format!("unknown option `-{other}`")),
         }
         i += 1;
-    }
-
-    // Reuse-aware ADDR is strongest on literal partial plans, but creates deep
-    // plateaus on the finite-domain representation. Plain ADD is the robust FDR
-    // default. An explicit `-h` always wins.
-    if fdr_pocl && !heuristic_explicit {
-        params.heuristic = Heuristic::parse("ADD").expect("ADD is a valid heuristic");
-        heuristic_name = "ADD".to_string();
     }
 
     if !flaw_orders.is_empty() {
@@ -678,7 +668,7 @@ fn print_help() {
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
-         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADDR; ADD for FDR)\n\
+         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20 -v, --verbose[=N]          live search telemetry (repeat for more frequent updates)\n\
@@ -699,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn literal_cli_uses_the_addr_static_profile() {
+    fn literal_cli_uses_the_add_static_profile() {
         let cli = cli(&[]);
-        assert_eq!(cli.heuristic_name, "ADDR");
+        assert_eq!(cli.heuristic_name, "ADD");
         assert_eq!(cli.flaw_order_names, ["STATIC"]);
         assert_eq!(cli.params.search_algorithm, SearchAlgorithm::A);
         assert_eq!(cli.params.action_cost, ActionCost::Task);
@@ -709,8 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn fdr_cli_uses_add_unless_the_heuristic_is_explicit() {
+    fn every_representation_defaults_to_add() {
+        assert_eq!(cli(&[]).heuristic_name, "ADD");
+        assert_eq!(cli(&["-g"]).heuristic_name, "ADD");
         assert_eq!(cli(&["--fdr-pocl"]).heuristic_name, "ADD");
+    }
+
+    #[test]
+    fn an_explicit_heuristic_still_wins() {
+        assert_eq!(cli(&["-h", "ADDR"]).heuristic_name, "ADDR");
         assert_eq!(cli(&["--fdr-pocl", "-h", "ADDR"]).heuristic_name, "ADDR");
     }
 }
