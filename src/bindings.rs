@@ -645,24 +645,12 @@ impl Bindings {
         l2: &Literal,
         id2: usize,
     ) -> bool {
+        // A negation affects a positive literal when their atoms unify; the
+        // signs are opposite by construction, so go straight to the atoms.
         match l1 {
-            Literal::Negation(a) => self.unify_mgu(
-                ctx,
-                mgu,
-                l2,
-                id2,
-                &Literal::Atom(a.clone()),
-                id1,
-            ),
+            Literal::Negation(a) => self.unify_atoms(ctx, mgu, l2.atom(), id2, a, id1),
             Literal::Atom(_) => match l2 {
-                Literal::Negation(a) => self.unify_mgu(
-                    ctx,
-                    mgu,
-                    &Literal::Atom(a.clone()),
-                    id2,
-                    l1,
-                    id1,
-                ),
+                Literal::Negation(a) => self.unify_atoms(ctx, mgu, a, id2, l1.atom(), id1),
                 Literal::Atom(_) => false,
             },
         }
@@ -687,8 +675,26 @@ impl Bindings {
         if l1.negative() != l2.negative() {
             return false;
         }
-        let a1 = l1.atom();
-        let a2 = l2.atom();
+        self.unify_atoms(ctx, mgu, l1.atom(), id1, l2.atom(), id2)
+    }
+
+    /// Unification of two atoms, with no opinion about the literals' signs.
+    ///
+    /// Split out of [`Bindings::unify_mgu`] so `affects_mgu`, which pairs a
+    /// negation's atom against a positive literal, can call it directly. It
+    /// previously cloned the atom purely to wrap it in a `Literal::Atom` that
+    /// would satisfy the sign check -- 703,380 allocations over a 20,000-node
+    /// lifted search.
+    #[allow(clippy::too_many_arguments)]
+    fn unify_atoms(
+        &self,
+        ctx: &TypeContext,
+        mgu: &mut Vec<Binding>,
+        a1: &crate::formula::Atom,
+        id1: usize,
+        a2: &crate::formula::Atom,
+        id2: usize,
+    ) -> bool {
         if a1.predicate != a2.predicate {
             return false;
         }
