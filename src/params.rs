@@ -1,9 +1,4 @@
-//! Planning parameters.
-//!
-//! The literal-POCL defaults are A* search, the reuse-aware `ADDR` heuristic,
-//! the static-first flaw-selection order, task action cost, weight 1, and lifted
-//! actions. The CLI substitutes plain `ADD` for finite-domain POCL, where it is
-//! substantially more robust than `ADDR`.
+//! Planning parameters and defaults.
 
 use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
@@ -70,7 +65,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Parameters {
             search_algorithm: SearchAlgorithm::A,
-            heuristic: Heuristic::parse("ADDR").expect("ADDR is a valid heuristic"),
+            heuristic: Heuristic::parse("ADD").expect("ADD is a valid heuristic"),
             action_cost: ActionCost::Task,
             weight: 1.0,
             flaw_orders: vec![

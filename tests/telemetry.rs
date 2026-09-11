@@ -22,7 +22,7 @@ fn verbose_mode_reports_live_and_final_search_state() {
 
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(stderr.contains(
-        "Search: lifted POCL | A(ADDR) | flaws STATIC | cost TASK | weight 1 | node limit unlimited"
+        "Search: lifted POCL | A(ADD) | flaws STATIC | cost TASK | weight 1 | node limit unlimited"
     ));
     assert!(stderr.contains("visited 1 | generated"));
     assert!(stderr.contains("| queued "));

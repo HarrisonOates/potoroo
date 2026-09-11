@@ -95,7 +95,7 @@ Input files can also be piped via stdin (domain first, then problem).
 ### Quick examples
 
 ```bash
-# Solve the Sussman anomaly with the default ADDR heuristic
+# Solve the Sussman anomaly with the default ADD heuristic
 potoroo examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
 
 # Use the additive heuristic
@@ -116,11 +116,17 @@ potoroo --fdr-pocl -v examples/blocks-world-domain.pddl examples/sussman-anomaly
 
 ### Default search profile
 
-Potoroo defaults to lifted POCL, A* search, task action costs, weight 1, and the
-`STATIC` flaw order. Literal POCL uses the reuse-aware `ADDR` heuristic. With
-`--fdr-pocl`, Potoroo selects plain `ADD` instead: empirical sweeps found its
-finite-domain search substantially more robust than `ADDR`. Any explicit
-`-h`, `-f`, `-s`, `-a`, or `-w` option overrides the corresponding default.
+Potoroo defaults to lifted POCL, A* search, the additive `ADD` heuristic, task
+action costs, weight 1, and the `STATIC` flaw order. The same defaults apply to
+every representation. Any explicit `-h`, `-f`, `-s`, `-a`, or `-w` option
+overrides the corresponding default.
+
+`ADD` rather than VHPOP's reuse-aware `ADDR`: the reuse check scans every step
+and effect for every open condition, so its cost grows with plan size, and on
+several domains it buys very little for that. On Gripper it is catastrophic, and
+not only here — VHPOP 3.0 itself needs 101,595 nodes with `ADDR` against 886
+with `ADD` on `gripper-6`, and times out on `gripper-8`. `ADDR` remains
+available with `-h ADDR`.
 
 ### Finite-domain ground POCL
 
@@ -209,7 +215,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `STATIC` |
 | — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
-| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADDR` (`ADD` with `--fdr-pocl`) |
+| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
 | `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
 | `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
@@ -242,10 +248,10 @@ These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is
 
 | Name | Description |
 |------|-------------|
-| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **FDR default.** |
+| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **Default.** |
 | `ADD_COST` | ADD cost term only (no step count) |
 | `ADD_WORK` | ADD work: total operator count in the ADD relaxed plan |
-| `ADDR` | Additive heuristic with action reuse: only new operators count toward the estimate. **Literal-POCL default.** |
+| `ADDR` | Additive heuristic with action reuse (VHPOP's `h^r_add`): only new operators count toward the estimate. Evaluation cost grows with plan size; see the note on defaults above. |
 | `ADDR_COST` | ADDR cost only |
 | `ADDR_WORK` | ADDR work |
 | `RELAX` | Delete-relaxed plan cost (FF-style joint extraction): `committed-cost + weight × cost(π_relax)` |
