@@ -780,7 +780,9 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             parameters,
             var_types: term_table.variable_types().to_vec(),
             precondition,
-            effects,
+            // Shared from here on: every step action and threat record refers
+            // to these rather than deep-copying the effect's atom.
+            effects: effects.into_iter().map(Rc::new).collect(),
             // Unresolved until `bind_action_costs` runs against a problem.
             cost: cost.constant,
             cost_base: cost.constant,

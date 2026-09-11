@@ -79,7 +79,7 @@ struct CompiledStep {
     /// The step's (schema) precondition, rendered with `subst`.
     precondition: Rc<Formula>,
     /// The step's (schema) effects, rendered with `subst`.
-    effects: Vec<Effect>,
+    effects: Vec<Rc<Effect>>,
     /// Variable types in the step's scope (for forall/param types).
     var_types: Vec<Type>,
     /// Committed steps `l'` with `l' ≺ l` (their `l'₊` are preconditions).
@@ -585,7 +585,7 @@ fn flatten_pre(int: &mut Interner, f: &Rc<Formula>) -> Option<Vec<(usize, bool)>
 /// Flattens ground effects into [`GroundEffect`]s (conditional `when` kept as
 /// effect conditions; statically-false conditions drop the effect). Forall
 /// effects are not expected in ground search and are skipped if present.
-fn flatten_effects(int: &mut Interner, effects: &[Effect]) -> Vec<GroundEffect> {
+fn flatten_effects(int: &mut Interner, effects: &[Rc<Effect>]) -> Vec<GroundEffect> {
     let mut out = Vec::new();
     for e in effects {
         if e.condition.contradiction() || !e.parameters.is_empty() {
@@ -994,7 +994,7 @@ fn render_formula_expr(f: &Rc<Formula>, subst: &Subst, ctx: &SearchContext) -> S
 /// the surrounding `(and ...)`, applying `subst` to bound terms.
 fn render_effects_into(
     s: &mut String,
-    effects: &[Effect],
+    effects: &[Rc<Effect>],
     subst: &Subst,
     var_types: &[Type],
     ctx: &SearchContext,

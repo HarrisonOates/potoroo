@@ -84,7 +84,7 @@ impl PartialEq for OpenCondition {
 pub struct Unsafe {
     pub link: Link,
     pub step_id: usize,
-    pub effect: Effect,
+    pub effect: Rc<Effect>,
 }
 
 /// Structural identity for chain removal. A plan never holds two structurally
@@ -93,10 +93,13 @@ impl PartialEq for Unsafe {
     fn eq(&self, other: &Self) -> bool {
         self.link == other.link
             && self.step_id == other.step_id
-            && self.effect.literal == other.effect.literal
-            && Rc::ptr_eq(&self.effect.condition, &other.effect.condition)
-            && self.effect.when == other.effect.when
-            && self.effect.parameters == other.effect.parameters
+            // Effects are shared, so identical ones are usually the same
+            // allocation; fall back to the field comparison when they are not.
+            && (Rc::ptr_eq(&self.effect, &other.effect)
+                || (self.effect.literal == other.effect.literal
+                    && Rc::ptr_eq(&self.effect.condition, &other.effect.condition)
+                    && self.effect.when == other.effect.when
+                    && self.effect.parameters == other.effect.parameters))
     }
 }
 

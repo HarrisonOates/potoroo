@@ -1680,10 +1680,10 @@ fn collect_reachable_tuple(
     if pre_value.infinite() {
         return;
     }
-    let effects: Vec<Effect> = schema
+    let effects: Vec<Rc<Effect>> = schema
         .effects
         .iter()
-        .map(|e| instantiate_effect(e, subst))
+        .map(|e| Rc::new(instantiate_effect(e, subst)))
         .collect();
     out.push(Rc::new(StepAction {
         name: schema.name.clone(),

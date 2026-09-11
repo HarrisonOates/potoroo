@@ -97,10 +97,10 @@ impl<'a> SearchContext<'a> {
             var_types: problem.goal_var_types.clone(),
         });
         // Init action: effects = init atoms (positive), in declaration order.
-        let init_effects: Vec<Effect> = problem
+        let init_effects: Vec<Rc<Effect>> = problem
             .init_order
             .iter()
-            .map(|a| Effect::new(Literal::Atom(a.clone())))
+            .map(|a| Rc::new(Effect::new(Literal::Atom(a.clone()))))
             .collect();
         let init_action = Rc::new(StepAction {
             name: "<init 0>".to_string(),
@@ -229,10 +229,10 @@ impl<'a> SearchContext<'a> {
             return None;
         }
         let precondition = instantiate_formula(&schema.precondition, &subst);
-        let effects: Vec<Effect> = schema
+        let effects: Vec<Rc<Effect>> = schema
             .effects
             .iter()
-            .map(|e| instantiate_effect(e, &subst))
+            .map(|e| Rc::new(instantiate_effect(e, &subst)))
             .collect();
         Some(Rc::new(StepAction {
             name: schema.name.clone(),
