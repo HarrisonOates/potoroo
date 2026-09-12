@@ -1444,35 +1444,38 @@ pub fn link_threats(
         if orderings.possibly_not_after(link.from_id, lt1, s.id, StepTime::AtEnd)
             && orderings.possibly_not_before(link.to_id, lt2, s.id, StepTime::AtStart)
         {
+            // Nothing below depends on which effect is being examined: the step,
+            // the link and `et` are all fixed across the loop. Deciding it once
+            // per step keeps the ordering matrix out of the per-effect path,
+            // which is where the threat scan spends its time on a long plan.
+            let et = StepTime::AtEnd;
+            let placement_admits_threat = (s.id != link.to_id)
+                && orderings.possibly_not_after(link.from_id, lt1, s.id, et)
+                && orderings.possibly_not_before(link.to_id, lt2, s.id, et)
+                && (link.condition.negative() || (link.from_id != s.id));
+            if !placement_admits_threat {
+                continue;
+            }
             for e in s.action.effects.iter() {
                 if e.link_condition.contradiction() {
                     continue;
                 }
-                let et = StepTime::AtEnd;
-                if (s.id != link.to_id)
-                    && orderings.possibly_not_after(link.from_id, lt1, s.id, et)
-                    && orderings.possibly_not_before(link.to_id, lt2, s.id, et)
-                {
-                    let neg_condition = link.condition.negative();
-                    if (neg_condition || (link.from_id != s.id))
-                        && bindings.affects(
-                            &ctx.type_ctx(),
-                            &e.literal,
-                            s.id,
-                            &link.condition,
-                            link.to_id,
-                        )
-                    {
-                        *unsafes = chain::cons(
-                            Unsafe {
-                                link: link.clone(),
-                                step_id: s.id,
-                                effect: e.clone(),
-                            },
-                            unsafes.clone(),
-                        );
-                        *num_unsafes += 1;
-                    }
+                if bindings.affects(
+                    &ctx.type_ctx(),
+                    &e.literal,
+                    s.id,
+                    &link.condition,
+                    link.to_id,
+                ) {
+                    *unsafes = chain::cons(
+                        Unsafe {
+                            link: link.clone(),
+                            step_id: s.id,
+                            effect: e.clone(),
+                        },
+                        unsafes.clone(),
+                    );
+                    *num_unsafes += 1;
                 }
             }
         }
@@ -1495,35 +1498,29 @@ pub fn step_threats(
         if orderings.possibly_not_after(l.from_id, lt1, step.id, StepTime::AtEnd)
             && orderings.possibly_not_before(l.to_id, lt2, step.id, StepTime::AtStart)
         {
+            // Loop-invariant across the step's effects; see `link_threats`.
+            let et = StepTime::AtEnd;
+            let placement_admits_threat = (step.id != l.to_id)
+                && orderings.possibly_not_after(l.from_id, lt1, step.id, et)
+                && orderings.possibly_not_before(l.to_id, lt2, step.id, et)
+                && (l.condition.negative() || (l.from_id != step.id));
+            if !placement_admits_threat {
+                continue;
+            }
             for e in step.action.effects.iter() {
                 if e.link_condition.contradiction() {
                     continue;
                 }
-                let et = StepTime::AtEnd;
-                if (step.id != l.to_id)
-                    && orderings.possibly_not_after(l.from_id, lt1, step.id, et)
-                    && orderings.possibly_not_before(l.to_id, lt2, step.id, et)
-                {
-                    let neg_condition = l.condition.negative();
-                    if (neg_condition || (l.from_id != step.id))
-                        && bindings.affects(
-                            &ctx.type_ctx(),
-                            &e.literal,
-                            step.id,
-                            &l.condition,
-                            l.to_id,
-                        )
-                    {
-                        *unsafes = chain::cons(
-                            Unsafe {
-                                link: l.clone(),
-                                step_id: step.id,
-                                effect: e.clone(),
-                            },
-                            unsafes.clone(),
-                        );
-                        *num_unsafes += 1;
-                    }
+                if bindings.affects(&ctx.type_ctx(), &e.literal, step.id, &l.condition, l.to_id) {
+                    *unsafes = chain::cons(
+                        Unsafe {
+                            link: l.clone(),
+                            step_id: step.id,
+                            effect: e.clone(),
+                        },
+                        unsafes.clone(),
+                    );
+                    *num_unsafes += 1;
                 }
             }
         }
