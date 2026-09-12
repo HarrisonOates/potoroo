@@ -758,14 +758,15 @@ impl Plan {
                     condition: open_cond.literal().unwrap(),
                     condition_time: open_cond.when,
                 };
-                let new_links = chain::cons(link.clone(), self.links.clone());
+                let new_links = chain::cons(link, self.links.clone());
+                let link = &new_links.as_ref().expect("cons yields a non-empty chain").head;
                 let mut new_unsafes = self.unsafes.clone();
                 let mut new_num_unsafes = self.num_unsafes;
                 link_threats(
                     ctx,
                     &mut new_unsafes,
                     &mut new_num_unsafes,
-                    &link,
+                    link,
                     &self.steps,
                     &self.orderings,
                     &bindings,
@@ -895,7 +896,11 @@ impl Plan {
             condition: open_cond.literal().unwrap(),
             condition_time: open_cond.when,
         };
-        let new_links = chain::cons(link.clone(), self.links.clone());
+        // Cons first, then borrow the link back out of the node just built.
+        // Cloning it for `link_threats` instead would copy the condition atom's
+        // term vector on every link the search creates.
+        let new_links = chain::cons(link, self.links.clone());
+        let link = &new_links.as_ref().expect("cons yields a non-empty chain").head;
 
         // Threats to the new link.
         let mut new_unsafes = self.unsafes.clone();
