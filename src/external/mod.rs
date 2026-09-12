@@ -126,6 +126,31 @@ fn cache_key(domain_pddl: &str, problem_pddl: &str, heur: FdHeuristic) -> u64 {
     h.finish()
 }
 
+/// Looks for `rel` inside an in-repository `downward/` checkout, so a plain
+/// `target/release/potoroo` invocation finds the same planner that `cargo run`
+/// does via `.cargo/config.toml`. Two roots are tried: the current directory
+/// (the repository root, for a run started there) and the directory two levels
+/// above the executable (`target/<profile>/potoroo`, for a run started
+/// anywhere else). Returns the path only when it exists, so an absent checkout
+/// falls through to the `PATH` lookup.
+fn in_repo_checkout(rel: &str) -> Option<String> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::with_capacity(2);
+    roots.push(std::path::PathBuf::from("."));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target_parent) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+        {
+            roots.push(target_parent.to_path_buf());
+        }
+    }
+    for root in roots {
+        let candidate = root.join("downward").join(rel);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 /// The configured Fast Downward driver. Resolution order:
 /// 1. `POTOROO_FD` environment variable (an explicit path to `fast-downward.py`).
 /// 2. `fast-downward.py` on `PATH`.
@@ -134,6 +159,9 @@ fn cache_key(domain_pddl: &str, problem_pddl: &str, heur: FdHeuristic) -> u64 {
 /// the apptainer `.sif` image, so callers need not care which is configured.
 pub fn fd_path() -> String {
     if let Ok(p) = std::env::var("POTOROO_FD") {
+        return p;
+    }
+    if let Some(p) = in_repo_checkout("fast-downward.py") {
         return p;
     }
     "fast-downward.py".to_string()
@@ -177,6 +205,12 @@ pub fn run_fd_heuristic(
 pub fn downward_path() -> String {
     if let Ok(p) = std::env::var("POTOROO_DOWNWARD") {
         return p;
+    }
+    for build in ["release", "debug"] {
+        let rel = format!("builds/{build}/bin/downward");
+        if let Some(p) = in_repo_checkout(&rel) {
+            return p;
+        }
     }
     "downward".to_string()
 }
