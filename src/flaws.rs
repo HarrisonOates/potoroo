@@ -62,9 +62,12 @@ impl OpenCondition {
         if self.step_id == crate::plan::GOAL_ID {
             return false;
         }
-        match self.literal() {
-            Some(l) => predicates.is_static(l.atom().predicate),
-            None => false,
+        // Read the predicate off the formula; `literal()` would clone the
+        // atom's term vector to answer, and the flaw order asks this per open
+        // condition per node.
+        match self.condition.as_ref() {
+            Formula::Atom(a) | Formula::Negation(a) => predicates.is_static(a.predicate),
+            _ => false,
         }
     }
 }
