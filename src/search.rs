@@ -14,7 +14,7 @@ use crate::bindings::{Bindings, StepVarTypes, TypeContext};
 use crate::chain;
 use crate::domain::Domain;
 use crate::effect::Effect;
-use crate::formula::{Formula, Literal};
+use crate::formula::{Atom, Formula, Literal};
 use crate::instantiate::{instantiate_effect, instantiate_formula, precondition_consistent};
 use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
@@ -37,6 +37,14 @@ pub struct SearchContext<'a> {
     achieves_pred: FastMap<u32, Vec<(Rc<StepAction>, usize)>>,
     /// Achievers of negative literals, keyed by predicate id.
     achieves_neg_pred: FastMap<u32, Vec<(Rc<StepAction>, usize)>>,
+    /// Exact achiever index for a fully ground task: the same entries as the
+    /// two predicate maps, keyed by the effect literal's atom rather than by its
+    /// predicate alone. `None` when any effect literal carries a variable (every
+    /// lifted run, and any forall effect), in which case the predicate maps are
+    /// the only index. See [`SearchContext::literal_achievers`].
+    achieves_atom: Option<FastMap<Atom, Vec<(Rc<StepAction>, usize)>>>,
+    /// Exact achiever index for negative literals; see `achieves_atom`.
+    achieves_neg_atom: Option<FastMap<Atom, Vec<(Rc<StepAction>, usize)>>>,
     /// Step-id -> action variable-type registry; populated as steps are created.
     step_var_types: RefCell<FastMap<usize, Rc<StepAction>>>,
     /// The relaxed planning graph, built lazily on first use when the configured
@@ -120,6 +128,8 @@ impl<'a> SearchContext<'a> {
             goal_action: goal_action.clone(),
             achieves_pred: FastMap::default(),
             achieves_neg_pred: FastMap::default(),
+            achieves_atom: None,
+            achieves_neg_atom: None,
             step_var_types: RefCell::new(FastMap::default()),
             planning_graph: RefCell::new(None),
             fresh_vars: RefCell::new(FastMap::default()),
@@ -171,6 +181,43 @@ impl<'a> SearchContext<'a> {
                 .or_default()
                 .push((self.init_action.clone(), idx));
         }
+        self.build_atom_achievers();
+    }
+
+    /// Builds the exact, atom-keyed achiever index from the predicate-keyed
+    /// ones. A ground open condition otherwise scans every effect sharing its
+    /// predicate and unifies each: on gripper-20 that is every `drop` in the
+    /// task for one `(at ball_i room_j)`, of which two can match.
+    ///
+    /// Only a wholly ground task can be indexed this way -- one variable in one
+    /// effect literal (a forall parameter, or any lifted run) makes the atom an
+    /// unsound key, because that effect can achieve atoms it is not equal to.
+    /// Giving up on the whole index then, rather than per predicate, keeps the
+    /// lookup a single branch on the hot path.
+    fn build_atom_achievers(&mut self) {
+        let ground = |m: &FastMap<u32, Vec<(Rc<StepAction>, usize)>>| {
+            m.values().flatten().all(|(action, idx)| {
+                let effect = &action.effects[*idx];
+                effect.parameters.is_empty() && effect.literal.atom().ground()
+            })
+        };
+        if !ground(&self.achieves_pred) || !ground(&self.achieves_neg_pred) {
+            return;
+        }
+        // Preserve each predicate bucket's order within its atom buckets: the
+        // achiever order decides the order refinements are generated in, and
+        // that decides which optimal plan A* returns.
+        let index = |m: &FastMap<u32, Vec<(Rc<StepAction>, usize)>>| {
+            let mut out: FastMap<Atom, Vec<(Rc<StepAction>, usize)>> = FastMap::default();
+            for entry in m.values().flatten() {
+                let atom = entry.1;
+                let key = entry.0.effects[atom].literal.atom().clone();
+                out.entry(key).or_default().push(entry.clone());
+            }
+            out
+        };
+        self.achieves_atom = Some(index(&self.achieves_pred));
+        self.achieves_neg_atom = Some(index(&self.achieves_neg_pred));
     }
 
     /// Naively instantiates every schema over all type-compatible argument
@@ -377,7 +424,22 @@ impl<'a> SearchContext<'a> {
     }
 
     pub fn literal_achievers(&self, literal: &Literal) -> Option<&[(Rc<StepAction>, usize)]> {
-        let pred = literal.atom().predicate.0;
+        let atom = literal.atom();
+        // A ground condition against a ground task: answer exactly. The
+        // achievers dropped here are precisely those `new_link` would have
+        // unified against and rejected, so the refinements produced -- and
+        // their order -- are unchanged.
+        let exact = if literal.negative() {
+            &self.achieves_neg_atom
+        } else {
+            &self.achieves_atom
+        };
+        if let Some(map) = exact {
+            if atom.ground() {
+                return map.get(atom).map(|v| v.as_slice());
+            }
+        }
+        let pred = atom.predicate.0;
         let map = if literal.negative() {
             &self.achieves_neg_pred
         } else {
