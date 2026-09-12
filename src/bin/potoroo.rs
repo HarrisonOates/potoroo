@@ -591,6 +591,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
     }
 
+    // Per-evaluation timing is only worth its two clock reads per generated
+    // node where `h_eval_ms` is actually printed: the verbose summary and live
+    // progress line, and the opt-in STATS row.
+    params.time_h_evals = verbosity > 0 || std::env::var_os("POTOROO_STATS_JSON").is_some();
+
     Ok(Some(Cli {
         params,
         fdr_pocl,

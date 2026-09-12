@@ -1380,11 +1380,15 @@ impl<'a> Planner<'a> {
         params: &Parameters,
         stats: &mut SearchStats,
     ) -> (Vec<f32>, Vec<f32>) {
-        let start = Instant::now();
+        // Only read the clock when `h_eval_ms` will be reported; see
+        // `Parameters::time_h_evals`.
+        let start = params.time_h_evals.then(Instant::now);
         let result = self.compute_rank_both(plan, params);
         stats.h_evals += 1;
-        stats.h_eval_nanos += start.elapsed().as_nanos();
-        stats.h_eval_ms = stats.h_eval_nanos / 1_000_000;
+        if let Some(start) = start {
+            stats.h_eval_nanos += start.elapsed().as_nanos();
+            stats.h_eval_ms = stats.h_eval_nanos / 1_000_000;
+        }
         result
     }
 

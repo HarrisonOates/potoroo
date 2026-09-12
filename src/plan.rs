@@ -142,7 +142,7 @@ impl Plan {
         } else {
             None
         };
-        let start = std::time::Instant::now();
+        let start = ctx.h_eval_start();
         let rank = ctx.params.heuristic.plan_rank(
             self,
             ctx.params.weight,
@@ -151,7 +151,7 @@ impl Plan {
             pg.as_deref(),
             ctx,
         );
-        ctx.record_h_eval(start.elapsed());
+        ctx.record_h_eval(start);
         // Most generated plans are ranked once and then parked in a queue;
         // don't let each retain its bindings lookup index.
         self.bindings.clear_index();
@@ -169,7 +169,7 @@ impl Plan {
         } else {
             None
         };
-        let start = std::time::Instant::now();
+        let start = ctx.h_eval_start();
         let ranks = ctx.params.heuristic.plan_rank_both(
             self,
             ctx.params.weight,
@@ -178,7 +178,7 @@ impl Plan {
             pg.as_deref(),
             ctx,
         );
-        ctx.record_h_eval(start.elapsed());
+        ctx.record_h_eval(start);
         self.bindings.clear_index();
         ranks
     }
@@ -192,7 +192,7 @@ impl Plan {
         } else {
             None
         };
-        let start = std::time::Instant::now();
+        let start = ctx.h_eval_start();
         let rank = ctx.params.heuristic.plan_rank_gbfs(
             self,
             ctx.params.weight,
@@ -201,7 +201,7 @@ impl Plan {
             pg.as_deref(),
             ctx,
         );
-        ctx.record_h_eval(start.elapsed());
+        ctx.record_h_eval(start);
         // Most generated plans are ranked once and then parked in a queue;
         // don't let each retain its bindings lookup index.
         self.bindings.clear_index();
