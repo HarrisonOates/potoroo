@@ -1337,16 +1337,21 @@ fn add_goal(
     while let Some(g) = goals.pop() {
         match g.as_ref() {
             Formula::Atom(_) | Formula::Negation(_) => {
-                let l = match g.as_ref() {
-                    Formula::Atom(a) => Literal::Atom(a.clone()),
-                    Formula::Negation(a) => Literal::Negation(a.clone()),
-                    _ => unreachable!(),
-                };
                 if !test_only {
+                    // Rebuild the formula directly rather than by way of a
+                    // `Literal`, which cloned the atom once to be made and
+                    // again in `to_formula`. The `Rc` is still fresh: open
+                    // conditions are identified by pointer, so sharing `g`
+                    // here would make distinct ones compare equal.
+                    let condition = match g.as_ref() {
+                        Formula::Atom(a) => Rc::new(Formula::Atom(a.clone())),
+                        Formula::Negation(a) => Rc::new(Formula::Negation(a.clone())),
+                        _ => unreachable!("matched an atom or a negation above"),
+                    };
                     *open_conds = chain::cons(
                         OpenCondition {
                             step_id,
-                            condition: l.to_formula(),
+                            condition,
                             when: FormulaTime::AtStart,
                         },
                         open_conds.clone(),
