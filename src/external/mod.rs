@@ -392,6 +392,27 @@ pub fn run_downward_sas(sas: &str, heur: FdHeuristic) -> Result<HResult, FdError
     result
 }
 
+/// The interpreter used for the direct translator invocation. `POTOROO_PYTHON`
+/// overrides it for a checkout whose translator needs a specific Python.
+fn python_path() -> String {
+    std::env::var("POTOROO_PYTHON").unwrap_or_else(|_| "python3".to_string())
+}
+
+/// The directory to put on `PYTHONPATH` so `fast_downward.translate` imports:
+/// the `bin/` directory of a Fast Downward build, which holds the `downward`
+/// binary and the `fast_downward/` translator package side by side. Derived
+/// from [`downward_path`] so a `POTOROO_DOWNWARD` pointing at one build does
+/// not pick up another build's translator. `None` when the package is absent,
+/// which sends `run_fd_translate` down the driver path.
+fn translate_package_dir() -> Option<std::path::PathBuf> {
+    let binary = std::path::PathBuf::from(downward_path());
+    let bin_dir = binary.parent()?;
+    if bin_dir.join("fast_downward").join("translate").is_dir() {
+        return Some(bin_dir.to_path_buf());
+    }
+    None
+}
+
 /// Runs only Fast Downward's translator (PDDL → SAS+) on the given problem and
 /// returns the SAS+ output as a string. This exposes FD's grounder so later
 /// phases (the reachability grounder / Lplan, Phase 0d/4) can consume FD's
@@ -408,15 +429,40 @@ pub fn run_fd_translate(domain_pddl: &str, problem_pddl: &str) -> Result<String,
         std::fs::File::create(&domain_path)?.write_all(domain_pddl.as_bytes())?;
         std::fs::File::create(&problem_path)?.write_all(problem_pddl.as_bytes())?;
     }
+    // Preferred: run the translator package directly. `fast-downward.py` only
+    // parses arguments and then spawns `python3 -m fast_downward.translate` as a
+    // *second* Python process, so going straight to the module drops one full
+    // interpreter startup (measured: 70 ms via the driver vs 40 ms direct, for
+    // byte-identical SAS⁺ output). Grounding dominates the wall time of every
+    // small ground/FDR run, so this is the bulk of it.
     let path = fd_path();
-    let spawn = std::process::Command::new(&path)
-        .arg("--sas-file")
-        .arg(&sas_path)
-        .arg("--translate")
-        .arg(&domain_path)
-        .arg(&problem_path)
-        .current_dir(&dir)
-        .output();
+    let direct = translate_package_dir().map(|pkg| {
+        std::process::Command::new(python_path())
+            .arg("-m")
+            .arg("fast_downward.translate")
+            .arg(&domain_path)
+            .arg(&problem_path)
+            .arg("--sas-file")
+            .arg(&sas_path)
+            .env("PYTHONPATH", &pkg)
+            .current_dir(&dir)
+            .output()
+    });
+    // Fall back to the driver whenever the direct call did not produce SAS⁺ —
+    // a missing package, a Python that cannot import it, a future layout
+    // change. The driver path is what this function always did, so a failure
+    // here can only cost time, never coverage.
+    let spawn = match direct {
+        Some(Ok(out)) if sas_path.exists() => Ok(out),
+        _ => std::process::Command::new(&path)
+            .arg("--sas-file")
+            .arg(&sas_path)
+            .arg("--translate")
+            .arg(&domain_path)
+            .arg(&problem_path)
+            .current_dir(&dir)
+            .output(),
+    };
     let result = (|| {
         let out = spawn.map_err(|source| FdError::Spawn {
             path: path.clone(),
