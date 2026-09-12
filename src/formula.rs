@@ -18,6 +18,15 @@ pub struct Atom {
     pub terms: Vec<Term>,
 }
 
+impl Atom {
+    /// True iff every term is already an object, so the atom needs no binding
+    /// resolution to name a ground fact. Allocation-free.
+    #[inline]
+    pub fn ground(&self) -> bool {
+        self.terms.iter().all(|t| t.object())
+    }
+}
+
 /// A literal is a (possibly negated) atom.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Literal {

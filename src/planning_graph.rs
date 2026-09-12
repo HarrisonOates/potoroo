@@ -624,6 +624,12 @@ impl PlanningGraph {
                 .get(atom)
                 .copied()
                 .unwrap_or(HeuristicValue::INFINITE),
+            Some(_) if atom.ground() => {
+                // Already ground before any binding lookup: the atom is its own
+                // resolution, so answer from the table without building a
+                // pattern. Ground search reaches this on every evaluation.
+                self.heuristic_value_atom(atom, 0, None)
+            }
             Some((ctx, b)) => {
                 // Take minimum value over ground atoms that unify. The pattern
                 // is resolved against the bindings once; per-candidate matching
@@ -683,6 +689,28 @@ impl PlanningGraph {
                     HeuristicValue::INFINITE
                 } else {
                     // False from the start: the negation costs nothing.
+                    HeuristicValue::ZERO_COST_UNIT_WORK
+                }
+            }
+            // Already ground before any binding lookup, so the pattern the arm
+            // below would resolve is fully bound and reproduces `atom`'s own
+            // terms. Take that arm's decisions directly rather than delegating
+            // to the unbound case above, which answers a different question:
+            // it neither checks whether the positive atom is still achievable
+            // nor reads the value out of the same table.
+            Some(_) if atom.ground() => {
+                // The same lookup answers both of that arm's uses of it: what
+                // `positive_value_for` returns for a ground atom, and the value
+                // it reads back once the negation table admits the atom.
+                let positive = self.heuristic_value_atom(atom, 0, None);
+                if !positive.zero() {
+                    return HeuristicValue::ZERO;
+                }
+                if self.negation_values.contains_key(atom) {
+                    positive
+                } else if self.init_atoms.contains(atom) {
+                    HeuristicValue::INFINITE
+                } else {
                     HeuristicValue::ZERO_COST_UNIT_WORK
                 }
             }
