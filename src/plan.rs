@@ -1463,6 +1463,12 @@ pub fn link_threats(
                 continue;
             }
             for e in s.action.effects.iter() {
+                // Cheapest test first: it reads the effect literal alone, and
+                // rules out most effects before the second `Rc` hop into the
+                // link condition and the unification below.
+                if !e.literal.may_affect(&link.condition) {
+                    continue;
+                }
                 if e.link_condition.contradiction() {
                     continue;
                 }
@@ -1514,6 +1520,10 @@ pub fn step_threats(
                 continue;
             }
             for e in step.action.effects.iter() {
+                // See `link_threats`.
+                if !e.literal.may_affect(&l.condition) {
+                    continue;
+                }
                 if e.link_condition.contradiction() {
                     continue;
                 }
