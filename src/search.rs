@@ -458,11 +458,22 @@ impl<'a> SearchContext<'a> {
         }
     }
 
-    /// Accumulates one heuristic (rank) evaluation into the search stats.
-    pub(crate) fn record_h_eval(&self, elapsed: std::time::Duration) {
+    /// Reads the clock, but only when `h_eval_ms` will be reported. See
+    /// [`Parameters::time_h_evals`].
+    #[inline]
+    pub(crate) fn h_eval_start(&self) -> Option<Instant> {
+        self.params.time_h_evals.then(Instant::now)
+    }
+
+    /// Accumulates one heuristic (rank) evaluation into the search stats,
+    /// adding its duration when [`Self::h_eval_start`] took a reading.
+    #[inline]
+    pub(crate) fn record_h_eval(&self, started: Option<Instant>) {
         self.h_evals.set(self.h_evals.get() + 1);
-        self.h_eval_nanos
-            .set(self.h_eval_nanos.get() + elapsed.as_nanos());
+        if let Some(started) = started {
+            self.h_eval_nanos
+                .set(self.h_eval_nanos.get() + started.elapsed().as_nanos());
+        }
     }
 
     /// Registers a step's action for variable-type lookups.

@@ -75,20 +75,30 @@ for mode in $MODES; do
     prob="$EX/${c##*:}"
     [ -f "$dom" ] && [ -f "$prob" ] || { echo "skip (missing): $c" >&2; continue; }
 
-    best=""; worst=""; gen="-"; vis="-"; row=""
+    # Node counts come from one extra run under POTOROO_STATS_JSON. The timed
+    # runs below deliberately leave it unset: requesting telemetry turns on
+    # per-evaluation heuristic timing, and timing a configuration nobody runs by
+    # default would report a number no user sees. The planner's own `Time:` line
+    # is the same search timer the STATS row reports.
+    row=$(
+      ulimit -v $((MEM_MB * 1024)) 2>/dev/null
+      POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" $mode "$dom" "$prob" 2>&1 >/dev/null \
+        | grep '^STATS ' | head -1
+    )
+    gen=$(printf '%s' "$row" | grep -o '"nodes_generated":[0-9]*' | cut -d: -f2)
+    vis=$(printf '%s' "$row" | grep -o '"nodes_visited":[0-9]*' | cut -d: -f2)
+    : "${gen:=-}" "${vis:=-}"
+
+    best=""; worst=""
     for _ in $(seq "$REPS"); do
       # The cap is on address space, applied in a subshell so it never leaks
       # into the rest of this script.
-      out=$(
+      ms=$(
         ulimit -v $((MEM_MB * 1024)) 2>/dev/null
-        POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" $mode "$dom" "$prob" 2>&1 >/dev/null \
-          | grep '^STATS ' | head -1
+        timeout "$TIMEOUT" "$BIN" $mode "$dom" "$prob" 2>/dev/null \
+          | sed -n 's/^Time: //p' | head -1
       )
-      [ -z "$out" ] && { best="FAIL"; break; }
-      row="$out"
-      ms=$(printf '%s' "$out" | grep -o '"wall_ms":[0-9]*' | cut -d: -f2)
-      gen=$(printf '%s' "$out" | grep -o '"nodes_generated":[0-9]*' | cut -d: -f2)
-      vis=$(printf '%s' "$out" | grep -o '"nodes_visited":[0-9]*' | cut -d: -f2)
+      [ -z "$ms" ] && { best="FAIL"; break; }
       [ -z "$best" ] && { best="$ms"; worst="$ms"; }
       [ "$ms" -lt "$best" ] && best="$ms"
       [ "$ms" -gt "$worst" ] && worst="$ms"

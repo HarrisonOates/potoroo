@@ -70,6 +70,12 @@ pub struct Parameters {
     /// Whether to plan with fully ground actions. Ground instantiation is
     /// performed up front; the binding interface is otherwise identical.
     pub ground_actions: bool,
+    /// Whether to time each heuristic evaluation, for the `h_eval_ms`
+    /// telemetry. Two clock reads per generated node is a measurable share of
+    /// search on the ground representations (2.4% of the FDR profile on
+    /// simple-grid2), so a run that will not report the figure does not pay for
+    /// it. `h_evals` is counted either way; only the timing is conditional.
+    pub time_h_evals: bool,
 }
 
 impl Default for Parameters {
@@ -84,6 +90,7 @@ impl Default for Parameters {
             ],
             search_limits: vec![usize::MAX],
             ground_actions: false,
+            time_h_evals: false,
         }
     }
 }
