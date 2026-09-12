@@ -1,6 +1,6 @@
 //! PDDL predicates and the predicate table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::types::Type;
 
@@ -13,9 +13,12 @@ pub struct Predicate(pub u32);
 pub struct PredicateTable {
     names: Vec<String>,
     parameters: Vec<Vec<Type>>,
-    /// Predicates that never appear in an effect; every predicate starts static
-    /// until [`make_dynamic`](Self::make_dynamic).
-    dynamic: HashSet<Predicate>,
+    /// Whether each predicate appears in some effect, indexed by predicate id.
+    /// Every predicate starts static until [`make_dynamic`](Self::make_dynamic).
+    /// Dense rather than a set because `is_static` is asked per open condition
+    /// by the flaw order and per atom by the planning graph, and a `Predicate`
+    /// is already an index into `names`.
+    dynamic: Vec<bool>,
     by_name: HashMap<String, Predicate>,
 }
 
@@ -32,6 +35,7 @@ impl PredicateTable {
         let p = Predicate(self.names.len() as u32);
         self.names.push(name.to_string());
         self.parameters.push(Vec::new());
+        self.dynamic.push(false);
         self.by_name.insert(name.to_string(), p);
         p
     }
@@ -42,11 +46,16 @@ impl PredicateTable {
 
     /// Marks a predicate as dynamic (appearing in some effect).
     pub fn make_dynamic(&mut self, p: Predicate) {
-        self.dynamic.insert(p);
+        let idx = p.0 as usize;
+        if idx >= self.dynamic.len() {
+            self.dynamic.resize(idx + 1, false);
+        }
+        self.dynamic[idx] = true;
     }
 
+    #[inline]
     pub fn is_static(&self, p: Predicate) -> bool {
-        !self.dynamic.contains(&p)
+        !self.dynamic.get(p.0 as usize).copied().unwrap_or(false)
     }
 
     pub fn name(&self, p: Predicate) -> &str {
