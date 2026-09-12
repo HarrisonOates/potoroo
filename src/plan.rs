@@ -66,12 +66,18 @@ impl PartialEq for Step {
 }
 
 /// A causal link `from_id --condition--> to_id`.
+///
+/// The condition is shared rather than owned because a `Link` is copied far
+/// more often than it is created: every threat against it holds one, and
+/// removing a resolved threat from the chain clones each `Unsafe` ahead of it.
+/// Owning the literal made each of those copies allocate the condition atom's
+/// term vector.
 #[derive(Debug, Clone)]
 pub struct Link {
     pub from_id: usize,
     pub effect_time: StepTime,
     pub to_id: usize,
-    pub condition: Literal,
+    pub condition: Rc<Literal>,
     pub condition_time: FormulaTime,
 }
 
@@ -755,7 +761,7 @@ impl Plan {
                     from_id: INIT_ID,
                     effect_time: StepTime::AtEnd,
                     to_id: open_cond.step_id,
-                    condition: open_cond.literal().unwrap(),
+                    condition: Rc::new(open_cond.literal().unwrap()),
                     condition_time: open_cond.when,
                 };
                 let new_links = chain::cons(link, self.links.clone());
@@ -893,7 +899,7 @@ impl Plan {
             from_id: step.id,
             effect_time: StepTime::AtEnd,
             to_id: open_cond.step_id,
-            condition: open_cond.literal().unwrap(),
+            condition: Rc::new(open_cond.literal().unwrap()),
             condition_time: open_cond.when,
         };
         // Cons first, then borrow the link back out of the node just built.
