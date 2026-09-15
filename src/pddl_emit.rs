@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::rc::Rc;
 
-use crate::action::ActionSchema;
+use crate::action::{ActionSchema, CostSpec};
 use crate::domain::Domain;
 use crate::effect::Effect;
 use crate::formula::{Atom, Formula, Literal};
@@ -101,8 +101,20 @@ fn emit_domain(domain: &Domain) -> String {
     }
     let _ = writeln!(out, "  )");
 
-    if requirements.action_costs {
-        let _ = writeln!(out, "  (:functions (total-cost) - number)");
+    if requirements.action_costs && !domain.functions.is_empty() {
+        // Every declared function, not just `total-cost`: a parameterised cost
+        // function must reach the translator with its signature intact, or the
+        // ground costs it computes will not match this task's.
+        let _ = writeln!(out, "  (:functions");
+        for index in 0..domain.functions.len() {
+            let function = crate::functions::Function(index as u32);
+            let _ = write!(out, "    ({}", domain.functions.name(function));
+            for (parameter, ty) in domain.functions.parameters(function).iter().enumerate() {
+                let _ = write!(out, " ?p{parameter} - {}", render_type(&domain.types, *ty));
+            }
+            let _ = writeln!(out, ") - number");
+        }
+        let _ = writeln!(out, "  )");
     }
 
     for action in &domain.actions {
@@ -156,7 +168,51 @@ fn emit_action(out: &mut String, domain: &Domain, action: &ActionSchema) {
         );
     }
     if domain.requirements.action_costs {
-        let _ = write!(out, " (increase (total-cost) {})", action.cost);
+        // The schema's `cost` may be a lower bound over instances, so emit the
+        // declared terms instead and let the translator ground each one.
+        if action.cost_base > 0 || action.cost_specs.is_empty() {
+            let _ = write!(out, " (increase (total-cost) {})", action.cost_base);
+        }
+        for spec in &action.cost_specs {
+            let _ = write!(
+                out,
+                " (increase (total-cost) {})",
+                render_cost_spec(spec, domain)
+            );
+        }
+        for conditional in &action.conditional_costs {
+            let guard = render_formula(
+                &conditional.condition,
+                &domain.predicates,
+                &action.var_types,
+                &domain.types,
+                &domain.constants,
+                None,
+            );
+            let increase = format!(
+                "(increase (total-cost) {})",
+                render_cost_spec(&conditional.spec, domain)
+            );
+            let body = if conditional.parameters.is_empty() {
+                format!("(when {guard} {increase})")
+            } else {
+                let mut vars = String::new();
+                for (index, parameter) in conditional.parameters.iter().enumerate() {
+                    if index > 0 {
+                        vars.push(' ');
+                    }
+                    let ty = action.var_types[parameter.0 as usize];
+                    let _ = write!(
+                        vars,
+                        "?v{} - {}",
+                        parameter.0,
+                        render_type(&domain.types, ty)
+                    );
+                }
+                format!("(forall ({vars}) (when {guard} {increase}))")
+            };
+            let _ = write!(out, " {body}");
+        }
     }
     let _ = writeln!(out, ")");
     let _ = writeln!(out, "  )");
@@ -194,6 +250,17 @@ fn emit_problem(domain: &Domain, problem: &Problem) -> String {
     }
     if domain.requirements.action_costs {
         let _ = write!(out, " (= (total-cost) 0)");
+        for (fluent, value) in &problem.init_values {
+            let mut application = String::from(domain.functions.name(fluent.function));
+            for term in &fluent.terms {
+                let _ = write!(
+                    application,
+                    " {}",
+                    render_term(*term, &problem.objects, Some(&domain.constants))
+                );
+            }
+            let _ = write!(out, " (= ({application}) {value})");
+        }
     }
     let _ = writeln!(out, ")");
     let _ = writeln!(
@@ -336,6 +403,20 @@ fn render_literal(
         Literal::Atom(atom) => render_atom(atom, predicates, objects, parent),
         Literal::Negation(atom) => {
             format!("(not {})", render_atom(atom, predicates, objects, parent))
+        }
+    }
+}
+
+/// Renders one `(increase (total-cost) ...)` right-hand side.
+fn render_cost_spec(spec: &CostSpec, domain: &Domain) -> String {
+    match spec {
+        CostSpec::Constant(n) => n.to_string(),
+        CostSpec::Fluent { function, terms } => {
+            let mut out = String::from(domain.functions.name(*function));
+            for term in terms {
+                let _ = write!(out, " {}", render_term(*term, &domain.constants, None));
+            }
+            format!("({out})")
         }
     }
 }

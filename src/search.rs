@@ -64,6 +64,10 @@ pub struct SearchContext<'a> {
     /// ground actions, cached initial-state fixpoint), built lazily on first use
     /// and reused across every search node. See `crate::sample_ff`.
     sample_ff_model: RefCell<Option<Rc<crate::sample_ff::SampleFfModel>>>,
+    /// Every ground cost-function value the problem's `:init` assigns, keyed by
+    /// the function and its arguments. Lets a ground instance be priced exactly
+    /// where the schema only carries a lower bound over instances.
+    pub(crate) cost_values: HashMap<(crate::functions::Function, Vec<Object>), f64>,
     /// Number of heuristic (rank) evaluations performed during search.
     pub(crate) h_evals: Cell<usize>,
     /// Total wall time spent in heuristic (rank) evaluations.
@@ -135,6 +139,7 @@ impl<'a> SearchContext<'a> {
             fresh_vars: RefCell::new(FastMap::default()),
             compile_base: RefCell::new(None),
             sample_ff_model: RefCell::new(None),
+            cost_values: crate::parser::lower::cost_function_values(problem),
             h_evals: Cell::new(0),
             h_eval_nanos: Cell::new(0),
             pruned: Cell::new(0),
@@ -287,7 +292,12 @@ impl<'a> SearchContext<'a> {
             arguments: tuple.to_vec(),
             precondition,
             effects,
-            cost: schema.cost,
+            // A ground instance knows its own cost arguments, so a
+            // parameterised cost resolves exactly here rather than staying at
+            // the schema's minimum-over-instances bound.
+            cost: schema
+                .instance_cost(tuple, &self.cost_values)
+                .unwrap_or(schema.cost),
             var_types: Vec::new(),
         }))
     }
@@ -1091,10 +1101,65 @@ fn plan_impl(
                 // Instantiate all actions if the plan is otherwise complete
                 // (lifted mode only).
                 if !ctx.params.ground_actions {
+                    let correct_costs = has_parameterised_costs(ctx);
                     loop {
                         match &current_plan {
                             Some(p) if p.complete() => match step_instantiation(ctx, p) {
                                 Some(inst) => {
+                                    // A step whose cost depends on its arguments
+                                    // was priced at the schema's lower bound when
+                                    // it was added. Now that instantiation has
+                                    // bound every argument the real cost is known;
+                                    // if it is higher this plan is worse than its
+                                    // `g` claimed, so requeue it at its true cost
+                                    // rather than return it as the best found.
+                                    let exact = if correct_costs {
+                                        exact_plan_cost(ctx, &inst)
+                                    } else {
+                                        inst.cost
+                                    };
+                                    if exact > inst.cost {
+                                        num_generated_plans += 1;
+                                        let corrected = Rc::new(Plan {
+                                            steps: inst.steps.clone(),
+                                            num_steps: inst.num_steps,
+                                            cost: exact,
+                                            links: inst.links.clone(),
+                                            num_links: inst.num_links,
+                                            orderings: inst.orderings.clone(),
+                                            bindings: inst.bindings.clone(),
+                                            unsafes: inst.unsafes.clone(),
+                                            num_unsafes: inst.num_unsafes,
+                                            open_conds: inst.open_conds.clone(),
+                                            num_open_conds: inst.num_open_conds,
+                                            id: std::cell::Cell::new(num_generated_plans),
+                                        });
+                                        let rank = corrected.rank(ctx);
+                                        if rank[0].is_finite() {
+                                            queues[current_flaw_order].push(QueuedPlan {
+                                                plan: corrected,
+                                                rank,
+                                                is_lazy: false,
+                                            });
+                                        }
+                                        (current_plan, current_rank0) = pop_next(
+                                            &mut queues[current_flaw_order],
+                                            if is_dual || is_alt {
+                                                Some(&mut secondary_queues[current_flaw_order])
+                                            } else {
+                                                None
+                                            },
+                                            &expanded_ids,
+                                            ctx,
+                                            is_lazy,
+                                            is_gbfs,
+                                            is_dual,
+                                            is_alt,
+                                            &mut boost_budget,
+                                            &mut expand_count,
+                                        );
+                                        continue;
+                                    }
                                     current_plan = Some(inst);
                                     break;
                                 }
@@ -1179,6 +1244,70 @@ fn plan_impl(
         _ => Outcome::NoSolution,
     };
     (outcome, search_stats)
+}
+
+/// The plan's cost with every parameterised step priced by the objects its
+/// parameters are actually bound to, rather than by the schema's
+/// minimum-over-instances bound.
+///
+/// A lifted step is added to a plan before its arguments are fully bound, so a
+/// cost that depends on those arguments can only be bounded from below at that
+/// point. Once the plan is complete and instantiated every argument is known,
+/// and this recovers the real cost.
+fn exact_plan_cost(ctx: &SearchContext, plan: &Plan) -> usize {
+    let mut total: usize = 0;
+    for step in chain::iter(&plan.steps) {
+        if step.id == INIT_ID || step.id == GOAL_ID {
+            continue;
+        }
+        total = total.saturating_add(exact_step_cost(ctx, plan, step));
+    }
+    total
+}
+
+/// One step's cost, resolved through the plan's bindings where the schema's
+/// number is only a bound. Falls back to the recorded cost whenever the step is
+/// already ground, the schema has no parameterised cost, or a parameter is
+/// still unbound.
+fn exact_step_cost(ctx: &SearchContext, plan: &Plan, step: &crate::plan::Step) -> usize {
+    let recorded = ctx.action_cost(&step.action);
+    if !step.action.arguments.is_empty() || step.action.parameters.is_empty() {
+        return recorded;
+    }
+    let Some(schema) = ctx.domain.find_action(&step.action.name) else {
+        return recorded;
+    };
+    if schema.cost_specs.iter().all(|s| s.is_argument_free()) {
+        return recorded;
+    }
+    let mut arguments = Vec::with_capacity(step.action.parameters.len());
+    for &v in &step.action.parameters {
+        match plan.bindings.binding(Term::Variable(v), step.id) {
+            Term::Object(o) => arguments.push(o),
+            Term::Variable(_) => return recorded,
+        }
+    }
+    match schema.instance_cost(&arguments, &ctx.cost_values) {
+        Some(exact) => {
+            if ctx.problem.metric == Some(Metric::MinimizeTotalCost) {
+                ctx.params.action_cost.resolve(exact)
+            } else {
+                recorded
+            }
+        }
+        None => recorded,
+    }
+}
+
+/// Whether any schema prices an action by a function of its parameters, so a
+/// complete plan's cost has to be recomputed once its steps are bound.
+fn has_parameterised_costs(ctx: &SearchContext) -> bool {
+    ctx.problem.metric == Some(Metric::MinimizeTotalCost)
+        && ctx
+            .domain
+            .actions
+            .iter()
+            .any(|a| a.cost_specs.iter().any(|s| !s.is_argument_free()))
 }
 
 /// Returns a fully-instantiated copy of a complete plan, or `None` if its steps

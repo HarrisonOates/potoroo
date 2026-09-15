@@ -20,7 +20,7 @@ use pddl::{
     Problem as PddlProblem, Requirement, Term as PddlTerm, Type as PddlType, TypedList,
 };
 
-use crate::action::ActionSchema;
+use crate::action::{ActionSchema, ConditionalCost, CostSpec};
 use crate::domain::Domain;
 use crate::effect::{Effect, EffectTime};
 use crate::formula::{Atom, Formula, Literal};
@@ -399,16 +399,20 @@ fn lower_primitive_effect(
 #[derive(Debug, Default)]
 struct CostAcc {
     constant: usize,
-    /// Names of nullary cost functions, in occurrence order. Resolved against
-    /// the domain's [`FunctionTable`] once the effect walk is done.
-    functions: Vec<String>,
+    /// Cost function applications, in occurrence order. Resolved against the
+    /// domain's [`FunctionTable`] once the effect walk is done.
+    functions: Vec<(String, Vec<Term>)>,
+    /// Increases nested in a `when`/`forall`, with the guard that fires them.
+    conditional: Vec<(Vec<Variable>, Rc<Formula>, CostTerm)>,
 }
 
 /// One recognized `(increase (total-cost) ...)` right-hand side.
+#[derive(Debug)]
 enum CostTerm {
     Constant(usize),
-    /// A nullary function whose value comes from the problem's `:init`.
-    Function(String),
+    /// A function whose value comes from the problem's `:init`. `terms` is
+    /// empty for `(f)` and holds the applied terms for `(f ?a ?b)`.
+    Function(String, Vec<Term>),
 }
 
 /// Recognizes the restricted numeric effect admitted by `:action-costs`:
@@ -417,7 +421,9 @@ enum CostTerm {
 fn lower_action_cost_effect(
     pe: &PrimitiveEffect,
     enabled: bool,
-    unconditional: bool,
+    scope: &VarScope,
+    consts: &TermTable,
+    objects: Option<&TermTable>,
 ) -> Result<Option<CostTerm>, LowerError> {
     let PrimitiveEffect::AssignNumericFluent(op, head, expression) = pe else {
         return Ok(None);
@@ -441,28 +447,24 @@ fn lower_action_cost_effect(
             "only the nullary `total-cost` fluent is supported".to_string(),
         ));
     }
-    if !unconditional {
-        return Err(LowerError::ActionCost(
-            "total-cost increases must be unconditional and unquantified".to_string(),
-        ));
-    }
     let number = match expression {
         FluentExpression::Number(number) => **number,
-        // `(increase (total-cost) (f))`. Only nullary `f` is supported: the
-        // cost of a lifted schema is a single number, so a function of the
-        // action's parameters would have to be resolved per ground action.
+        // `(increase (total-cost) (f))` or `(increase (total-cost) (f ?a ?b))`.
+        // The applied terms are kept in the schema's scope and resolved per
+        // ground instance; a lifted step whose arguments are still unbound is
+        // priced at the minimum over instances.
         FluentExpression::Function(head) => {
-            let (symbol, nullary) = match head {
-                FunctionHead::Simple(symbol) => (symbol, true),
-                FunctionHead::WithTerms(symbol, terms) => (symbol, terms.is_empty()),
+            let (symbol, terms) = match head {
+                FunctionHead::Simple(symbol) => (symbol, Vec::new()),
+                FunctionHead::WithTerms(symbol, terms) => {
+                    let mut lowered = Vec::with_capacity(terms.len());
+                    for term in terms.iter() {
+                        lowered.push(lower_term(term, scope, consts, objects)?);
+                    }
+                    (symbol, lowered)
+                }
             };
-            if !nullary {
-                return Err(LowerError::ActionCost(format!(
-                    "cost function `{}` takes arguments; only nullary cost functions are supported",
-                    s(symbol)
-                )));
-            }
-            return Ok(Some(CostTerm::Function(s(symbol).to_string())));
+            return Ok(Some(CostTerm::Function(s(symbol).to_string(), terms)));
         }
         _ => {
             return Err(LowerError::ActionCost(
@@ -502,18 +504,22 @@ fn lower_effect_item(
     action_costs: bool,
     cost: &mut CostAcc,
 ) -> Result<(), LowerError> {
-    if let Some(term) = lower_action_cost_effect(
-        pe,
-        action_costs,
-        parameters.is_empty() && condition.tautology(),
-    )? {
+    if let Some(term) = lower_action_cost_effect(pe, action_costs, scope, consts, objects)? {
+        // A guarded increase fires only in states where its condition holds,
+        // which a partial order does not fix; it is recorded and priced at zero
+        // rather than folded into the schema's cost.
+        if !parameters.is_empty() || !condition.tautology() {
+            cost.conditional
+                .push((parameters.to_vec(), condition.clone(), term));
+            return Ok(());
+        }
         match term {
             CostTerm::Constant(increase) => {
                 cost.constant = cost.constant.checked_add(increase).ok_or_else(|| {
                     LowerError::ActionCost("action cost overflows usize".to_string())
                 })?;
             }
-            CostTerm::Function(name) => cost.functions.push(name),
+            CostTerm::Function(name, terms) => cost.functions.push((name, terms)),
         }
         return Ok(());
     }
@@ -673,7 +679,7 @@ fn lower_preconditions(
 /// Lowers a parsed PDDL domain into the owned [`Domain`] model.
 pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
     // 1. Requirements.
-    let requirements = lower_requirements(d.requirements());
+    let mut requirements = lower_requirements(d.requirements());
     requirements.reject_deferred()?;
 
     // 2. Types (+ supertypes).
@@ -703,6 +709,16 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             let ty = lower_type(&mut types, entry.type_())?;
             functions.add_parameter(f, ty);
         }
+    }
+    // Declaring `(total-cost)` is what actually makes a domain an action-cost
+    // domain. Several IPC domains (floortile, for one) declare the function and
+    // use `(increase (total-cost) N)` without listing `:action-costs`, and Fast
+    // Downward accepts them; gating on the flag alone turned them away.
+    if functions
+        .find_function("total-cost")
+        .is_some_and(|f| functions.parameters(f).is_empty())
+    {
+        requirements.action_costs = true;
     }
 
     // 6. Action schemas.
@@ -739,6 +755,7 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             let mut cost = CostAcc {
                 constant: if requirements.action_costs { 0 } else { 1 },
                 functions: Vec::new(),
+                conditional: Vec::new(),
             };
             if let Some(effs) = action.effect() {
                 let no_params: Vec<Variable> = Vec::new();
@@ -766,12 +783,32 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
 
         // Cost functions are named in `:functions`, which is lowered above, so
         // an unknown name here is a malformed domain rather than a deferral.
-        let mut cost_functions = Vec::with_capacity(cost.functions.len());
-        for name in &cost.functions {
-            let f = functions.find_function(name).ok_or_else(|| {
-                LowerError::ActionCost(format!("undeclared cost function `{name}`"))
-            })?;
-            cost_functions.push(f);
+        let resolve_cost_function = |name: &str| -> Result<crate::functions::Function, LowerError> {
+            functions
+                .find_function(name)
+                .ok_or_else(|| LowerError::ActionCost(format!("undeclared cost function `{name}`")))
+        };
+        let mut cost_specs = Vec::with_capacity(cost.functions.len());
+        for (name, terms) in &cost.functions {
+            cost_specs.push(CostSpec::Fluent {
+                function: resolve_cost_function(name)?,
+                terms: terms.clone(),
+            });
+        }
+        let mut conditional_costs = Vec::with_capacity(cost.conditional.len());
+        for (parameters, condition, term) in &cost.conditional {
+            let spec = match term {
+                CostTerm::Constant(n) => CostSpec::Constant(*n),
+                CostTerm::Function(name, terms) => CostSpec::Fluent {
+                    function: resolve_cost_function(name)?,
+                    terms: terms.clone(),
+                },
+            };
+            conditional_costs.push(ConditionalCost {
+                parameters: parameters.clone(),
+                condition: condition.clone(),
+                spec,
+            });
         }
 
         let schema = ActionSchema {
@@ -786,7 +823,8 @@ pub fn lower_domain(d: &PddlDomain) -> Result<Domain, LowerError> {
             // Unresolved until `bind_action_costs` runs against a problem.
             cost: cost.constant,
             cost_base: cost.constant,
-            cost_functions,
+            cost_specs,
+            conditional_costs,
         };
         actions_by_name.insert(name, id);
         actions.push(schema);
@@ -974,18 +1012,21 @@ fn lower_init_element(
             }
             Ok(())
         }
-        // `(= (f) N)` for a nullary `f`: recorded for every declared function,
-        // whether or not a cost effect names it; `bind_action_costs` filters.
-        InitElement::IsValue(term, value) if action_costs && term.names().is_empty() => {
+        // `(= (f a b) N)`: recorded for every declared function, whether or not
+        // a cost effect names it; `bind_action_costs` filters. Arguments are
+        // ground object names, which is how IPC cost domains give a
+        // parameterised cost function its values (`(= (road-length a b) 22)`).
+        InitElement::IsValue(term, value) if action_costs => {
             let name = s(term.symbol());
             let function = functions
                 .find_function(name)
                 .ok_or_else(|| LowerError::ActionCost(format!("undeclared function `{name}`")))?;
+            let mut terms = Vec::with_capacity(term.names().len());
+            for n in term.names() {
+                terms.push(Term::Object(resolve_object(n.as_ref(), consts, objects)?));
+            }
             values.push((
-                crate::expressions::Fluent {
-                    function,
-                    terms: Vec::new(),
-                },
+                crate::expressions::Fluent { function, terms },
                 **value as f64,
             ));
             Ok(())
@@ -997,34 +1038,117 @@ fn lower_init_element(
 }
 
 /// Resolves each schema's [`ActionSchema::cost`] to `cost_base` plus the value
-/// of every cost function it names, read from `problem`'s `:init`. Call once
-/// per problem before planning; recomputes from `cost_base` each time, so it's
-/// safe to re-run when one domain serves several problems.
+/// of every cost term it names, read from `problem`'s `:init`. Call once per
+/// problem before planning; recomputes from `cost_base` each time, so it's safe
+/// to re-run when one domain serves several problems.
+///
+/// A term applied to the action's parameters — the IPC form `(increase
+/// (total-cost) (road-length ?a ?b))` — has no single value at the schema
+/// level, so the schema takes the **minimum over the instances its parameter
+/// types admit**. That is a lower bound on any ground instance's cost, which
+/// keeps a lifted plan's `g` admissible; grounding resolves the exact value per
+/// instance through [`ActionSchema::instance_cost`].
 pub fn bind_action_costs(domain: &mut Domain, problem: &Problem) -> Result<(), LowerError> {
-    // Later assignments win, matching `:init` being read in order.
-    let mut values: HashMap<crate::functions::Function, f64> = HashMap::new();
-    for (fluent, value) in &problem.init_values {
-        if fluent.terms.is_empty() {
-            values.insert(fluent.function, *value);
-        }
-    }
+    let values = cost_function_values(problem);
+    let Domain {
+        actions,
+        functions,
+        types,
+        constants,
+        ..
+    } = domain;
 
-    for schema in &mut domain.actions {
+    for schema in actions.iter_mut() {
         let mut cost = schema.cost_base;
-        for &f in &schema.cost_functions {
-            let name = domain.functions.name(f);
-            let value = values.get(&f).copied().ok_or_else(|| {
-                LowerError::ActionCost(format!(
-                    "cost function `{name}` has no value in the problem's `:init`"
-                ))
-            })?;
-            cost = cost.checked_add(cost_value(value as f32)?).ok_or_else(|| {
-                LowerError::ActionCost("action cost overflows usize".to_string())
-            })?;
+        for spec in &schema.cost_specs {
+            let add = match spec {
+                CostSpec::Constant(n) => *n,
+                CostSpec::Fluent { function, terms } => {
+                    let value = if terms.is_empty() {
+                        values.get(&(*function, Vec::new())).copied()
+                    } else {
+                        minimum_instance_value(
+                            *function,
+                            terms,
+                            &schema.var_types,
+                            &values,
+                            types,
+                            constants,
+                            &problem.objects,
+                        )
+                    };
+                    let name = functions.name(*function);
+                    let value = value.ok_or_else(|| {
+                        LowerError::ActionCost(format!(
+                            "cost function `{name}` has no value in the problem's `:init`"
+                        ))
+                    })?;
+                    cost_value(value as f32)?
+                }
+            };
+            cost = cost
+                .checked_add(add)
+                .ok_or_else(|| LowerError::ActionCost("action cost overflows usize".to_string()))?;
         }
         schema.cost = cost;
     }
     Ok(())
+}
+
+/// Every ground cost-function value the problem's `:init` assigns, keyed by the
+/// function and its object arguments. Later assignments win, matching `:init`
+/// being read in order.
+pub fn cost_function_values(
+    problem: &Problem,
+) -> HashMap<(crate::functions::Function, Vec<Object>), f64> {
+    let mut values = HashMap::new();
+    for (fluent, value) in &problem.init_values {
+        let mut arguments = Vec::with_capacity(fluent.terms.len());
+        for term in &fluent.terms {
+            match term {
+                Term::Object(o) => arguments.push(*o),
+                // A variable cannot appear in `:init`; skip rather than panic.
+                Term::Variable(_) => return values,
+            }
+        }
+        values.insert((fluent.function, arguments), *value);
+    }
+    values
+}
+
+/// The smallest value `function` takes over the argument tuples this term list
+/// admits: object terms must match exactly, and a variable term admits any
+/// object whose type is compatible with the variable's.
+#[allow(clippy::too_many_arguments)]
+fn minimum_instance_value(
+    function: crate::functions::Function,
+    terms: &[Term],
+    var_types: &[Type],
+    values: &HashMap<(crate::functions::Function, Vec<Object>), f64>,
+    types: &Types,
+    constants: &TermTable,
+    objects: &TermTable,
+) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for ((f, arguments), value) in values {
+        if *f != function || arguments.len() != terms.len() {
+            continue;
+        }
+        let admits = terms
+            .iter()
+            .zip(arguments)
+            .all(|(term, &object)| match term {
+                Term::Object(o) => *o == object,
+                Term::Variable(v) => match var_types.get(v.0 as usize) {
+                    Some(&ty) => types.compatible(objects.object_type(Some(constants), object), ty),
+                    None => true,
+                },
+            });
+        if admits && best.is_none_or(|b| *value < b) {
+            best = Some(*value);
+        }
+    }
+    best
 }
 
 /// Resolves a ground object name against problem objects then domain constants.
