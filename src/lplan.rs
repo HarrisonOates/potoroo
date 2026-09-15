@@ -30,7 +30,10 @@
 //! falls back to the open-condition count.
 
 use good_lp::constraint::{eq, geq, leq};
-use good_lp::solvers::microlp::microlp;
+#[cfg(feature = "highs-lp")]
+use good_lp::solvers::highs::highs as lp_solver;
+#[cfg(not(feature = "highs-lp"))]
+use good_lp::solvers::microlp::microlp as lp_solver;
 use good_lp::{Expression, ProblemVariables, ResolutionError, SolverModel, Variable};
 
 use crate::plan::Plan;
@@ -234,7 +237,12 @@ fn solve_horizon(task: &GroundTask, l: usize) -> bool {
         }
     }
 
-    let model = vars.minimise(obj).using(microlp).with_all(cons);
+    let model = vars.minimise(obj).using(lp_solver).with_all(cons);
+    // Use one HiGHS worker for these small LPs; retain presolve.
+    #[cfg(feature = "highs-lp")]
+    let model = model
+        .set_parallel(good_lp::solvers::highs::HighsParallelType::Off)
+        .set_threads(1);
     match model.solve() {
         Ok(_) => true,
         Err(ResolutionError::Infeasible) => false,
