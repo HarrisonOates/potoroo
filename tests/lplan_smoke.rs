@@ -51,9 +51,11 @@ fn lplan_gripper_initial_eval() {
 }
 
 /// End-to-end: the LPLAN heuristic drives the search to a valid optimal solution.
-/// `#[ignore]`d because the per-node LP cost makes this ~30s (the heuristic is
-/// deliberately expensive — Bylander's own planner needed ~1s/node). Run with
-/// `cargo test --test lplan_smoke -- --ignored`.
+/// `#[ignore]`d because the per-node LP cost makes this ~22s under the default
+/// microlp backend (the heuristic is deliberately expensive — Bylander's own
+/// planner needed ~1s/node). Run with
+/// `cargo test --test lplan_smoke -- --ignored`, or add `--features highs-lp`,
+/// under which the same test takes 0.7s.
 #[test]
 #[ignore = "slow: ~30s of LP solving"]
 fn lplan_sussman_solves_valid_optimal() {

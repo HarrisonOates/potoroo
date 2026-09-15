@@ -13,6 +13,13 @@ path = "src/bin/potoroo.rs"
 name = "potoroo"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Solve the Lplan LP with HiGHS instead of the pure-Rust microlp. HiGHS is a C++
+# library built from source, so this is off by default: the core stays buildable
+# with no system dependencies.
+highs-lp = ["good_lp/highs"]
+
 [dependencies]
 pddl = "0.2"
 # Only for rendering `pddl`'s parse failures with a line and column: its
