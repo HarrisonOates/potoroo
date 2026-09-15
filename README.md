@@ -11,12 +11,12 @@ The name comes from the [potoroo](https://en.wikipedia.org/wiki/Potoroo), a smal
 
 ## Features
 
-- **Full POCL search** with lifted and grounded action modes
-- **Reachability-based grounder** via Fast Downward's translator when in ground mode (`-g`), with fallback to naive instantiation
-- **PDDL action costs** end-to-end in lifted and finite-domain search
+- **Full POCL search** with lifted, ground, and finite-domain representations
 - **All historical heuristics** discussed in the position paper by Howsam, Oates and Bercher (HSDIP 2026)
-- **Flaw-selection DSL** with all orders from the VHPOP and UCPOP literature
+- **Flaw-selection DSL** covering every order from the VHPOP and UCPOP literature
 - **Composable heuristics** — combine any two with `/`
+- **PDDL action costs** end-to-end, including cost functions of an action's parameters
+- **Reachability-based grounding** via Fast Downward's translator, with a naive fallback
 - Pure Rust, no C/C++ build-time dependencies (Fast Downward is optional at runtime)
 
 ---
@@ -39,18 +39,26 @@ The binary is at `target/release/potoroo`.
 cargo test
 ```
 
-Most tests run without Fast Downward. Tests that require FD are skipped automatically if it is not available.
+Most tests run without Fast Downward. Tests that require it are skipped automatically if it is not available.
+
+### Optional features
+
+| Feature | Effect |
+|---------|--------|
+| `highs-lp` | Solve the `LPLAN` LP with [HiGHS](https://highs.dev) instead of the pure-Rust `microlp`. Roughly 5× faster per evaluation, and turns some timeouts into solutions. HiGHS is a C++ library built from source, so this needs `cmake` and a C++ compiler; off by default so the core stays buildable with no system dependencies. |
+
+```bash
+cargo build --release --features highs-lp
+```
 
 ---
 
 ## Fast Downward (optional)
 
-Fast Downward is required for the `COMPILE*` family of heuristics and for efficient grounding. All other heuristics work without it.
-
-**Install Fast Downward:**
+Fast Downward is required for the `COMPILE*` heuristics, for `--fdr-pocl`, and for
+reachability-based grounding. Everything else works without it.
 
 ```bash
-# Clone and build
 git clone https://github.com/aibasel/downward.git
 cd downward
 python build.py
@@ -65,13 +73,13 @@ export PATH="/path/to/downward:$PATH"
 # Option 2: set the environment variable
 export POTOROO_FD=/path/to/downward/fast-downward.py
 
-# Option 3 (ground-mode COMPILE* only): point directly at the C++ binary
-# for maximum speed (skips the Python translator, ~10× faster per node)
+# Option 3 (ground-mode COMPILE* only): point directly at the C++ binary,
+# which skips the Python translator and is ~10× faster per node
 export POTOROO_DOWNWARD=/path/to/downward/builds/release/bin/downward
 ```
 
-For a checkout at `./downward`, a project-local `.cargo/config.toml` can make
-both paths automatic for every `cargo run` and `cargo test`:
+For a checkout at `./downward`, a project-local `.cargo/config.toml` can make both
+paths automatic for every `cargo run` and `cargo test`:
 
 ```toml
 [env]
@@ -79,8 +87,196 @@ POTOROO_FD = { value = "downward/fast-downward.py", relative = true }
 POTOROO_DOWNWARD = { value = "downward/builds/release/bin/downward", relative = true }
 ```
 
-The local config is gitignored, so machine-specific planner paths do not leak
-into commits. Explicit shell environment variables override these defaults.
+The local config is gitignored, so machine-specific paths do not leak into commits.
+Explicit shell environment variables override these defaults.
+
+---
+
+## Usage
+
+```
+potoroo [options] domain.pddl problem.pddl
+```
+
+Files may be given in either order — each is classified by its contents. A single
+file may hold both, and input can be piped on stdin instead.
+
+```bash
+# Default configuration: lifted POCL, A*, the ADD heuristic
+potoroo examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
+
+# Ground actions with the admissible Lplan LP heuristic
+potoroo -g -h LPLAN examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
+
+# Greedy best-first search, which is usually the fastest satisficing setting
+potoroo -s GBFS examples/gripper-domain.pddl examples/gripper-20.pddl
+
+# Compose two heuristics: rank by UCPOP, break ties by ADD
+potoroo -h "UCPOP/ADD" examples/gripper-domain.pddl examples/gripper-4.pddl
+
+# Finite-domain ground POCL over Fast Downward's SAS+ variables
+potoroo --fdr-pocl examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
+```
+
+---
+
+## Options reference
+
+| Flag | Long form | Argument | Description | Default |
+|------|-----------|----------|-------------|---------|
+| `-a` | `--action-cost` | `TASK`\|`UNIT`\|`DURATION`\|`RELATIVE` | Action cost model. `TASK` uses the PDDL `total-cost`; `UNIT` makes every action cost 1. `DURATION` and `RELATIVE` are accepted and fall back to `TASK`. | `TASK` |
+| `-f` | `--flaw-order` | ORDER | Flaw-selection order; see [Flaw-selection orders](#flaw-selection-orders). Repeatable, one per search tier. | `STATIC` |
+| `-g` | `--ground-actions` | — | Plan with fully ground actions. Required by `LPLAN`, `SAMPLE_FF` and `COMPILE*`. | lifted |
+| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic; see [Heuristics](#heuristics). | `ADD` |
+| `-l` | `--limit` | N \| `unlimited` | Cap on generated search nodes. Repeatable, one per `-f` tier. | `unlimited` |
+| `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm; see the table below. | `A` |
+| `-v` | `--verbose` | `[N]` | Live telemetry on stderr. Repeat for faster updates: `-vv` is 250 ms, `-vvv` prints every expansion. | off |
+| `-w` | `--weight` | W | Multiplier on the heuristic term of the rank. | `1.0` |
+| — | `--fdr-pocl` | — | Search over Fast Downward's multi-valued SAS+ variables; see [Representations](#representations). | off |
+| `-H` | `--help` | — | Print usage and exit. | |
+| `-V` | `--version` | — | Print version and exit. | |
+
+Accepted for VHPOP compatibility but inert: `-d`, `-S`, `-T`, `-t`, `-W`.
+`-r` (random open conditions) is rejected.
+
+### Search algorithms (`-s`)
+
+| Name | Description |
+|------|-------------|
+| `A` | Best-first A\* on `g + w × h`. Returns optimal-length plans with an admissible heuristic. **Default.** |
+| `IDA` | Iterative-deepening A\*, re-searching under a rising `f`-limit. |
+| `HC` | Hill climbing. |
+| `BFS` | Breadth-first search. |
+| `GBFS` | Greedy best-first: ranks on `h` alone. Usually much faster than `A` when any plan will do. |
+| `LGBFS` | Lazy GBFS — children are queued on the parent's estimate and re-ranked when popped. |
+| `LGBFS-D` | Lazy GBFS with a dual queue. |
+| `ALT` | LAMA-style 1:1 alternation between an A\*-ordered and a GBFS-ordered queue. |
+
+---
+
+## Heuristics
+
+Set with `-h NAME`. Two heuristics compose with `/` for lexicographic
+tie-breaking: `-h "UCPOP/ADD"` ranks by `UCPOP` and breaks ties with `ADD`.
+
+The **Needs** column gives the representation a heuristic requires: `—` means any,
+`-g` means ground actions, `--fdr-pocl` means the finite-domain representation, and
+`FD` means Fast Downward must be installed.
+
+### Structural
+
+No planning graph; `O(|plan|)` per node.
+
+| Name | Needs | Description |
+|------|-------|-------------|
+| `UCPOP` | — | `committed-cost + w × (open conditions + unsafe links)`, from the original UCPOP planner |
+| `OC` | — | Open-condition count |
+| `UC` | — | Unsafe-link (threat) count |
+| `BUC` | — | Binary unsafe count: 0 with no threats, 1 otherwise |
+| `LIFO` | — | Newest plan first |
+| `FIFO` | — | Oldest plan first |
+
+### Planning graph
+
+Built incrementally, Graphplan-style. Ground mode is not required but resolves more
+bindings and so gives sharper estimates.
+
+| Name | Needs | Description |
+|------|-------|-------------|
+| `ADD` | — | Additive heuristic: `committed-cost + w × h_add` over all open conditions. **Default.** |
+| `ADD_COST` | — | The `ADD` cost term alone, without the step count |
+| `ADD_WORK` | — | Operator count in the `ADD` relaxed plan |
+| `ADDR` | — | `ADD` with action reuse (VHPOP's `h^r_add`): only new operators count |
+| `ADDR_COST` | — | The `ADDR` cost term alone |
+| `ADDR_WORK` | — | Operator count in the `ADDR` relaxed plan |
+| `RELAX` | — | Delete-relaxed plan cost, FF-style joint extraction |
+| `RELAXR` | — | `RELAX` counting only operators not already in the plan |
+
+### Admissible
+
+| Name | Needs | Description |
+|------|-------|-------------|
+| `LPLAN` | `-g` | Bylander's (1997) LP relaxation over the causal-link compilation: the smallest horizon whose time-indexed LP is feasible. A lower bound on total completion length. Build with `--features highs-lp` for a much faster solver. |
+| `LMCUT` | `--fdr-pocl` | Joint LM-cut estimate for all open conditions, from the problem's initial state. Requires unconditional SAS+ effects. |
+| `LMCUTR` | `--fdr-pocl` | Reuse-aware LM-cut: effects of committed steps are free |
+
+### Delegating
+
+These evaluate a transformed task, so each node costs far more than a planning-graph
+evaluation.
+
+| Name | Needs | Description |
+|------|-------|-------------|
+| `SAMPLE_FF` | `-g` | Sample-FF (Bercher et al. 2013): committed steps stay unrelaxed, open conditions are filled by delete relaxation over `k` sampled linearisations. `k` defaults to 10. |
+| `SAMPLE_FF:k` | `-g` | As above with an explicit sample count, e.g. `SAMPLE_FF:5` |
+| `COMPILE_FF` | `-g`, FD | Compile the partial plan to a classical task (Bercher, Geier & Biundo 2013) and evaluate it with FD's `ff()`. The most useful of these in practice. |
+| `COMPILE_LMCUT` | `-g`, FD | As above with `lmcut()` — a tight admissible bound, slower |
+| `COMPILE_HMAX` | `-g`, FD | As above with `hmax()` |
+| `COMPILE_HADD` | `-g`, FD | As above with `add()` |
+| `COMPILE_BLIND` | `-g`, FD | As above with `blind()`, for baselines |
+| `COMPILE` | `-g`, FD | Alias for `COMPILE_FF` |
+
+`LMCUT`/`LMCUTR` are open-condition relaxations computed directly over finite-domain
+facts, and are distinct from `COMPILE_LMCUT`, which runs LM-cut on the compiled task.
+
+---
+
+## Flaw-selection orders
+
+Set with `-f`. The order decides which flaw the planner resolves at each step, and
+is a major factor in POCL search efficiency — it was studied extensively in the
+UCPOP and VHPOP literature.
+
+### Predefined
+
+| Name | Expansion | Description |
+|------|-----------|-------------|
+| `STATIC` | — | Static open conditions first, then LIFO for threats and the rest. **Default.** |
+| `UCPOP` | `{n,s}LIFO/{o}LIFO` | Threats LIFO (non-separable then separable), then open conditions LIFO |
+| `UCPOP-LC` | `{n,s}LIFO/{o}LR` | Threats LIFO, open conditions by fewest refinements |
+| `UCPOP-MC` | `{n,s}LIFO/{o}MR` | Threats LIFO, open conditions by most refinements |
+| `UCPOP-LC-MC` | `{n,s}LIFO/{o}LR/{o}MR` | Both, in that order |
+| `DSEP-LIFO` | `{n}LIFO/{o}LIFO/{s}LIFO` | Non-separable threats, then open conditions, then separable threats |
+| `DSEP-LC` | `{n}LIFO/{o}LR/{s}LIFO` | As above with least-refinements open conditions |
+| `ZLIFO` | `{n}LIFO/{o}0LIFO/{o}1NEW/{o}LIFO/{s}LIFO` | Zero-commitment LIFO (Haslum & Geffner 2000): dead ends first, then single-refinement conditions |
+| `LCFR` | — | Least-cost-first with reuse |
+| `LCFR-LOC` | — | `LCFR` preferring open conditions |
+| `LCFR-CONF` | — | `LCFR` preferring threatened conditions |
+| `MC` | — | Most-cost first |
+| `MW` | — | Most-work first |
+| `LC_ADD`, `MC_ADD`, `LW_ADD`, `MW_ADD` | — | Cost and work variants ranked by the `ADD` heuristic |
+
+### DSL
+
+Custom orders are written as `/`-separated tiers, evaluated lexicographically:
+
+```
+{flaws}[max]ORDER / {flaws}[max]ORDER / ...
+```
+
+| Part | Meaning |
+|------|---------|
+| `{n}` | Non-separable threats |
+| `{s}` | Separable threats |
+| `{o}` | Open conditions |
+| `[max]` | Optional cap on refinements considered, e.g. `{o}0LIFO` selects only flaws with no refinement |
+| `ORDER` | `LIFO`, `FIFO`, `R` (random), `LR` (fewest refinements), `MR` (most), `NEW`, `REUSE`, `LC_add`, `MC_add`, `LW_add`, `MW_add` |
+
+---
+
+## Representations
+
+The same search configuration — algorithms, weights, limits, flaw orders — applies
+to all three.
+
+| Flag | Representation |
+|------|----------------|
+| *(none)* | **Lifted.** Actions stay partially instantiated and variables are resolved by binding constraints. |
+| `-g` | **Ground.** Actions are fully instantiated up front, by Fast Downward's translator where available and by naive instantiation otherwise. Required by `LPLAN`, `SAMPLE_FF` and `COMPILE*`. |
+| `--fdr-pocl` | **Finite-domain.** Fast Downward's multi-valued SAS+ variables are kept throughout. Causal links protect equalities such as `location(truck) = paris`, so any effect assigning another value is a threat without needing an explicit delete. |
+
+Structural heuristics, `ADD`/`ADDR`, `RELAX`/`RELAXR` and the native `LMCUT`/`LMCUTR`
+work on finite-domain nodes; `SAMPLE_FF`, `LPLAN` and `COMPILE*` do not.
 
 ---
 
@@ -134,122 +330,27 @@ benchmark family uses that form.
 
 ---
 
-## Usage
+## Output
 
-```
-potoroo [options] domain.pddl problem.pddl
-```
-
-Input files can also be piped via stdin (domain first, then problem).
-
-### Quick examples
-
-```bash
-# Solve the Sussman anomaly with the default ADD heuristic
-potoroo examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
-
-# Use the additive heuristic
-potoroo -h ADD examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
-
-# Use the Lplan LP heuristic (admissible) with ground actions
-potoroo -h LPLAN -g examples/blocks-world-domain.pddl examples/bw-large-a.pddl
-
-# Compile to classical planning and evaluate with LM-cut (requires Fast Downward)
-potoroo -h COMPILE_LMCUT -g examples/gripper-domain.pddl examples/gripper-4.pddl
-
-# Compose two heuristics (lexicographic tiebreaking)
-potoroo -h "UCPOP/ADD" examples/logistics-domain.pddl examples/logistics-a.pddl
-
-# Ground POCL search directly over Fast Downward's SAS+ variables
-potoroo --fdr-pocl -v examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
-```
-
-### Default search profile
-
-Potoroo defaults to lifted POCL, A* search, the additive `ADD` heuristic, task
-action costs, weight 1, and the `STATIC` flaw order. The same defaults apply to
-every representation. Any explicit `-h`, `-f`, `-s`, `-a`, or `-w` option
-overrides the corresponding default.
-
-`ADD` rather than VHPOP's reuse-aware `ADDR`: the reuse check scans every step
-and effect for every open condition, so its cost grows with plan size, and on
-several domains it buys very little for that. On Gripper it is catastrophic, and
-not only here — VHPOP 3.0 itself needs 101,595 nodes with `ADDR` against 886
-with `ADD` on `gripper-6`, and times out on `gripper-8`. `ADDR` remains
-available with `-h ADDR`.
-
-### Finite-domain ground POCL
-
-`--fdr-pocl` translates the original problem with Fast Downward and retains its
-multi-valued SAS+ variables throughout ground POCL refinement.
-Causal links protect equalities such as `location(truck) = paris`; every effect
-assigning another value to `location(truck)` is treated as a threat, without
-requiring an explicit delete proposition. With `-v`, Potoroo reports how many
-translated variables are genuinely multi-valued.
-
-Threats from conditional assignments are resolved by *confrontation* as well as
-by promotion and demotion. Confrontation is UCPOP's threat resolver for
-conditional effects, which VHPOP folds into its separation refinement: the
-effect only clobbers the link when all of its conditions hold, so the
-threatening step is committed to another value of a condition variable instead
-of being ordered out of the protected interval. Finite domains make the negated
-antecedent exact — `mode != unsafe` is the disjunction over the remaining values
-of `mode`, so each alternative is a refinement of its own rather than a
-disjunctive open condition — and by the same reading a threat is dropped
-outright once the step is already committed against one of the effect's
-conditions. A ground threat has no unifier to separate, so `{s}` selects the
-confrontable threats and `{n}` the rest.
-
-The finite-domain path consumes the normal search configuration: A*/IDA*/HC,
-BFS, GBFS, lazy/dual-queue GBFS, ALT, search weights and limits, and the
-flaw-order DSL. Cheap structural heuristics, `ADD`/`ADDR`, joint FF-style
-`RELAX`/`RELAXR` extraction, and native `LMCUT`/`LMCUTR` (including composed
-ranks) are implemented directly over finite-domain facts. Declared PDDL/SAS+
-operator costs are used by default, with `-a UNIT` available as an override.
-Fast Downward-generated axiom variables (used when normalizing quantified and
-disjunctive formulas) are expanded into base-fact support clauses at the
-consumer. The representation-specific `SAMPLE_FF`, `LPLAN`, and `COMPILE*`
-heuristics remain unavailable on FDR nodes. Native LM-cut currently requires
-unconditional SAS+ effects.
-
-| Native FDR heuristic | Description |
-|------|-------------|
-| `LMCUT` | Joint LM-cut estimate for all open conditions, starting from the problem initial state |
-| `LMCUTR` | Reuse-aware LM-cut: committed-step effects are free; an admissible lower bound on additional task cost |
-
-These are direct POCL open-condition relaxations and are distinct from
-`COMPILE_LMCUT`, which evaluates LM-cut on the causal-link compilation.
-
-For resource-shuttling problems, `-s ALT -h ADD` is generally more robust than
-pure GBFS: ALT interleaves greedy `h_add` guidance with total estimated plan
-cost, avoiding low-heuristic plateaus caused by repeated vehicle transitions.
-
-### Output
-
-On success, Potoroo prints the plan to stdout:
+On success the plan goes to stdout:
 
 ```
 ;problem-name
-(action1 arg1 arg2)
-(action2 arg1)
-...
+1:(puton c table a)
+2:(puton b c table)
 Time: 42
 ```
 
-On failure: `no plan` followed by the reason.
+On failure, `no plan` followed by the reason. Exit status is non-zero only for bad
+input, not for an unsolved problem.
 
-Pass `-v` to see the selected search configuration, live progress on stderr,
-and a final human-readable summary. Progress includes generated, visited, and
-queued nodes; heuristic evaluations and time; pruned nodes; and the current
-partial plan's steps, open conditions, and threats. The first expansion is
-always printed, followed by updates at most once per second. Use `-vv` for
-250 ms updates or `-vvv` to print every expansion.
+`-v` adds the chosen configuration, live progress, and a closing summary on stderr:
 
 ```text
 Search [   1.00s] visited 1824 | generated 5931 | queued 4107 | h 5930 evals / 712 ms | pruned 38 | current steps=7 open=4 threats=1 order=1
 ```
 
-Set `POTOROO_STATS_JSON=1` to emit a machine-readable JSON line on stderr:
+Set `POTOROO_STATS_JSON=1` for one machine-readable line per problem on stderr:
 
 ```json
 STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len":6,"plan_cost":11,"nodes_generated":142,"nodes_visited":38,"wall_ms":12}
@@ -257,128 +358,31 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 
 ---
 
-## Options reference
+## Design notes
 
-| Flag | Long form | Argument | Description | Default |
-|------|-----------|----------|-------------|---------|
-| `-a` | `--action-cost` | `TASK`\|`UNIT`\|`DURATION`\|`RELATIVE` | Action cost model (`TASK` respects PDDL `total-cost`) | `TASK` |
-| `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `STATIC` |
-| — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
-| `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
-| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD` |
-| `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
-| `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
-| `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
-| `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
-| `-H` | `--help` | — | Display help and exit | |
-| `-V` | `--version` | — | Display version and exit | |
+**Threat resolution.** Threats are resolved by promotion, demotion and separation.
+Separation also covers *confrontation*, UCPOP's resolver for conditional effects: an
+effect only clobbers a link when its guard holds, so the threatening step can be
+committed against the guard instead of being ordered out of the protected interval.
+Over finite domains the negated guard is exact — `mode != unsafe` is the disjunction
+over the remaining values of `mode` — so each alternative is a refinement of its own
+rather than a disjunctive open condition, and a threat disappears once the step is
+already committed against one of the guard's conditions. A ground threat has no
+unifier to separate, so `{s}` selects the confrontable threats and `{n}` the rest.
 
----
+**Action costs.** Declared costs are used by default; `-a UNIT` overrides them. A cost
+that depends on an action's arguments has no single value at the schema level, so a
+lifted step whose arguments are still unbound is priced at the minimum over the
+instances its parameter types admit. That is a lower bound, so `g` never
+over-estimates and A\* stays admissible, and the exact cost is recovered once the plan
+is complete and its steps are instantiated. Ground and finite-domain search price
+every instance exactly from the outset.
 
-## Heuristics
-
-Heuristics are specified with `-h NAME`. Two heuristics can be composed with `/` for lexicographic tiebreaking: `-h "UCPOP/ADD"` ranks by UCPOP first, breaking ties by ADD.
-
-### Cheap heuristics
-
-These run in O(|plan|) time with no planning graph.
-
-| Name | Description |
-|------|-------------|
-| `UCPOP` | `committed-cost + weight × (open-conditions + unsafe-links)` — the heuristic from the original UCPOP planner |
-| `OC` | Open-condition count |
-| `UC` | Unsafe-link (threat) count |
-| `BUC` | Binary unsafe count (0 if no threats, 1 otherwise) |
-| `LIFO` | Last-in-first-out ordering (newest plan first) |
-| `FIFO` | First-in-first-out ordering (oldest plan first) |
-
-### Planning-graph heuristics
-
-These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is not required but may give better estimates by resolving more bindings.
-
-| Name | Description |
-|------|-------------|
-| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **Default.** |
-| `ADD_COST` | ADD cost term only (no step count) |
-| `ADD_WORK` | ADD work: total operator count in the ADD relaxed plan |
-| `ADDR` | Additive heuristic with action reuse (VHPOP's `h^r_add`): only new operators count toward the estimate. Evaluation cost grows with plan size; see the note on defaults above. |
-| `ADDR_COST` | ADDR cost only |
-| `ADDR_WORK` | ADDR work |
-| `RELAX` | Delete-relaxed plan cost (FF-style joint extraction): `committed-cost + weight × cost(π_relax)` |
-| `RELAXR` | RELAX with reuse (only new operators in the extracted relaxed plan) |
-
-### Lplan LP heuristic
-
-Requires ground actions (`-g`). An **admissible** lower bound on the total number of steps needed to complete the plan, based on Bylander's (1997) LP relaxation applied to the causal-link compilation of the current partial plan.
-
-| Name | Description |
-|------|-------------|
-| `LPLAN` | Smallest feasible horizon h such that a time-indexed LP relaxation of the ground causal-link compilation admits a solution. Admissible. |
-
-### Sample-FF heuristic
-
-Requires ground actions (`-g`).
-
-| Name | Description |
-|------|-------------|
-| `SAMPLE_FF` | Sample-FF (Bercher et al. 2013): keeps committed steps non-relaxed and fills open conditions with delete relaxation over k sampled linearizations. Default k=10. |
-| `SAMPLE_FF:k` | As above with explicit sample count k (e.g. `SAMPLE_FF:5`). |
-
-### Causal-link compilation heuristics
-
-Require ground actions (`-g`) and Fast Downward. The partial plan is compiled to a classical STRIPS task (Bercher, Geier & Biundo 2013), and the initial-state heuristic value of that task estimates the remaining completion cost.
-
-| Name | FD evaluator | Description |
-|------|-------------|-------------|
-| `COMPILE_FF` | `ff()` | FF heuristic (delete relaxation, most useful in practice) |
-| `COMPILE_LMCUT` | `lmcut()` | Landmark-cut (tight admissible bound, slower) |
-| `COMPILE_HMAX` | `hmax()` | h^max (admissible, less informed than LM-cut) |
-| `COMPILE_HADD` | `add()` | Additive heuristic via FD |
-| `COMPILE_BLIND` | `blind()` | Goal-count (for baseline comparison) |
-| `COMPILE` | `ff()` | Alias for `COMPILE_FF` |
-
-**Performance note:** The ground-mode path (`-g`) bypasses the Python translator and communicates with the `downward` C++ binary directly, reducing per-node overhead by ~10×. Set `POTOROO_DOWNWARD` to the binary path for this fast path.
+**Axioms.** Axiom variables that Fast Downward introduces when normalising quantified
+and disjunctive formulas are expanded into base-fact support clauses where they are
+consumed.
 
 ---
-
-## Flaw-selection orders
-
-The flaw-selection order (`-f`) controls which open flaw the planner chooses to resolve at each step. This is a major factor in search efficiency for POCL planning and was extensively studied in the UCPOP/VHPOP literature.
-
-### Predefined orders
-
-| Name | Description |
-|------|-------------|
-| `STATIC` | Resolve static open conditions first, then use LIFO for threats and remaining open conditions. **Default.** |
-| `UCPOP` | `{n,s}LIFO/{o}LIFO` — threats (non-separable then separable) LIFO, then open conditions LIFO |
-| `UCPOP-LC` | `{n,s}LIFO/{o}LR` — threats LIFO, open conditions by least-refinements |
-| `UCPOP-MC` | `{n,s}LIFO/{o}MR` — threats LIFO, open conditions by most-refinements |
-| `UCPOP-LC-MC` | `{n,s}LIFO/{o}LR/{o}MR` |
-| `DSEP-LIFO` | `{n}LIFO/{o}LIFO/{s}LIFO` — non-separable threats, then open conditions, then separable threats |
-| `DSEP-LC` | `{n}LIFO/{o}LR/{s}LIFO` |
-| `ZLIFO` | Complex ZLIFO order (Haslum & Geffner 2000) |
-| `LCFR` | Least-cost-first with reuse |
-| `LCFR-LOC` | LCFR, prefer open conditions |
-| `LCFR-CONF` | LCFR, prefer threatened conditions |
-| `MC` | Most-cost first |
-| `MW` | Most-work first |
-| `LC_ADD`, `MC_ADD`, `LW_ADD`, `MW_ADD` | Cost/work variants using the ADD heuristic |
-
-### DSL syntax
-
-Custom orders can be written in the flaw-selection DSL:
-
-```
-{flaws}[max]ORDER / {flaws}[max]ORDER / ...
-```
-
-- `{n}` — non-separable threats, `{s}` — separable threats, `{o}` — open conditions
-- `[max]` — optional integer cap on refinements considered (e.g. `{n}0LIFO`)
-- Ordering keywords: `LIFO`, `FIFO`, `R` (random), `LR` (least refinements), `MR` (most refinements), `NEW`, `REUSE`, `LC_add`, `MC_add`, `LW_add`, `MW_add`
-- Tiers are separated by `/` and evaluated lexicographically
-
----
-
 ## Acknowledgements
 
 Potoroo builds on the following work:
@@ -394,4 +398,4 @@ Potoroo builds on the following work:
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+This project is licensed under the [Apache License 2.0](LICENSE.MD).
