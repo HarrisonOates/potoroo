@@ -35,3 +35,9 @@ assert_cmd = "2"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Release codegen with symbols, for `perf`. `debug = 1` (line tables) does not
+# change optimisation, so a profile taken here reflects release behaviour.
+[profile.profiling]
+inherits = "release"
+debug = 1

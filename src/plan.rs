@@ -669,7 +669,7 @@ impl Plan {
                 // variables resolve correctly.
                 ctx.register_step(step.id, action);
                 let effect = action.effects[*effect_idx].clone();
-                self.new_link(ctx, plans, &step, &effect, literal, open_cond);
+                self.new_link(ctx, plans, &step, &effect, literal, open_cond, false);
             }
         }
     }
@@ -697,7 +697,7 @@ impl Plan {
                             .orderings
                             .possibly_before(step.id, et, open_cond.step_id, gt)
                         {
-                            self.new_link(ctx, plans, &step, &effect, literal, open_cond);
+                            self.new_link(ctx, plans, &step, &effect, literal, open_cond, false);
                         }
                     }
                 }
@@ -705,6 +705,9 @@ impl Plan {
         }
     }
 
+    /// Supports `open_cond` with `effect` of `step`. Returns whether the link is
+    /// feasible; see [`Plan::make_link`] for what `test_only` skips.
+    #[allow(clippy::too_many_arguments)]
     fn new_link(
         &self,
         ctx: &SearchContext,
@@ -713,7 +716,8 @@ impl Plan {
         effect: &Effect,
         literal: &Literal,
         open_cond: &OpenCondition,
-    ) {
+        test_only: bool,
+    ) -> bool {
         let mut mgu: Vec<Binding> = Vec::new();
         if self.bindings.unify_mgu(
             &ctx.type_ctx(),
@@ -723,7 +727,9 @@ impl Plan {
             literal,
             open_cond.step_id,
         ) {
-            self.make_link(ctx, plans, step, effect, open_cond, &mgu);
+            self.make_link(ctx, plans, step, effect, open_cond, &mgu, test_only)
+        } else {
+            false
         }
     }
 
@@ -817,6 +823,18 @@ impl Plan {
         }
     }
 
+    /// Builds the child plan that supports `open_cond` with `effect` of `step`,
+    /// pushing it onto `plans`. Returns whether the link is feasible at all.
+    ///
+    /// Under `test_only` every feasibility gate still runs — the unifier, the
+    /// conditional-effect and precondition goals, binding consistency and the
+    /// ordering cycle check — but none of the bookkeeping that only a real child
+    /// needs: no chain is extended, no threats are recomputed, no `Plan` is
+    /// allocated. The refinement counts behind the `LR`/`MR` flaw orders and the
+    /// `max_refinements` caps used to build a whole plan and throw it away.
+    /// Sharing one path keeps a count from ever disagreeing with the refinement
+    /// it counts.
+    #[allow(clippy::too_many_arguments)]
     fn make_link(
         &self,
         ctx: &SearchContext,
@@ -825,7 +843,8 @@ impl Plan {
         effect: &Effect,
         open_cond: &OpenCondition,
         unifier: &[Binding],
-    ) {
+        test_only: bool,
+    ) -> bool {
         // Rename universally-quantified effect parameters to fresh per-step
         // variables, so binding one instance (to establish this link) leaves the
         // original parameter free for other instances and for threat detection.
@@ -850,7 +869,11 @@ impl Plan {
             }
         }
 
-        let mut new_open_conds = chain::remove(&self.open_conds, open_cond);
+        let mut new_open_conds = if test_only {
+            None
+        } else {
+            chain::remove(&self.open_conds, open_cond)
+        };
         let mut new_num_open_conds = self.num_open_conds - 1;
 
         // Conditional effect: add its condition together with the synthesised
@@ -871,9 +894,9 @@ impl Plan {
                 &mut new_bindings,
                 cond_goal,
                 step.id,
-                false,
+                test_only,
             ) {
-                return;
+                return false;
             }
         }
 
@@ -890,18 +913,20 @@ impl Plan {
                 &mut new_bindings,
                 step.action.precondition.clone(),
                 step.id,
-                false,
+                test_only,
             ) {
-                return;
+                return false;
             }
-            new_steps = chain::cons(step.clone(), new_steps);
+            if !test_only {
+                new_steps = chain::cons(step.clone(), new_steps);
+            }
             new_num_steps += 1;
             new_cost = new_cost.saturating_add(ctx.action_cost(&step.action));
         }
 
-        let bindings = match self.bindings.add(&ctx.type_ctx(), &new_bindings, false) {
+        let bindings = match self.bindings.add(&ctx.type_ctx(), &new_bindings, test_only) {
             Some(b) => b,
-            None => return,
+            None => return false,
         };
 
         let new_orderings = match self.orderings.refine_with_step(
@@ -914,8 +939,14 @@ impl Plan {
             step.id,
         ) {
             Some(o) => o,
-            None => return,
+            None => return false,
         };
+
+        if test_only {
+            // Feasible. The link, its threats and the child plan itself matter
+            // only to a caller that is going to search the child.
+            return true;
+        }
 
         // Add the new link.
         let link = Link {
@@ -973,6 +1004,7 @@ impl Plan {
             new_open_conds,
             new_num_open_conds,
         ));
+        true
     }
 }
 
@@ -1219,7 +1251,8 @@ impl Plan {
         open_cond: &OpenCondition,
         limit: i32,
     ) -> bool {
-        let mut dummy: Vec<Rc<Plan>> = Vec::new();
+        let mut plans: Vec<Rc<Plan>> = Vec::new();
+        let mut found = 0;
         if let Some(achievers) = ctx.literal_achievers(literal) {
             for (action, effect_idx) in achievers {
                 if !action.synthetic() {
@@ -1229,14 +1262,16 @@ impl Plan {
                     };
                     ctx.register_step(step.id, action);
                     let effect = action.effects[*effect_idx].clone();
-                    self.new_link(ctx, &mut dummy, &step, &effect, literal, open_cond);
-                    if dummy.len() as i32 > limit {
-                        return false;
+                    if self.new_link(ctx, &mut plans, &step, &effect, literal, open_cond, true) {
+                        found += 1;
+                        if found > limit {
+                            return false;
+                        }
                     }
                 }
             }
         }
-        *refinements = dummy.len() as i32;
+        *refinements = found;
         *refinements <= limit
     }
 
@@ -1248,7 +1283,8 @@ impl Plan {
         open_cond: &OpenCondition,
         limit: i32,
     ) -> bool {
-        let mut dummy: Vec<Rc<Plan>> = Vec::new();
+        let mut plans: Vec<Rc<Plan>> = Vec::new();
+        let mut found = 0;
         let gt = open_cond.when.start_time();
         for step in chain::iter(&self.steps) {
             if self
@@ -1264,9 +1300,13 @@ impl Plan {
                                 .possibly_before(step.id, et, open_cond.step_id, gt)
                             {
                                 let effect = action.effects[*effect_idx].clone();
-                                self.new_link(ctx, &mut dummy, step, &effect, literal, open_cond);
-                                if dummy.len() as i32 > limit {
-                                    return false;
+                                if self.new_link(
+                                    ctx, &mut plans, step, &effect, literal, open_cond, true,
+                                ) {
+                                    found += 1;
+                                    if found > limit {
+                                        return false;
+                                    }
                                 }
                             }
                         }
@@ -1275,12 +1315,16 @@ impl Plan {
             }
         }
         if let Literal::Negation(atom) = literal {
-            self.new_cw_link(ctx, &mut dummy, atom, open_cond);
-            if dummy.len() as i32 > limit {
+            // The closed-world link still builds its child: it is at most one
+            // per open condition, and its goal is a disjunction the feasibility
+            // path would have to reproduce.
+            self.new_cw_link(ctx, &mut plans, atom, open_cond);
+            found += plans.len() as i32;
+            if found > limit {
                 return false;
             }
         }
-        *refinements = dummy.len() as i32;
+        *refinements = found;
         *refinements <= limit
     }
 }
