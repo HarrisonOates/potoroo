@@ -284,10 +284,35 @@ fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators
         }
         cons.push(leq(applied, 1.0));
 
-        // An operator may only be applied where its preconditions hold.
+        // An operator may only be applied where its preconditions hold. Posting
+        // this per operator as `o(t,i) <= x(t,v,d)` is weaker than it needs to
+        // be: at most one operator fires per time point, so the operators that
+        // *share* a precondition can be summed,
+        //
+        //     sum over i requiring v = d of o(t,i)  <=  x(t,v,d)
+        //
+        // which dominates the individual constraints, since every `o` is
+        // non-negative, and replaces one constraint per operator-precondition
+        // with one per fact. Stronger and smaller at once.
+        let mut requiring: Vec<Vec<Expression>> = task
+            .variables
+            .iter()
+            .map(|variable| {
+                variable
+                    .values
+                    .iter()
+                    .map(|_| Expression::default())
+                    .collect()
+            })
+            .collect();
         for (i, operator) in task.operators.iter().enumerate() {
             for fact in operator.preconditions() {
-                cons.push(leq(var(o[t][i]), var(x[t][fact.variable][fact.value])));
+                requiring[fact.variable][fact.value] += o[t][i];
+            }
+        }
+        for (v, values) in requiring.into_iter().enumerate() {
+            for (d, total) in values.into_iter().enumerate() {
+                cons.push(leq(total, var(x[t][v][d])));
             }
         }
 
