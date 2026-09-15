@@ -21,8 +21,8 @@ fn integral_operators_against_the_relaxation() {
         return;
     }
     println!(
-        "{:<22} {:>8} {:>10} {:>12} {:>10} {:>12}",
-        "problem", "optimal", "LP", "LP time", "MIP", "MIP time"
+        "{:<22} {:>7} {:>5} {:>11} {:>5} {:>12} {:>6} {:>11}",
+        "problem", "optimal", "LP", "LP time", "MIP", "MIP time", "20ms", "20ms time"
     );
     for (df, pf, optimal) in [
         ("blocks-world-domain.pddl", "sussman-anomaly.pddl", 3usize),
@@ -54,15 +54,22 @@ fn integral_operators_against_the_relaxation() {
         let t1 = Instant::now();
         let mip = potoroo::lpsas::horizon_bound(&task, 12, Operators::Integral);
         let mip_time = t1.elapsed();
+        let t2 = Instant::now();
+        let budgeted = potoroo::lpsas::horizon_bound(&task, 12, Operators::IntegralWithin(20));
+        let budget_time = t2.elapsed();
 
         println!(
-            "{pf:<22} {optimal:>8} {:>10} {:>12?} {:>10} {:>12?}",
+            "{pf:<22} {optimal:>7} {:>5} {:>11?} {:>5} {:>12?} {:>6} {:>11?}",
             lp.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
             lp_time,
             mip.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
-            mip_time
+            mip_time,
+            budgeted
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            budget_time
         );
-        for (name, got) in [("LP", lp), ("MIP", mip)] {
+        for (name, got) in [("LP", lp), ("MIP", mip), ("budgeted", budgeted)] {
             if let Some(v) = got {
                 assert!(
                     v <= optimal,
