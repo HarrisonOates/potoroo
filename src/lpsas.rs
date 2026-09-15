@@ -151,6 +151,19 @@ pub fn completion_bound(
     (l0..=l0 + extra).find(|&l| solve_at(task, l, &steps, operators).is_some())
 }
 
+/// Whether two facts hold together in no reachable state.
+///
+/// Two values of the same variable are mutex by exactly-one; across variables it
+/// takes one of the translator's invariant groups.
+fn mutex(task: &Task, a: crate::fdr::Fact, b: crate::fdr::Fact) -> bool {
+    if a.variable == b.variable {
+        return a.value != b.value;
+    }
+    task.mutex_groups
+        .iter()
+        .any(|group| group.contains(&a) && group.contains(&b))
+}
+
 /// The fewest value changes variable `v` must undergo: the shortest path in its
 /// domain transition graph from its initial to its goal value. `None` when `v`
 /// has no goal, or the goal is already its initial value.
@@ -179,10 +192,24 @@ fn dtg_distance(task: &Task, v: usize) -> Option<usize> {
             }
             match effect.pre {
                 Some(from) => edges[from].push(effect.post),
-                // No required old value: reachable from anywhere.
+                // No required old value recorded, which does not mean the
+                // operator is applicable whatever `v` holds: the condition that
+                // pins `v` may live in another variable. `drop ball roomb left`
+                // is the case in point — it writes `at(ball, roomb)` with no
+                // recorded old value, but requires `carry(ball, left)`, which is
+                // mutex with the ball being in either room. Edges out of values
+                // the preconditions exclude are dropped, which lengthens the
+                // path and so strengthens the bound; only a genuine mutex may
+                // prune, or a real transition would be lost.
                 None => {
-                    for from in edges.iter_mut() {
-                        from.push(effect.post);
+                    let preconditions = operator.preconditions();
+                    for (from, out) in edges.iter_mut().enumerate() {
+                        let excluded = preconditions
+                            .iter()
+                            .any(|&fact| mutex(task, fact, crate::fdr::Fact::new(v, from)));
+                        if !excluded {
+                            out.push(effect.post);
+                        }
                     }
                 }
             }
