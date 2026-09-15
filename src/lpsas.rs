@@ -658,3 +658,29 @@ fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators
         Err(_) => Some(l as f64),
     }
 }
+
+/// How far past the committed-step count the horizon scan may reach, matching
+/// [`crate::lplan`].
+const HORIZON_EXTRA: usize = 6;
+
+/// The SAS+ LP heuristic: an admissible lower bound on the total length of any
+/// completion of `plan`.
+///
+/// Ground search only. The estimate needs the plan's steps matched to translated
+/// operators by name, which needs them ground, and it needs Fast Downward's
+/// translation, which is cached on the context. Anything that rules the estimate
+/// out falls back to the committed-step count plus the open conditions, as
+/// [`crate::lplan`] does.
+pub fn lpsas_rank(plan: &Plan, ctx: &SearchContext, weight: f32, operators: Operators) -> f32 {
+    let fallback = || plan.num_steps() as f32 + weight * plan.num_open_conds() as f32;
+    if !ctx.params.ground_actions {
+        return fallback();
+    }
+    let Some(task) = ctx.fdr_task() else {
+        return fallback();
+    };
+    match completion_bound(&task, plan, ctx, HORIZON_EXTRA, operators) {
+        Some(bound) => bound as f32,
+        None => fallback(),
+    }
+}
