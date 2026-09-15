@@ -44,8 +44,14 @@ fn the_completion_bound_is_admissible_and_sees_the_partial_plan() {
         let task = potoroo::fdr_pocl::translate(&ctx).expect("translate");
         let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
 
-        let bare = potoroo::lpsas::horizon_bound(&task, 12);
-        let completion = potoroo::lpsas::completion_bound(&task, &initial, &ctx, 12);
+        let bare = potoroo::lpsas::horizon_bound(&task, 12, potoroo::lpsas::Operators::Fractional);
+        let completion = potoroo::lpsas::completion_bound(
+            &task,
+            &initial,
+            &ctx,
+            12,
+            potoroo::lpsas::Operators::Fractional,
+        );
         eprintln!("  {pf:<22} optimal={optimal:<3} task bound={bare:?} completion={completion:?}");
 
         // On the initial plan there are no committed steps, so the two must
@@ -97,7 +103,15 @@ fn no_optimal_path_is_priced_out_of_reach() {
             }
             let best = children
                 .iter()
-                .filter_map(|c| potoroo::lpsas::completion_bound(&task, c, &ctx, 12))
+                .filter_map(|c| {
+                    potoroo::lpsas::completion_bound(
+                        &task,
+                        c,
+                        &ctx,
+                        12,
+                        potoroo::lpsas::Operators::Fractional,
+                    )
+                })
                 .min();
             eprintln!(
                 "  {pf:<22} depth={depth} children={} best bound={best:?} optimal={optimal}",

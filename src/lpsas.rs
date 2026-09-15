@@ -55,6 +55,26 @@ use crate::orderings::StepTime;
 use crate::plan::{Plan, GOAL_ID, INIT_ID};
 use crate::search::SearchContext;
 
+/// Whether the operator variables are relaxed or held integral.
+///
+/// [`Operators::Integral`] removes Bylander's "superposition": with at most one
+/// operator per time point and that choice integral, an unconditional effect
+/// forces its post value to 1 and exactly-one zeroes the rest, so — starting
+/// from an integral initial state — the whole solution is integral by induction
+/// and the relaxation becomes exact. Exact means no longer a relaxation: each
+/// probe is a mixed-integer program, i.e. the planning problem itself. Offered
+/// to measure what superposition is actually costing, not as a default.
+///
+/// Conditional effects are the exception: one may decline to fire, so the
+/// variable it writes can still take a fractional value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operators {
+    /// Bylander's relaxation: operator variables range over `[0,1]`.
+    Fractional,
+    /// Operator variables are binary.
+    Integral,
+}
+
 /// A `[0,1]` variable.
 fn unit() -> good_lp::variable::VariableDefinition {
     good_lp::variable().min(0.0).max(1.0)
@@ -73,13 +93,13 @@ fn var(v: Variable) -> Expression {
 /// Feasibility is monotone in the horizon, so the first feasible one is the
 /// minimum and an admissible lower bound on the number of operators any plan
 /// needs.
-pub fn horizon_bound(task: &Task, cap: usize) -> Option<usize> {
+pub fn horizon_bound(task: &Task, cap: usize, operators: Operators) -> Option<usize> {
     // Axioms would need their closure modelled inside each time step; a task
     // carrying them is simply not estimated here.
     if !task.axioms.is_empty() {
         return None;
     }
-    (0..=cap).find(|&l| feasible(task, l))
+    (0..=cap).find(|&l| feasible_with(task, l, &[], operators))
 }
 
 /// One committed step: the operator it instantiates, and the steps that must
@@ -159,6 +179,7 @@ pub fn completion_bound(
     plan: &Plan,
     ctx: &SearchContext,
     extra: usize,
+    operators: Operators,
 ) -> Option<usize> {
     if !task.axioms.is_empty() {
         return None;
@@ -167,15 +188,10 @@ pub fn completion_bound(
     // At most one operator fires per time point, so the horizon is at least the
     // number of committed steps.
     let l0 = steps.len();
-    (l0..=l0 + extra).find(|&l| feasible_with(task, l, &steps))
+    (l0..=l0 + extra).find(|&l| feasible_with(task, l, &steps, operators))
 }
 
-/// Whether the relaxation admits reaching the goal within `l` operators.
-fn feasible(task: &Task, l: usize) -> bool {
-    feasible_with(task, l, &[])
-}
-
-fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep]) -> bool {
+fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators) -> bool {
     // Every committed step needs a time point of its own.
     if steps.len() > l {
         return false;
@@ -193,17 +209,13 @@ fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep]) -> bool {
         })
         .collect();
     // o[t][i]: operator `i` is applied at time `t`.
-    let integral_operators = std::env::var("LPSAS_INT_OPS").is_ok();
     let o: Vec<Vec<Variable>> = (0..l)
         .map(|_| {
             task.operators
                 .iter()
-                .map(|_| {
-                    if integral_operators {
-                        vars.add(good_lp::variable().binary())
-                    } else {
-                        vars.add(unit())
-                    }
+                .map(|_| match operators {
+                    Operators::Fractional => vars.add(unit()),
+                    Operators::Integral => vars.add(good_lp::variable().binary()),
                 })
                 .collect()
         })
