@@ -643,3 +643,188 @@ fn planning_graph_heuristics_reach_through_a_universal_precondition() {
         assert_eq!(solution.num_steps(), 2, "heuristic `{heuristic}`");
     }
 }
+
+const PARAMETERISED_COST_DOMAIN: &str = r#"
+(define (domain road-costs)
+  (:requirements :strips :typing :action-costs)
+  (:types loc)
+  (:predicates (at ?l - loc) (road ?a - loc ?b - loc))
+  (:functions (road-length ?a - loc ?b - loc) - number (total-cost) - number)
+  (:action drive
+    :parameters (?a - loc ?b - loc)
+    :precondition (and (at ?a) (road ?a ?b))
+    :effect (and (at ?b) (not (at ?a)) (increase (total-cost) (road-length ?a ?b)))))
+"#;
+
+/// A direct road costing 10 against a two-hop detour costing 1 + 1.
+const PARAMETERISED_COST_PROBLEM: &str = r#"
+(define (problem road-costs-p)
+  (:domain road-costs)
+  (:objects l1 l2 l3 - loc)
+  (:init (at l1) (road l1 l2) (road l2 l3) (road l1 l3)
+         (= (total-cost) 0)
+         (= (road-length l1 l2) 1)
+         (= (road-length l2 l3) 1)
+         (= (road-length l1 l3) 10))
+  (:goal (at l3))
+  (:metric minimize (total-cost)))
+"#;
+
+fn lower_bound(
+    domain_source: &str,
+    problem_source: &str,
+) -> (potoroo::domain::Domain, potoroo::problem::Problem) {
+    let (mut domain, problem) = lower(domain_source, problem_source);
+    bind_action_costs(&mut domain, &problem).expect("action costs must bind");
+    (domain, problem)
+}
+
+#[test]
+fn a_parameterised_cost_schema_prices_at_the_minimum_over_instances() {
+    let (domain, _) = lower_bound(PARAMETERISED_COST_DOMAIN, PARAMETERISED_COST_PROBLEM);
+    // The cheapest road is 1, so an unbound `drive` step may not be priced
+    // above that without breaking admissibility.
+    assert_eq!(domain.actions[0].cost, 1);
+    assert_eq!(domain.actions[0].cost_base, 0);
+    assert_eq!(domain.actions[0].cost_specs.len(), 1);
+}
+
+#[test]
+fn ground_search_prices_each_road_by_its_own_length() {
+    let (domain, problem) = lower_bound(PARAMETERISED_COST_DOMAIN, PARAMETERISED_COST_PROBLEM);
+    let params = Parameters {
+        ground_actions: true,
+        heuristic: Heuristic::parse("ADD").unwrap(),
+        search_limits: vec![50_000],
+        ..Parameters::default()
+    };
+    let context = SearchContext::new(&domain, &problem, &params);
+    let Outcome::Solved(solution) = plan(&context) else {
+        panic!("a parameterised-cost task must be solvable");
+    };
+    // Two cheap hops (1 + 1) beat the single expensive road (10).
+    assert_eq!(solution.num_steps(), 2);
+    assert_eq!(solution.cost(), 2);
+}
+
+#[test]
+fn a_cost_function_value_may_be_given_for_each_argument_tuple() {
+    let (_, problem) = lower_bound(PARAMETERISED_COST_DOMAIN, PARAMETERISED_COST_PROBLEM);
+    // Three roads, each with its own length; `(= (total-cost) 0)` is normalized
+    // away rather than recorded.
+    assert_eq!(problem.init_values.len(), 3);
+}
+
+#[test]
+fn action_costs_may_be_declared_alongside_numeric_fluents() {
+    let domain_source = PARAMETERISED_COST_DOMAIN.replace(
+        ":strips :typing :action-costs",
+        ":strips :typing :action-costs :numeric-fluents",
+    );
+    let (domain, _) = lower_bound(&domain_source, PARAMETERISED_COST_PROBLEM);
+    assert!(domain.requirements.action_costs);
+}
+
+#[test]
+fn declaring_total_cost_enables_action_costs_without_the_requirement() {
+    // Several IPC domains (floortile) use `(increase (total-cost) N)` while
+    // listing only `:typing`.
+    let domain_source = PARAMETERISED_COST_DOMAIN.replace(":action-costs", "");
+    let (domain, _) = lower_bound(&domain_source, PARAMETERISED_COST_PROBLEM);
+    assert!(domain.requirements.action_costs);
+    assert_eq!(domain.actions[0].cost, 1);
+}
+
+#[test]
+fn a_guarded_cost_increase_is_accepted_and_priced_at_zero() {
+    let domain_source = r#"
+    (define (domain guarded-cost)
+      (:requirements :strips :typing :action-costs :conditional-effects)
+      (:types loc)
+      (:predicates (at ?l - loc) (road ?a - loc ?b - loc) (tolled ?l - loc))
+      (:functions (total-cost) - number)
+      (:action drive
+        :parameters (?a - loc ?b - loc)
+        :precondition (and (at ?a) (road ?a ?b))
+        :effect (and (at ?b) (not (at ?a))
+                     (increase (total-cost) 2)
+                     (when (tolled ?b) (increase (total-cost) 5)))))
+    "#;
+    let problem_source = r#"
+    (define (problem guarded-cost-p)
+      (:domain guarded-cost)
+      (:objects l1 l2 - loc)
+      (:init (at l1) (road l1 l2) (tolled l2) (= (total-cost) 0))
+      (:goal (at l2))
+      (:metric minimize (total-cost)))
+    "#;
+    let (domain, problem) = lower_bound(domain_source, problem_source);
+    assert_eq!(domain.actions[0].conditional_costs.len(), 1);
+    // The guard holds only in states a partial order does not fix, so the toll
+    // is excluded from the bound rather than assumed.
+    assert_eq!(domain.actions[0].cost, 2);
+
+    let params = Parameters {
+        heuristic: Heuristic::parse("ADD").unwrap(),
+        search_limits: vec![10_000],
+        ..Parameters::default()
+    };
+    let context = SearchContext::new(&domain, &problem, &params);
+    let Outcome::Solved(solution) = plan(&context) else {
+        panic!("a guarded cost increase must not make the action unusable");
+    };
+    assert_eq!(solution.cost(), 2);
+}
+
+#[test]
+fn lifted_search_recovers_the_exact_cost_of_a_parameterised_step() {
+    // A lifted step is added before its arguments are bound, so `(road-length
+    // ?a ?b)` can only be bounded from below at that point. The direct l1->l3
+    // road costs 10 and must not be returned as if it cost the cheapest road's 1.
+    let (domain, problem) = lower_bound(PARAMETERISED_COST_DOMAIN, PARAMETERISED_COST_PROBLEM);
+    let params = Parameters {
+        heuristic: Heuristic::parse("ADD").unwrap(),
+        search_limits: vec![50_000],
+        ..Parameters::default()
+    };
+    let context = SearchContext::new(&domain, &problem, &params);
+    let Outcome::Solved(solution) = plan(&context) else {
+        panic!("a parameterised-cost task must be solvable in lifted mode");
+    };
+    assert_eq!(solution.cost(), 2);
+    assert_eq!(solution.num_steps(), 2);
+}
+
+#[test]
+fn every_representation_agrees_on_a_parameterised_cost() {
+    if !fd_available() {
+        eprintln!("skipping: Fast Downward translator not available");
+        return;
+    }
+    let (domain, problem) = lower_bound(PARAMETERISED_COST_DOMAIN, PARAMETERISED_COST_PROBLEM);
+    let params = Parameters {
+        heuristic: Heuristic::parse("ADD").unwrap(),
+        search_limits: vec![50_000],
+        ..Parameters::default()
+    };
+    // The translator must receive the cost function's signature and its `:init`
+    // values, or the SAS+ operator costs will not match this task's.
+    let context = SearchContext::new(&domain, &problem, &params);
+    let task = translate(&context).unwrap();
+    let (outcome, _) = solve_fdr(&task, &params).unwrap();
+    let FdrOutcome::Solved(solution) = outcome else {
+        panic!("expected the finite-domain search to solve the task");
+    };
+    let cost: usize = solution
+        .operators
+        .iter()
+        .map(|&o| task.operators[o].cost)
+        .sum();
+    assert_eq!(cost, 2);
+
+    // Each road reaches the translator with its own length, rather than every
+    // operator inheriting the schema's minimum.
+    let mut costs: Vec<usize> = task.operators.iter().map(|o| o.cost).collect();
+    costs.sort_unstable();
+    assert_eq!(costs, vec![1, 1, 10]);
+}

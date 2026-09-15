@@ -59,4 +59,13 @@ impl FunctionTable {
     pub fn find_function(&self, name: &str) -> Option<Function> {
         self.by_name.get(name).copied()
     }
+
+    /// The number of declared functions. Ids are `0..len()`.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }

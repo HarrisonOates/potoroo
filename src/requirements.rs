@@ -44,12 +44,18 @@ impl Requirements {
         self.universal_preconditions = true;
     }
 
-    /// Rejects requirements outside the classical subset. Durative/temporal and
-    /// general numeric-fluent features are deferred; restricted action costs
-    /// have their own flag and remain supported.
+    /// Rejects requirements outside the classical subset. Durative/temporal
+    /// features are deferred; restricted action costs have their own flag and
+    /// remain supported.
+    ///
+    /// `:fluents`/`:numeric-fluents` is **not** rejected here. IPC action-cost
+    /// domains routinely declare it alongside `:action-costs` while using only
+    /// `total-cost` and cost functions, so rejecting on the flag turned away
+    /// domains that are inside the fragment. Numeric content outside that
+    /// fragment is rejected where it is used, as every other unsupported
+    /// construct already is.
     pub fn reject_deferred(&self) -> Result<(), LowerError> {
         let unsupported = [
-            (self.fluents, "fluents"),
             (self.durative_actions, "durative-actions"),
             (self.duration_inequalities, "duration-inequalities"),
             (self.continuous_effects, "continuous-effects"),
