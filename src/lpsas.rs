@@ -28,6 +28,11 @@ pub enum Operators {
     Fractional,
     /// Operator variables are binary.
     Integral,
+    /// Binary, but each probe is given at most this many milliseconds. A probe
+    /// that does not finish counts as feasible, which stops the scan early and
+    /// so underestimates — weaker, never inadmissible. This trades tightness
+    /// against the cost of exactness, which on gripper-4 is 309x.
+    IntegralWithin(u64),
 }
 
 /// A `[0,1]` variable.
@@ -54,7 +59,7 @@ pub fn horizon_bound(task: &Task, cap: usize, operators: Operators) -> Option<us
     if !task.axioms.is_empty() {
         return None;
     }
-    (0..=cap).find(|&l| feasible_with(task, l, &[], operators))
+    (0..=cap).find(|&l| solve_at(task, l, &[], operators).is_some())
 }
 
 /// One committed step: the operator it instantiates, and the steps that must
@@ -143,13 +148,15 @@ pub fn completion_bound(
     // At most one operator fires per time point, so the horizon is at least the
     // number of committed steps.
     let l0 = steps.len();
-    (l0..=l0 + extra).find(|&l| feasible_with(task, l, &steps, operators))
+    (l0..=l0 + extra).find(|&l| solve_at(task, l, &steps, operators).is_some())
 }
 
-fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators) -> bool {
+/// Minimize operator usage at horizon `l`.
+/// Return `None` if the horizon is infeasible.
+fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators) -> Option<f64> {
     // Every committed step needs a time point of its own.
     if steps.len() > l {
-        return false;
+        return None;
     }
     let num_variables = task.variables.len();
     let mut vars = ProblemVariables::new();
@@ -170,7 +177,9 @@ fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep], operators: Oper
                 .iter()
                 .map(|_| match operators {
                     Operators::Fractional => vars.add(unit()),
-                    Operators::Integral => vars.add(good_lp::variable().binary()),
+                    Operators::Integral | Operators::IntegralWithin(_) => {
+                        vars.add(good_lp::variable().binary())
+                    }
                 })
                 .collect()
         })
@@ -341,20 +350,32 @@ fn feasible_with(task: &Task, l: usize, steps: &[CommittedStep], operators: Oper
         }
     }
 
-    // Feasibility is the question; the objective only has to be bounded.
-    let model = vars
-        .minimise(Expression::default())
-        .using(lp_solver)
-        .with_all(cons);
+    // Minimise how many operators are used across the horizon.
+    let mut usage = Expression::default();
+    for row in o.iter().take(l) {
+        for &operator in row {
+            usage += operator;
+        }
+    }
+    let model = vars.minimise(usage.clone()).using(lp_solver).with_all(cons);
     #[cfg(feature = "highs-lp")]
-    let model = model
-        .set_parallel(good_lp::solvers::highs::HighsParallelType::Off)
-        .set_threads(1);
+    let model = {
+        let model = model
+            .set_parallel(good_lp::solvers::highs::HighsParallelType::Off)
+            .set_threads(1);
+        match operators {
+            Operators::IntegralWithin(millis) => model.set_time_limit(millis as f64 / 1000.0),
+            _ => model,
+        }
+    };
     match model.solve() {
-        Ok(_) => true,
-        Err(ResolutionError::Infeasible) => false,
-        // Any other solver outcome is treated conservatively as infeasible,
-        // which can only make the bound weaker, never inadmissible.
-        Err(_) => false,
+        Ok(solution) => Some(usage.eval_with(&solution)),
+        Err(ResolutionError::Infeasible) => None,
+        // Anything else is "don't know", and the safe direction is *feasible*.
+        // The scan moves to a larger horizon only when a probe is infeasible, so
+        // reporting infeasible on an inconclusive solve pushes the estimate up
+        // and can overestimate. Reporting feasible stops the scan early, which
+        // underestimates and stays admissible.
+        Err(_) => Some(l as f64),
     }
 }
