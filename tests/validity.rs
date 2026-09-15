@@ -120,3 +120,46 @@ fn flat_tire_closed_world_link_valid_ground() {
 fn flat_tire_closed_world_link_valid_lifted_2() {
     check("flat-tire-domain.pddl", "fix2.pddl", "ADD", false);
 }
+
+// ---------------------------------------------------------------------------
+// ADL examples. These exercise conditional effects, universally quantified
+// effects, and quantified/disjunctive preconditions. They were parsed and
+// lowered by the coverage tests but never solved, so nothing checked the plans
+// the planner returned for them.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcd_blocks_world_valid_under_quantified_preconditions_and_effects() {
+    // `forall` in both preconditions and effects, with a nested `or` inside a
+    // `when` — the richest ADL example in the corpus.
+    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "ADD", false);
+    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "UCPOP", false);
+}
+
+#[test]
+fn briefcase_world_valid_under_conditional_effects() {
+    check("briefcase-world-domain.pddl", "get-paid.pddl", "ADD", false);
+    check("briefcase-world-domain.pddl", "get-paid.pddl", "UCPOP", false);
+}
+
+#[test]
+fn trains_valid_under_an_existential_goal() {
+    check("trains-domain.pddl", "trains1.pddl", "ADD", false);
+    check("trains-domain.pddl", "trains1.pddl", "UCPOP", false);
+}
+
+#[test]
+fn robot_valid_under_a_universally_quantified_conditional_effect() {
+    check("robot-domain.pddl", "r-test1.pddl", "ADD", false);
+    check("robot-domain.pddl", "r-test1.pddl", "UCPOP", false);
+}
+
+#[test]
+fn ho_world_valid_under_conditional_effects() {
+    check("ho-world-domain.pddl", "ho-demo.pddl", "UCPOP", false);
+}
+
+#[test]
+fn mcd_blocks_world_valid_ground() {
+    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "ADD", true);
+}
