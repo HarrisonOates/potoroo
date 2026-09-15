@@ -28,6 +28,7 @@ pub mod heuristics;
 pub(crate) mod instantiate;
 pub(crate) mod lmcut;
 pub mod lplan;
+pub mod lpsas;
 pub mod orderings;
 pub mod params;
 pub mod parser;
