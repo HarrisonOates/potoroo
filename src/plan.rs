@@ -374,13 +374,22 @@ impl Plan {
         }
     }
 
-    fn separate(
+    /// The goal whose achievement separates `unsafe_`: the disjunction of the
+    /// inequalities that would break the threatening unifier, plus — for a
+    /// conditional effect — the negation of its guard (confrontation).
+    ///
+    /// Shared by [`Self::separate`] and [`Self::separate_count`] so a refinement
+    /// is never counted on a different formula from the one it produces. The
+    /// two used to build this separately, and only `separate` wrapped a
+    /// quantified effect's negated guard in a fresh-variable `forall`, so the
+    /// `LR`/`MR` flaw orders ranked forall-conditional effects by a count that
+    /// did not match the refinements available.
+    fn separation_goal(
         &self,
         ctx: &SearchContext,
-        plans: &mut Vec<Rc<Plan>>,
         unsafe_: &Unsafe,
         unifier: &[Binding],
-    ) {
+    ) -> Rc<Formula> {
         // Build the disjunction of inequalities that would separate the threat.
         let mut goal = Rc::new(Formula::False);
         for subst in unifier {
@@ -421,6 +430,17 @@ impl Plan {
             };
             goal = Formula::or(goal, cond_goal);
         }
+        goal
+    }
+
+    fn separate(
+        &self,
+        ctx: &SearchContext,
+        plans: &mut Vec<Rc<Plan>>,
+        unsafe_: &Unsafe,
+        unifier: &[Binding],
+    ) {
+        let goal = self.separation_goal(ctx, unsafe_, unifier);
 
         let mut new_open_conds = self.open_conds.clone();
         let mut new_num_open_conds = self.num_open_conds;
@@ -985,28 +1005,7 @@ impl Plan {
     }
 
     fn separate_count(&self, ctx: &SearchContext, unsafe_: &Unsafe, unifier: &[Binding]) -> i32 {
-        let mut goal = Rc::new(Formula::False);
-        for subst in unifier {
-            if !unsafe_.effect.parameters.contains(&subst.var) {
-                let g = make_inequality(subst.var, subst.var_id, subst.term, subst.term_id);
-                let consistent = match g.as_ref() {
-                    Formula::Inequality { .. } => self.bindings.consistent_with_inequality(
-                        subst.var,
-                        subst.var_id,
-                        subst.term,
-                        subst.term_id,
-                    ),
-                    _ => true,
-                };
-                if consistent {
-                    goal = Formula::or(goal, g);
-                }
-            }
-        }
-        let effect_cond = &unsafe_.effect.condition;
-        if !effect_cond.tautology() {
-            goal = Formula::or(goal, effect_cond.negation());
-        }
+        let goal = self.separation_goal(ctx, unsafe_, unifier);
         let mut dummy_oc: Option<Rc<Chain<OpenCondition>>> = None;
         let mut dummy_n = 0usize;
         let mut new_bindings: Vec<Binding> = Vec::new();
