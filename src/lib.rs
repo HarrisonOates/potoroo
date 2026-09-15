@@ -1,8 +1,14 @@
 //! A partial-order causal-link planner for the classical planning subset.
 //!
-//! The classical subset targets STRIPS + ADL with lifted and ground actions;
-//! durative/temporal and general numeric features are deferred and rejected at
-//! lowering time; the restricted PDDL `total-cost` fragment is supported.
+//! The subset is the IPC 2027 fragment of PDDL 3.1 — STRIPS, action costs,
+//! negative preconditions, and conditional effects (with `forall`), plus
+//! disjunctive preconditions and existential quantifiers — over lifted, ground,
+//! and finite-domain representations. Action costs cover the `total-cost`
+//! fragment, including cost functions of an action's parameters.
+//!
+//! Durative/temporal features, general numeric fluents, timed initial literals,
+//! preferences, constraints, and derived predicates are deferred and rejected at
+//! lowering time. See the README's "Supported PDDL" section.
 
 pub mod action;
 pub mod bindings;
