@@ -92,6 +92,11 @@ impl Operator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub variables: Vec<Variable>,
+    /// Invariant groups the translator proved: at most one fact of each group
+    /// holds in any reachable state. A SAS+ variable already carries the
+    /// exactly-one invariant over its own values, so these are the *cross*-
+    /// variable ones, which nothing else in the representation implies.
+    pub mutex_groups: Vec<Vec<Fact>>,
     /// One value per variable.
     pub initial: Vec<usize>,
     pub goals: Vec<Fact>,
@@ -137,18 +142,21 @@ impl Task {
             variables.push(Variable { name, values });
         }
 
-        // Mutex groups are useful diagnostics, but variable=value already carries
-        // the invariants needed by this representation. Parse and validate them,
-        // then discard them.
+        // Search over variable=value needs no mutex group, but the LP
+        // relaxation in `crate::lpsas` turns each into a cut, so they are kept.
         let num_mutex_groups = lines.usize("mutex group count")?;
+        let mut mutex_groups = Vec::with_capacity(num_mutex_groups);
         for _ in 0..num_mutex_groups {
             lines.marker("begin_mutex_group")?;
             let size = lines.usize("mutex group size")?;
+            let mut group = Vec::with_capacity(size);
             for _ in 0..size {
                 let fact = lines.fact("mutex fact")?;
                 validate_fact(&variables, fact, &lines)?;
+                group.push(fact);
             }
             lines.marker("end_mutex_group")?;
+            mutex_groups.push(group);
         }
 
         lines.marker("begin_state")?;
@@ -243,6 +251,7 @@ impl Task {
 
         Ok(Task {
             variables,
+            mutex_groups,
             initial,
             goals,
             operators,

@@ -2083,6 +2083,7 @@ mod tests {
                 },
             ],
             axioms: vec![],
+            mutex_groups: vec![],
         }
     }
 
@@ -2125,6 +2126,7 @@ mod tests {
                 },
             ],
             axioms: vec![],
+            mutex_groups: vec![],
         }
     }
 
@@ -2199,6 +2201,7 @@ mod tests {
                 },
             ],
             axioms: vec![],
+            mutex_groups: vec![],
         }
     }
 
@@ -2279,6 +2282,7 @@ mod tests {
                 cost: 1,
             }],
             axioms: vec![],
+            mutex_groups: vec![],
         }
     }
 
