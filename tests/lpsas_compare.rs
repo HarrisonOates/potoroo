@@ -35,7 +35,7 @@ fn compare(domain_file: &str, problem_file: &str, optimal: f32) {
 
     let task = potoroo::fdr_pocl::translate(&ctx).expect("translate");
     let t2 = Instant::now();
-    let sas = potoroo::lpsas::horizon_bound(&task, 12);
+    let sas = potoroo::lpsas::horizon_bound(&task, 12, potoroo::lpsas::Operators::Fractional);
     let t_sas = t2.elapsed();
 
     println!(
