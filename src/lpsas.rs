@@ -59,7 +59,7 @@ pub fn horizon_bound(task: &Task, cap: usize, operators: Operators) -> Option<us
     if !task.axioms.is_empty() {
         return None;
     }
-    (0..=cap).find(|&l| solve_at(task, l, &[], operators).is_some())
+    scan_from(task, &[], cap, operators)
 }
 
 /// One committed step: the operator it instantiates, and the steps that must
@@ -148,7 +148,32 @@ pub fn completion_bound(
     // At most one operator fires per time point, so the horizon is at least the
     // number of committed steps.
     let l0 = steps.len();
-    (l0..=l0 + extra).find(|&l| solve_at(task, l, &steps, operators).is_some())
+    scan_from(task, &steps, l0 + extra, operators)
+}
+
+/// The smallest horizon up to `cap` that admits a solution.
+///
+/// Under an integral mode the scan starts from the relaxation's answer rather
+/// than from zero. Holding the operators integral only ever removes solutions,
+/// so every horizon the relaxation rejects the integer program rejects too, and
+/// beginning below that answer can only re-prove what is already known. It also
+/// keeps an integral mode from ever returning *less* than the relaxation would,
+/// which a budgeted probe could otherwise do by running out of time low in the
+/// scan.
+fn scan_from(
+    task: &Task,
+    steps: &[CommittedStep],
+    cap: usize,
+    operators: Operators,
+) -> Option<usize> {
+    let floor = match operators {
+        Operators::Fractional => steps.len(),
+        // The relaxation rejecting every horizon means the task does too.
+        Operators::Integral | Operators::IntegralWithin(_) => {
+            scan_from(task, steps, cap, Operators::Fractional)?
+        }
+    };
+    (floor..=cap).find(|&l| solve_at(task, l, steps, operators).is_some())
 }
 
 /// Whether two facts hold together in no reachable state.
