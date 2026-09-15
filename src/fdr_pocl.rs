@@ -634,7 +634,7 @@ impl<'a> Planner<'a> {
                         return Err(Error::Unsupported(error.to_string()));
                     }
                 }
-                HVal::SampleFf(_) | HVal::Lplan | HVal::Compile(_) => {
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Compile(_) => {
                     return Err(Error::Unsupported(
                         "SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
                             .to_string(),
@@ -1476,7 +1476,7 @@ impl<'a> Planner<'a> {
                     rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
-                HVal::SampleFf(_) | HVal::Lplan | HVal::Compile(_) => {
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Compile(_) => {
                     unreachable!("unsupported FDR heuristic was rejected before search")
                 }
             }

@@ -27,7 +27,12 @@ fn eval(domain_file: &str, problem_file: &str) -> (f32, f32, std::time::Duration
     let ctx = SearchContext::new(&domain, &problem, &params);
     let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
     let t = Instant::now();
-    let h = potoroo::lplan::lplan_rank(&initial, &ctx, params.weight);
+    let h = potoroo::lplan::lplan_rank(
+        &initial,
+        &ctx,
+        params.weight,
+        potoroo::lplan::Tightenings::NONE,
+    );
     let dt = t.elapsed();
     (h, params.weight, dt)
 }

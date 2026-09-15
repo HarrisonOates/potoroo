@@ -43,7 +43,7 @@ pub(crate) enum HVal {
     /// Lplan LP heuristic (Bylander 1997): the smallest horizon whose relaxed LP
     /// over the causal-link compilation reaches the goal — an admissible lower
     /// bound on the completion length. Ground search only.
-    Lplan,
+    Lplan(crate::lplan::Tightenings),
     /// Causal-link compilation heuristic: rank by a state-based heuristic
     /// (computed by Fast Downward) on the initial state of the classical problem
     /// the partial plan compiles to (`crate::compile`). The `FdHeuristic` is the
@@ -66,6 +66,19 @@ impl Heuristic {
             // Causal-link compilation heuristics (COMPILE / COMPILE_FF / ...).
             if let Some(backend) = crate::compile::parse_backend(part) {
                 h.push(HVal::Compile(backend));
+                continue;
+            }
+            // Lplan: `LPLAN` is Bylander's encoding as published; `LPLAN2` adds the
+            // tightenings, with `LPLAN2:a+b` selecting them individually so each
+            // can be ablated against the baseline.
+            let upper = part.to_ascii_uppercase();
+            if upper == "LPLAN" {
+                h.push(HVal::Lplan(crate::lplan::Tightenings::NONE));
+                continue;
+            }
+            if upper == "LPLAN2" || upper.starts_with("LPLAN2:") {
+                let spec = upper.strip_prefix("LPLAN2:").unwrap_or("");
+                h.push(HVal::Lplan(crate::lplan::Tightenings::parse(spec)?));
                 continue;
             }
             // Sample-FF (SAMPLE_FF or SAMPLE_FF:k for k samples).
@@ -125,7 +138,7 @@ impl Heuristic {
                 }
                 "LMCUT" | "LM-CUT" => HVal::LmCut,
                 "LMCUTR" | "LM-CUTR" => HVal::LmCutR,
-                "LPLAN" => HVal::Lplan,
+
                 "MAKESPAN" => {
                     return Err("heuristic `MAKESPAN` is temporal and not yet supported".to_string())
                 }
@@ -359,8 +372,8 @@ impl Heuristic {
                     rank.push(v);
                     grank.push(v);
                 }
-                HVal::Lplan => {
-                    let v = crate::lplan::lplan_rank(plan, search_ctx, weight);
+                HVal::Lplan(tightenings) => {
+                    let v = crate::lplan::lplan_rank(plan, search_ctx, weight, tightenings);
                     rank.push(v);
                     grank.push(v);
                 }
