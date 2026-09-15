@@ -80,6 +80,15 @@ pub struct Tightenings {
     /// Encode the partial order with the paper's step variables rather than
     /// leaving it to the causal-link compilation.
     pub step_variables: bool,
+    /// Sum the operators sharing a precondition into one inequality instead of
+    /// posting the paper's one-per-operator form.
+    ///
+    /// At most one operator fires per time point, so
+    /// `Σ_{i requiring f} o(t,i) ≤ p(t,f)` holds in every integer solution and
+    /// dominates the individual `o(t,i) ≤ p(t,f)`, every `o` being
+    /// non-negative. It also replaces one constraint per operator-precondition
+    /// with one per fact, so the model shrinks as it tightens.
+    pub aggregated_preconditions: bool,
 }
 
 impl Tightenings {
@@ -88,6 +97,7 @@ impl Tightenings {
         fact_mutexes: false,
         negative_preconditions: false,
         step_variables: false,
+        aggregated_preconditions: false,
     };
 
     /// Every tightening.
@@ -96,6 +106,7 @@ impl Tightenings {
         fact_mutexes: true,
         negative_preconditions: true,
         step_variables: false,
+        aggregated_preconditions: true,
     };
 
     /// Parses a `+`-separated feature list, for ablation: `mutex+negpre`.
@@ -109,6 +120,7 @@ impl Tightenings {
             match feature.to_ascii_lowercase().as_str() {
                 "none" => {}
                 "mutex" => t.fact_mutexes = true,
+                "aggpre" => t.aggregated_preconditions = true,
                 "negpre" => t.negative_preconditions = true,
                 "steps" => {
                     return Err(
@@ -120,7 +132,7 @@ impl Tightenings {
                 "all" => t = Self::ALL,
                 other => {
                     return Err(format!(
-                        "unknown Lplan tightening `{other}` (expected none, mutex, negpre, steps or all)"
+                        "unknown Lplan tightening `{other}` (expected none, mutex, negpre, aggpre, steps or all)"
                     ))
                 }
             }
@@ -273,16 +285,51 @@ fn solve_horizon(
         // true/false" correction variables. Accumulate per fact.
         let mut delta: Vec<Expression> = (0..f).map(|_| Expression::default()).collect();
 
+        // Preconditions: op ⇒ condition holds. Posted per operator this is
+        // weaker than it needs to be. At most one operator fires per time point,
+        // so the operators sharing a precondition can be summed,
+        //
+        //     sum over operators requiring `fct` of o(t,i)  ≤  p(t,fct)
+        //
+        // which dominates the individual inequalities — every `o` is
+        // non-negative — and costs one constraint per fact rather than one per
+        // operator-precondition.
+        if tightenings.aggregated_preconditions {
+            let mut requiring_true: Vec<Expression> =
+                (0..f).map(|_| Expression::default()).collect();
+            let mut requiring_false: Vec<Expression> =
+                (0..f).map(|_| Expression::default()).collect();
+            for oi in 0..m {
+                for &fct in &pos_pre[oi] {
+                    requiring_true[fct] += o[t][oi];
+                }
+                for &fct in &neg_pre[oi] {
+                    requiring_false[fct] += o[t][oi];
+                }
+            }
+            for fct in 0..f {
+                cons.push(leq(
+                    std::mem::take(&mut requiring_true[fct]),
+                    var(p[t][fct]),
+                ));
+                cons.push(leq(
+                    std::mem::take(&mut requiring_false[fct]),
+                    one_minus(p[t][fct]),
+                ));
+            }
+        } else {
+            for oi in 0..m {
+                for &fct in &pos_pre[oi] {
+                    cons.push(leq(var(o[t][oi]), var(p[t][fct])));
+                }
+                for &fct in &neg_pre[oi] {
+                    cons.push(leq(var(o[t][oi]), one_minus(p[t][fct])));
+                }
+            }
+        }
+
         for (oi, op) in ops.iter().enumerate() {
             let trig = o[t][oi];
-
-            // Preconditions: op ⇒ condition holds.
-            for &fct in &pos_pre[oi] {
-                cons.push(leq(var(trig), var(p[t][fct])));
-            }
-            for &fct in &neg_pre[oi] {
-                cons.push(leq(var(trig), one_minus(p[t][fct])));
-            }
 
             for e in &op.effects {
                 let fct = e.fact;
