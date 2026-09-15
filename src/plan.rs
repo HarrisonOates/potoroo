@@ -845,7 +845,7 @@ impl Plan {
                         true,
                     ));
                 } else {
-                    new_bindings.push(subst.clone());
+                    new_bindings.push(*subst);
                 }
             }
         }
@@ -941,7 +941,7 @@ impl Plan {
             ctx,
             &mut new_unsafes,
             &mut new_num_unsafes,
-            &link,
+            link,
             &new_steps,
             &new_orderings,
             &bindings,

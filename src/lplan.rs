@@ -137,8 +137,8 @@ fn solve_horizon(task: &GroundTask, l: usize) -> bool {
     for t in 0..l {
         // At most one operator per time point.
         let mut one = Expression::default();
-        for op in 0..m {
-            one += o[t][op];
+        for &variable in &o[t][..m] {
+            one += variable;
         }
         cons.push(leq(one, 1.0));
 
@@ -228,9 +228,9 @@ fn solve_horizon(task: &GroundTask, l: usize) -> bool {
     // Objective: minimise total operator usage (feasibility is what matters; a
     // bounded objective keeps the solver well-posed).
     let mut obj = Expression::default();
-    for t in 0..l {
-        for op in 0..m {
-            obj += o[t][op];
+    for row in o.iter().take(l) {
+        for &variable in &row[..m] {
+            obj += variable;
         }
     }
 

@@ -109,8 +109,10 @@ fn compile_heuristic_ranks_initial_plan() {
         return;
     }
     let (domain, problem) = load("blocks-world-domain.pddl", "sussman-anomaly.pddl");
-    let mut params = Parameters::default();
-    params.heuristic = Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF");
+    let params = Parameters {
+        heuristic: Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF"),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
     let rank = initial.rank(&ctx);
@@ -131,9 +133,11 @@ fn compile_ground_fast_path_solves_sussman() {
         return;
     }
     let (domain, problem) = load("blocks-world-domain.pddl", "sussman-anomaly.pddl");
-    let mut params = Parameters::default();
-    params.ground_actions = true;
-    params.heuristic = Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF");
+    let params = Parameters {
+        ground_actions: true,
+        heuristic: Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF"),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {
         Outcome::Solved(p) => p,
@@ -149,9 +153,11 @@ fn compile_ground_fast_path_solves_gripper() {
         return;
     }
     let (domain, problem) = load("gripper-domain.pddl", "gripper-2.pddl");
-    let mut params = Parameters::default();
-    params.ground_actions = true;
-    params.heuristic = Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF");
+    let params = Parameters {
+        ground_actions: true,
+        heuristic: Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF"),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {
         Outcome::Solved(p) => p,
@@ -175,8 +181,10 @@ fn compile_heuristic_solves_sussman() {
     // sussman instance and validate the returned plan with the independent
     // checker.
     let (domain, problem) = load("blocks-world-domain.pddl", "sussman-anomaly.pddl");
-    let mut params = Parameters::default();
-    params.heuristic = Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF");
+    let params = Parameters {
+        heuristic: Heuristic::parse("COMPILE_FF").expect("parse COMPILE_FF"),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {
         Outcome::Solved(p) => p,

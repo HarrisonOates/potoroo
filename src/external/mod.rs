@@ -266,7 +266,7 @@ fn spawn_h_server(heur: FdHeuristic) -> Result<HServer, FdError> {
 /// One request/response against a (possibly freshly spawned) server process.
 fn h_server_request(server: &mut HServer, sas: &str) -> std::io::Result<HResult> {
     use std::io::{BufRead, Write};
-    write!(server.stdin, "{}\n", sas.len())?;
+    writeln!(server.stdin, "{}", sas.len())?;
     server.stdin.write_all(sas.as_bytes())?;
     server.stdin.flush()?;
     let mut line = String::new();
@@ -308,9 +308,9 @@ pub fn run_h_server_eval(sas: &str, heur: FdHeuristic) -> Result<HResult, FdErro
     let mut map = h_servers().lock().unwrap();
     // Up to two attempts: the first may hit a stale/dead server.
     for attempt in 0..2 {
-        if !map.contains_key(&heur.tag()) {
+        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(heur.tag()) {
             let s = spawn_h_server(heur)?;
-            map.insert(heur.tag(), s);
+            e.insert(s);
         }
         let server = map.get_mut(&heur.tag()).unwrap();
         match h_server_request(server, sas) {

@@ -32,6 +32,7 @@
 //!   never re-adds it, so deleters stay blocked to the end;
 //! - every action deleting the protected literal `v` gets `g_cl` as a
 //!   precondition, so it cannot fire inside the protected interval.
+//!
 //! Guards are never goal requirements. This is `O(|CL|·|A|)` (Prop 1).
 //!
 //! The result is a [`CompiledProblem`] IR rendered to PDDL by [`emit_pddl`]; the

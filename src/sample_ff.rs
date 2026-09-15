@@ -325,17 +325,13 @@ fn extract(
             base_reqs.insert(g);
             continue;
         }
-        match reach.achiever[g] {
-            Some(a) => {
-                if chosen.insert(a) {
-                    for &p in &relaxed[a].pre {
-                        if !done.contains(&p) {
-                            queue.push(p);
-                        }
-                    }
+        let a = reach.achiever[g]?;
+        if chosen.insert(a) {
+            for &p in &relaxed[a].pre {
+                if !done.contains(&p) {
+                    queue.push(p);
                 }
             }
-            None => return None, // unreachable subgoal
         }
     }
     Some((chosen.len(), base_reqs))

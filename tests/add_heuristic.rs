@@ -26,9 +26,11 @@ fn solve(heuristic: &str, ground: bool) -> String {
         _ => panic!("expected a problem"),
     };
 
-    let mut params = Parameters::default();
-    params.heuristic = Heuristic::parse(heuristic).expect("valid heuristic");
-    params.ground_actions = ground;
+    let params = Parameters {
+        heuristic: Heuristic::parse(heuristic).expect("valid heuristic"),
+        ground_actions: ground,
+        ..Parameters::default()
+    };
 
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {

@@ -26,6 +26,11 @@ use crate::types::{Type, OBJECT};
 /// Holds the immutable context threaded through search: the problem/domain,
 /// parameters, the synthetic init/goal actions, the achiever maps, and the
 /// per-step variable-type registry. Replaces the C++ globals in `plans.cc`.
+/// An achiever index: for each key, the actions that achieve it paired with the
+/// index of the achieving effect. Keyed by predicate id for the lifted indexes
+/// and by ground atom for the exact ones.
+type AchieverIndex<K> = FastMap<K, Vec<(Rc<StepAction>, usize)>>;
+
 pub struct SearchContext<'a> {
     pub domain: &'a Domain,
     pub problem: &'a Problem,
@@ -34,17 +39,17 @@ pub struct SearchContext<'a> {
     pub goal_action: Rc<StepAction>,
     /// Achievers of positive literals, keyed by predicate id. Each entry is the
     /// achieving action plus the index of the achieving effect.
-    achieves_pred: FastMap<u32, Vec<(Rc<StepAction>, usize)>>,
+    achieves_pred: AchieverIndex<u32>,
     /// Achievers of negative literals, keyed by predicate id.
-    achieves_neg_pred: FastMap<u32, Vec<(Rc<StepAction>, usize)>>,
+    achieves_neg_pred: AchieverIndex<u32>,
     /// Exact achiever index for a fully ground task: the same entries as the
     /// two predicate maps, keyed by the effect literal's atom rather than by its
     /// predicate alone. `None` when any effect literal carries a variable (every
     /// lifted run, and any forall effect), in which case the predicate maps are
     /// the only index. See [`SearchContext::literal_achievers`].
-    achieves_atom: Option<FastMap<Atom, Vec<(Rc<StepAction>, usize)>>>,
+    achieves_atom: Option<AchieverIndex<Atom>>,
     /// Exact achiever index for negative literals; see `achieves_atom`.
-    achieves_neg_atom: Option<FastMap<Atom, Vec<(Rc<StepAction>, usize)>>>,
+    achieves_neg_atom: Option<AchieverIndex<Atom>>,
     /// Step-id -> action variable-type registry; populated as steps are created.
     step_var_types: RefCell<FastMap<usize, Rc<StepAction>>>,
     /// The relaxed planning graph, built lazily on first use when the configured
@@ -716,14 +721,14 @@ fn pop_next(
     // queue.
     let alt_use_secondary = is_alt && {
         *expand_count += 1;
-        *expand_count % 2 == 0
+        (*expand_count).is_multiple_of(2)
     };
     loop {
         // In dual-queue mode, decide which queue to pop from.
         let use_secondary = alt_use_secondary
             || (is_dual && *boost_budget == 0 && {
                 *expand_count += 1;
-                *expand_count % 3 == 0 // pop secondary every 3rd expansion (2:1 ratio)
+                (*expand_count).is_multiple_of(3) // pop secondary every 3rd expansion (2:1 ratio)
             });
 
         let q = if use_secondary {
@@ -929,9 +934,7 @@ fn plan_impl(
                     best_h = current_rank0;
                     boost_budget = boost_budget.saturating_add(10);
                 }
-                if boost_budget > 0 {
-                    boost_budget -= 1;
-                }
+                boost_budget = boost_budget.saturating_sub(1);
             }
             // Register step actions referenced by this plan for type lookups.
             for s in chain::iter(&plan.steps) {

@@ -1094,7 +1094,7 @@ impl PlanningGraph {
             if !reachable {
                 continue;
             }
-            if best.as_ref().map_or(true, |(_, _, bc)| cost < *bc) {
+            if best.as_ref().is_none_or(|(_, _, bc)| cost < *bc) {
                 best = Some((ai, pre_atoms, cost));
             }
         }
@@ -1275,6 +1275,10 @@ fn collect_join_atoms<'a>(f: &'a Formula, out: &mut Vec<&'a Atom>) {
 /// discards them anyway — so replacing the Cartesian type-domain enumeration
 /// with this join leaves the resulting planning graph unchanged while making
 /// instantiation proportional to the number of matches.
+/// Called once per parameter tuple the join yields, with the substitution it
+/// binds and the tuple itself.
+type TupleVisitor<'a> = dyn FnMut(&[Option<Object>], &[Object]) + 'a;
+
 struct JoinEnum<'a> {
     /// Types of every variable in the schema's scope, indexed by variable
     /// index. Covers schema parameters and quantified-effect variables alike.
@@ -1360,7 +1364,7 @@ impl<'a> JoinEnum<'a> {
         self.var_types[v.0 as usize]
     }
 
-    fn run(&mut self, visit: &mut dyn FnMut(&[Option<Object>], &[Object])) {
+    fn run(&mut self, visit: &mut TupleVisitor<'_>) {
         // Pick the unused join conjunct with the fewest unbound variables,
         // tie-broken by smallest candidate list.
         let mut pick: Option<(usize, (usize, usize))> = None;
@@ -1379,7 +1383,7 @@ impl<'a> JoinEnum<'a> {
                 .and_then(|r| r.as_ref())
                 .map_or(0, |relation| relation.atoms.len());
             let key = (unbound, cands);
-            if pick.map_or(true, |(_, k)| key < k) {
+            if pick.is_none_or(|(_, k)| key < k) {
                 pick = Some((i, key));
             }
         }
@@ -1432,7 +1436,7 @@ impl<'a> JoinEnum<'a> {
         &mut self,
         conjunct: &'a Atom,
         candidate: &'a Atom,
-        visit: &mut dyn FnMut(&[Option<Object>], &[Object]),
+        visit: &mut TupleVisitor<'_>,
     ) {
         let mark = self.bound_stack.len();
         let mut ok = true;
@@ -1482,7 +1486,7 @@ impl<'a> JoinEnum<'a> {
 
     /// Enumerates parameters not bound by any join conjunct over their type
     /// domains, then emits the complete tuple.
-    fn enumerate_rest(&mut self, from: usize, visit: &mut dyn FnMut(&[Option<Object>], &[Object])) {
+    fn enumerate_rest(&mut self, from: usize, visit: &mut TupleVisitor<'_>) {
         let params = self.params;
         let mut k = from;
         while k < params.len() && self.subst[params[k].0 as usize].is_some() {

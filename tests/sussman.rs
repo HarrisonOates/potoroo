@@ -22,8 +22,10 @@ fn solve(ground: bool) -> String {
         _ => panic!("expected a problem"),
     };
 
-    let mut params = Parameters::default();
-    params.ground_actions = ground;
+    let params = Parameters {
+        ground_actions: ground,
+        ..Parameters::default()
+    };
 
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {

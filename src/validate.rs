@@ -39,7 +39,7 @@ pub fn is_valid_solution(plan: &Plan, ctx: &SearchContext) -> Result<(), String>
 
     // (2) Every causal link is supported by an effect of its producer.
     for link in chain::iter(&plan.links) {
-        if !link_supported(plan, ctx, &link) {
+        if !link_supported(plan, ctx, link) {
             return Err(format!(
                 "causal link {} --{:?}--> {} is unsupported: producer has no effect \
                  unifying with the link condition",
@@ -50,7 +50,7 @@ pub fn is_valid_solution(plan: &Plan, ctx: &SearchContext) -> Result<(), String>
 
     // (3) No causal link is threatened.
     for link in chain::iter(&plan.links) {
-        if let Some(threat_id) = link_threatened_by(plan, ctx, &link) {
+        if let Some(threat_id) = link_threatened_by(plan, ctx, link) {
             return Err(format!(
                 "causal link {} --{:?}--> {} is threatened by step {}",
                 link.from_id, link.condition, link.to_id, threat_id
