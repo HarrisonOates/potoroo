@@ -241,6 +241,12 @@ pub struct PlanningGraph {
     /// Predicate -> `(action index, effect index)` of every positive add effect,
     /// for finding achievers of a goal atom during relaxed-plan extraction.
     pos_achievers: FastMap<Predicate, Vec<(usize, usize)>>,
+    /// The positive precondition atoms of each entry of `actions`, parallel to
+    /// it. A ground action's precondition never changes, but relaxed-plan
+    /// extraction costs every candidate achiever of every subgoal at every node,
+    /// so collecting them on demand meant an allocation and a deep atom clone
+    /// per candidate, almost all of it thrown away.
+    action_pre_atoms: Vec<Vec<Atom>>,
 }
 
 impl PlanningGraph {
@@ -261,6 +267,7 @@ impl PlanningGraph {
             negation_index: FastMap::default(),
             actions: Vec::new(),
             pos_achievers: FastMap::default(),
+            action_pre_atoms: Vec::new(),
         };
 
         // Add initial conditions at level 0 (heuristics.cc:471-485).
@@ -384,6 +391,7 @@ impl PlanningGraph {
 
         // Index positive add effects by predicate for relaxed-plan extraction.
         pg.actions = actions.to_vec();
+        pg.cache_precondition_atoms();
         for (ai, action) in pg.actions.iter().enumerate() {
             for (ei, effect) in action.effects.iter().enumerate() {
                 if let Literal::Atom(a) = &effect.literal {
@@ -424,6 +432,7 @@ impl PlanningGraph {
             negation_index: FastMap::default(),
             actions: Vec::new(),
             pos_achievers: FastMap::default(),
+            action_pre_atoms: Vec::new(),
         };
 
         // Initialise level 0 from the init atoms.
@@ -544,6 +553,7 @@ impl PlanningGraph {
             });
         }
         pg.actions = reachable_actions;
+        pg.cache_precondition_atoms();
 
         // Index positive add effects for relaxed-plan extraction.
         for (ai, action) in pg.actions.iter().enumerate() {
@@ -998,16 +1008,15 @@ impl PlanningGraph {
                 achieved.insert(g);
                 continue;
             }
-            match self.cheapest_achiever(&g, search_ctx) {
-                None => return None, // unreachable: relaxed dead end
-                Some((ai, pre_atoms)) => {
-                    achieved.insert(g);
-                    chosen.insert(ai);
-                    for p in pre_atoms {
-                        if !achieved.contains(&p) {
-                            worklist.push_back(p);
-                        }
-                    }
+            // No achiever: the subgoal is unreachable in the relaxed graph.
+            let ai = self.cheapest_achiever(&g, search_ctx)?;
+            achieved.insert(g);
+            chosen.insert(ai);
+            // Only the achiever actually picked has its preconditions cloned,
+            // and only those not already established.
+            for p in &self.action_pre_atoms[ai] {
+                if !achieved.contains(p) {
+                    worklist.push_back(p.clone());
                 }
             }
         }
@@ -1065,25 +1074,35 @@ impl PlanningGraph {
         best.map(|(a, _)| a)
     }
 
-    /// The cheapest achiever of a ground goal atom: the `(action index, positive
-    /// precondition atoms)` minimising the additive cost of the action's
-    /// preconditions. `None` if no reachable achiever exists.
+    /// Collects each action's positive precondition atoms once, so extraction
+    /// can read them instead of rebuilding them per candidate.
+    fn cache_precondition_atoms(&mut self) {
+        self.action_pre_atoms = self
+            .actions
+            .iter()
+            .map(|action| positive_precondition_atoms(&action.precondition))
+            .collect();
+    }
+
+    /// The index of the cheapest achiever of a ground goal atom: the action
+    /// minimising the additive cost of its positive preconditions. `None` if no
+    /// reachable achiever exists. Read the chosen action's preconditions back
+    /// from [`PlanningGraph::action_pre_atoms`].
     fn cheapest_achiever(
         &self,
         g: &Atom,
         search_ctx: &crate::search::SearchContext,
-    ) -> Option<(usize, Vec<Atom>)> {
-        let mut best: Option<(usize, Vec<Atom>, f32)> = None;
+    ) -> Option<usize> {
+        let mut best: Option<(usize, f32)> = None;
         for &(ai, ei) in self.pos_achievers.get(&g.predicate).into_iter().flatten() {
             let action = &self.actions[ai];
             // This ground effect must produce exactly `g`.
             if action.effects[ei].literal.atom() != g {
                 continue;
             }
-            let pre_atoms = positive_precondition_atoms(&action.precondition);
             let mut cost = search_ctx.action_cost(action) as f32;
             let mut reachable = true;
-            for p in &pre_atoms {
+            for p in &self.action_pre_atoms[ai] {
                 let c = self.heuristic_value_atom(p, 0, None).add_cost();
                 if c.is_infinite() {
                     reachable = false;
@@ -1094,11 +1113,11 @@ impl PlanningGraph {
             if !reachable {
                 continue;
             }
-            if best.as_ref().is_none_or(|(_, _, bc)| cost < *bc) {
-                best = Some((ai, pre_atoms, cost));
+            if best.as_ref().is_none_or(|(_, bc)| cost < *bc) {
+                best = Some((ai, cost));
             }
         }
-        best.map(|(ai, pre, _)| (ai, pre))
+        best.map(|(ai, _)| ai)
     }
 
     /// Whether some existing non-synthetic plan step has a positive effect that
