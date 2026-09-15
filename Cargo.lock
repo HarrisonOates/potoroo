@@ -369,6 +369,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "good_lp",
+ "nom",
  "pddl",
  "thiserror",
 ]
