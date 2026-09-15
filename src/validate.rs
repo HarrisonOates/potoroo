@@ -93,6 +93,67 @@ fn link_supported(plan: &Plan, ctx: &SearchContext, link: &Link) -> bool {
 /// Recomputes whether any step threatens `link`, returning the threatening step
 /// id if so. Reports rather than records, and does not consult the plan's stored
 /// `unsafes`.
+/// Whether the plan has committed against `effect`'s guard at `step_id`, so the
+/// effect cannot fire there and threatens nothing.
+///
+/// This is UCPOP's *confrontation*, which potoroo folds into its separation
+/// refinement: rather than ordering the threatening step out of the protected
+/// interval, the refinement adds the negated guard as an open condition on that
+/// step, and a complete plan closes it with a causal link. A guard literal whose
+/// negation is linked into the step is therefore proof that the effect is dead
+/// there.
+///
+/// Without this, every confronted conditional effect reads as an unresolved
+/// threat and valid plans are reported invalid — `briefcase-world` resolves
+/// `(when (in p) ...)` exactly this way.
+fn effect_confronted(
+    plan: &Plan,
+    ctx: &SearchContext,
+    effect: &crate::effect::Effect,
+    step_id: usize,
+) -> bool {
+    if effect.condition.tautology() {
+        return false;
+    }
+    let mut guard = Vec::new();
+    collect_literals(&effect.condition, &mut guard);
+    if guard.is_empty() {
+        return false;
+    }
+    let type_ctx = ctx.type_ctx();
+    for link in chain::iter(&plan.links) {
+        if link.to_id != step_id {
+            continue;
+        }
+        // One falsified conjunct is enough: the guard is a conjunction, so the
+        // effect cannot fire.
+        if guard.iter().any(|literal| {
+            plan.bindings
+                .affects(&type_ctx, &link.condition, link.to_id, literal, step_id)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Collects the literals of a conjunctive guard. Anything else (a disjunction,
+/// a quantifier) contributes nothing, which keeps the check conservative: an
+/// unrecognised guard is treated as able to fire.
+fn collect_literals(formula: &crate::formula::Formula, out: &mut Vec<Literal>) {
+    use crate::formula::Formula;
+    match formula {
+        Formula::Atom(atom) => out.push(Literal::Atom(atom.clone())),
+        Formula::Negation(atom) => out.push(Literal::Negation(atom.clone())),
+        Formula::Conjunction(conjuncts) => {
+            for conjunct in conjuncts {
+                collect_literals(conjunct, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn link_threatened_by(plan: &Plan, ctx: &SearchContext, link: &Link) -> Option<usize> {
     let orderings = &plan.orderings;
     let bindings = &plan.bindings;
@@ -112,6 +173,12 @@ fn link_threatened_by(plan: &Plan, ctx: &SearchContext, link: &Link) -> Option<u
             // A contradictory link condition means the effect can never fire in a
             // way that clobbers, so it is not a real threat.
             if e.link_condition.contradiction() {
+                continue;
+            }
+            // Nor is a conditional effect the plan has already committed
+            // against: confrontation resolves the threat without ordering the
+            // step anywhere.
+            if effect_confronted(plan, ctx, e, s.id) {
                 continue;
             }
             let et = StepTime::AtEnd;
