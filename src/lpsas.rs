@@ -221,6 +221,104 @@ fn scan_from(
     (floor..=cap).find(|&l| solve_at(task, l, steps, operators).is_some())
 }
 
+/// Values of `v` that some operator forced to fire demands.
+///
+/// An operator is forced when it is the only one writing a goal value that is
+/// not already established: no plan can reach the goal without it, so every
+/// precondition it carries must hold at some point, and the variables those
+/// preconditions name must *visit* those values. That turns the transition
+/// bound from a shortest path into a shortest walk.
+fn forced_values(task: &Task, v: usize) -> Vec<usize> {
+    let mut required = Vec::new();
+    for goal in &task.goals {
+        if task.initial[goal.variable] == goal.value {
+            continue;
+        }
+        // Every way of achieving this goal is a disjunctive landmark: one of
+        // them must fire. Where they all demand the same value of `v`, that
+        // value is visited whichever is chosen. Insisting on a *single*
+        // achiever is far too strict -- a goal value usually has several, such
+        // as dropping a ball with either gripper -- and finds almost nothing.
+        let achievers: Vec<_> = task
+            .operators
+            .iter()
+            .filter(|operator| {
+                operator
+                    .effects
+                    .iter()
+                    .any(|e| e.variable == goal.variable && e.post == goal.value)
+            })
+            .collect();
+        let Some(first) = achievers.first() else {
+            continue;
+        };
+        for fact in first.preconditions() {
+            if fact.variable != v || required.contains(&fact.value) {
+                continue;
+            }
+            let demanded_by_all = achievers.iter().all(|operator| {
+                operator
+                    .preconditions()
+                    .iter()
+                    .any(|other| other.variable == v && other.value == fact.value)
+            });
+            if demanded_by_all {
+                required.push(fact.value);
+            }
+        }
+    }
+    required
+}
+
+/// Shortest walk from `start` through every value of `through`, ending at
+/// `goal`. Domains are small, so the orders are simply enumerated.
+fn shortest_walk(
+    distance: &dyn Fn(usize, usize) -> Option<usize>,
+    start: usize,
+    through: &[usize],
+    goal: usize,
+) -> Option<usize> {
+    if through.is_empty() {
+        return distance(start, goal);
+    }
+    // More than a handful of required values is not worth enumerating, and
+    // dropping them only weakens the bound.
+    if through.len() > 4 {
+        return distance(start, goal);
+    }
+    let mut order: Vec<usize> = (0..through.len()).collect();
+    let mut best: Option<usize> = None;
+    permute(&mut order, 0, &mut |perm| {
+        let mut total = 0usize;
+        let mut at = start;
+        for &index in perm {
+            let Some(step) = distance(at, through[index]) else {
+                return;
+            };
+            total += step;
+            at = through[index];
+        }
+        let Some(last) = distance(at, goal) else {
+            return;
+        };
+        total += last;
+        best = Some(best.map_or(total, |b: usize| b.min(total)));
+    });
+    best
+}
+
+fn permute(order: &mut Vec<usize>, k: usize, visit: &mut dyn FnMut(&[usize])) {
+    if k == order.len() {
+        visit(order);
+        return;
+    }
+    for i in k..order.len() {
+        order.swap(k, i);
+        permute(order, k + 1, visit);
+        order.swap(k, i);
+    }
+}
+
 /// Whether two facts hold together in no reachable state.
 ///
 /// Two values of the same variable are mutex by exactly-one; across variables it
@@ -248,11 +346,15 @@ fn mutex(task: &Task, a: crate::fdr::Fact, b: crate::fdr::Fact) -> bool {
 /// edge from every value. More edges mean shorter paths and a weaker bound,
 /// never an inadmissible one.
 fn dtg_distance(task: &Task, v: usize) -> Option<usize> {
-    let goal = task.goals.iter().find(|g| g.variable == v)?.value;
     let start = task.initial[v];
-    if start == goal {
-        return None;
-    }
+    let through = forced_values(task, v);
+    // With no goal of its own a variable is still obliged to visit whatever the
+    // landmarks demand; it just has nowhere particular to end up.
+    let goal = match task.goals.iter().find(|g| g.variable == v) {
+        Some(g) => g.value,
+        None if through.is_empty() => return None,
+        None => *through.last().expect("checked non-empty"),
+    };
     let size = task.variables[v].values.len();
     let mut edges: Vec<Vec<usize>> = vec![Vec::new(); size];
     for operator in &task.operators {
@@ -286,22 +388,32 @@ fn dtg_distance(task: &Task, v: usize) -> Option<usize> {
         }
     }
 
-    let mut distance = vec![usize::MAX; size];
-    distance[start] = 0;
-    let mut queue = std::collections::VecDeque::from([start]);
-    while let Some(value) = queue.pop_front() {
-        if value == goal {
-            return Some(distance[value]);
+    // All-pairs distances over a domain this small.
+    let hop = |from: usize, to: usize| -> Option<usize> {
+        if from == to {
+            return Some(0);
         }
-        for &next in &edges[value] {
-            if distance[next] == usize::MAX {
-                distance[next] = distance[value] + 1;
-                queue.push_back(next);
+        let mut seen = vec![false; size];
+        seen[from] = true;
+        let mut queue = std::collections::VecDeque::from([(from, 0usize)]);
+        while let Some((value, steps)) = queue.pop_front() {
+            for &next in &edges[value] {
+                if next == to {
+                    return Some(steps + 1);
+                }
+                if !seen[next] {
+                    seen[next] = true;
+                    queue.push_back((next, steps + 1));
+                }
             }
         }
-    }
-    // Unreachable: the LP will find the horizon infeasible on its own.
-    None
+        None
+    };
+
+    // A value some forced operator demands has to be visited on the way, which
+    // can make the journey longer than the direct path — a variable may have to
+    // leave its goal value and come back.
+    shortest_walk(&hop, start, &through, goal)
 }
 
 /// Solves the model at horizon `l`, minimising total operator usage, and
