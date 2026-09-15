@@ -84,6 +84,56 @@ into commits. Explicit shell environment variables override these defaults.
 
 ---
 
+## Supported PDDL
+
+Potoroo targets the **IPC 2027 fragment** of PDDL 3.1: STRIPS, action costs,
+negative preconditions, and conditional effects (including in combination with
+`forall`), plus the two features the competition lists as under consideration —
+disjunctive preconditions and existential quantifiers.
+
+| Feature | Support |
+|---|---|
+| STRIPS | Full. |
+| `:typing` (`:types`, `:constants`, hierarchies, `either`) | Full, including multi-level hierarchies and union types. |
+| `:negative-preconditions` | Full and native — no `not-p` compilation. Negative open conditions may be closed against the initial state. |
+| `:disjunctive-preconditions` (`or`, `imply`) | Full and native: a disjunction is a first-class flaw, refined into one child plan per disjunct rather than split into separate actions. |
+| `:existential-preconditions` (`exists`) | Full, in preconditions and goals. The binder is eliminated and its variables are resolved by the binding constraints. |
+| `:universal-preconditions` (`forall`) | Full, by expansion over the type-compatible objects. |
+| `:conditional-effects` (`when`, `forall`) | Full, including `(forall … (when …))` and nested `forall`. Threats from conditional effects are resolved by confrontation as well as by promotion and demotion. |
+| `:action-costs` | Full for the `total-cost` fragment: constants, nullary cost functions, and functions of an action's parameters such as `(increase (total-cost) (road-length ?a ?b))`. An increase guarded by `when`/`forall` is accepted but contributes zero — see below. |
+| `:equality` | Full, through the binding constraints rather than as a fact. |
+
+Deliberately rejected, with a diagnostic naming the construct: durative actions,
+general numeric fluents, timed initial literals, preferences, constraints, and
+derived predicates. `:fluents`/`:numeric-fluents` may be *declared* alongside
+`:action-costs` — many IPC domains do — and is rejected only if numeric content
+outside the `total-cost` fragment is actually used. Declaring `(total-cost)` in
+`:functions` is enough to enable action costs, whether or not `:action-costs`
+appears in `:requirements`.
+
+Against the 147 domain families in
+[`downward-benchmarks`](https://github.com/aibasel/downward-benchmarks), 143
+parse and lower; the 4 that do not are the derived-predicate domains. Reproduce
+with `scripts/fragment_survey.sh <benchmark-dir>`.
+
+### Action costs and the lifted representation
+
+A cost that depends on an action's arguments has no single value at the schema
+level, and a lifted POCL step joins the plan before its arguments are bound. Such
+a step is therefore priced at the **minimum over the instances its parameter
+types admit** — a lower bound, so `g` never over-estimates and A* stays
+admissible — and the exact cost is recovered once the plan is complete and its
+steps are instantiated. Ground (`-g`) and finite-domain (`--fdr-pocl`) search
+price every instance exactly from the outset. All three representations agree on
+the cost of a finished plan.
+
+An `(increase (total-cost) …)` nested inside a `when` or `forall` is accepted and
+recorded, but contributes zero: whether its guard holds is a property of the
+state the step is applied in, which a partial order does not fix. No IPC
+benchmark family uses that form.
+
+---
+
 ## Usage
 
 ```
