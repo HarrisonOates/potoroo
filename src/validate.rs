@@ -85,8 +85,13 @@ fn link_supported(plan: &Plan, ctx: &SearchContext, link: &Link) -> bool {
         });
     }
     producer.action.effects.iter().any(|e| {
-        plan.bindings
-            .unify(&type_ctx, &e.literal, link.from_id, &link.condition, link.to_id)
+        plan.bindings.unify(
+            &type_ctx,
+            &e.literal,
+            link.from_id,
+            &link.condition,
+            link.to_id,
+        )
     })
 }
 

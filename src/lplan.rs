@@ -110,11 +110,23 @@ fn solve_horizon(task: &GroundTask, l: usize) -> bool {
     // Per operator, classify preconditions once.
     let pos_pre: Vec<Vec<usize>> = ops
         .iter()
-        .map(|op| op.pre.iter().filter(|(_, v)| *v).map(|(fct, _)| *fct).collect())
+        .map(|op| {
+            op.pre
+                .iter()
+                .filter(|(_, v)| *v)
+                .map(|(fct, _)| *fct)
+                .collect()
+        })
         .collect();
     let neg_pre: Vec<Vec<usize>> = ops
         .iter()
-        .map(|op| op.pre.iter().filter(|(_, v)| !*v).map(|(fct, _)| *fct).collect())
+        .map(|op| {
+            op.pre
+                .iter()
+                .filter(|(_, v)| !*v)
+                .map(|(fct, _)| *fct)
+                .collect()
+        })
         .collect();
 
     // Initial state: p(0) fixed.
