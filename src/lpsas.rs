@@ -151,6 +151,62 @@ pub fn completion_bound(
     (l0..=l0 + extra).find(|&l| solve_at(task, l, &steps, operators).is_some())
 }
 
+/// The fewest value changes variable `v` must undergo: the shortest path in its
+/// domain transition graph from its initial to its goal value. `None` when `v`
+/// has no goal, or the goal is already its initial value.
+///
+/// Every edge of that path costs one operator application that writes `v`, so
+/// this bounds from below how often such operators fire — a *counting* bound on
+/// the operator variables, which is the class that bites here, rather than
+/// another constraint on the state.
+///
+/// Edges are over-approximated: a conditional effect that might not fire still
+/// contributes one, and an effect with no required old value contributes an
+/// edge from every value. More edges mean shorter paths and a weaker bound,
+/// never an inadmissible one.
+fn dtg_distance(task: &Task, v: usize) -> Option<usize> {
+    let goal = task.goals.iter().find(|g| g.variable == v)?.value;
+    let start = task.initial[v];
+    if start == goal {
+        return None;
+    }
+    let size = task.variables[v].values.len();
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); size];
+    for operator in &task.operators {
+        for effect in &operator.effects {
+            if effect.variable != v {
+                continue;
+            }
+            match effect.pre {
+                Some(from) => edges[from].push(effect.post),
+                // No required old value: reachable from anywhere.
+                None => {
+                    for from in edges.iter_mut() {
+                        from.push(effect.post);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut distance = vec![usize::MAX; size];
+    distance[start] = 0;
+    let mut queue = std::collections::VecDeque::from([start]);
+    while let Some(value) = queue.pop_front() {
+        if value == goal {
+            return Some(distance[value]);
+        }
+        for &next in &edges[value] {
+            if distance[next] == usize::MAX {
+                distance[next] = distance[value] + 1;
+                queue.push_back(next);
+            }
+        }
+    }
+    // Unreachable: the LP will find the horizon infeasible on its own.
+    None
+}
+
 /// Minimize operator usage at horizon `l`.
 /// Return `None` if the horizon is infeasible.
 fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators) -> Option<f64> {
@@ -303,14 +359,30 @@ fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators
         // operator could fire without moving it, which is what made this
         // encoding weaker than the boolean one's frame equalities. A
         // conditional effect is excluded: it may not fire.
+        // Aggregated the same way as the preconditions: at most one operator
+        // fires, so the operators that unconditionally write the same value can
+        // be summed against it. Dominates the per-operator form.
+        let mut writing: Vec<Vec<Expression>> = task
+            .variables
+            .iter()
+            .map(|variable| {
+                variable
+                    .values
+                    .iter()
+                    .map(|_| Expression::default())
+                    .collect()
+            })
+            .collect();
         for (i, operator) in task.operators.iter().enumerate() {
             for effect in &operator.effects {
                 if effect.conditions.is_empty() {
-                    cons.push(leq(
-                        var(o[t][i]),
-                        var(x[t + 1][effect.variable][effect.post]),
-                    ));
+                    writing[effect.variable][effect.post] += o[t][i];
                 }
+            }
+        }
+        for (v, values) in writing.into_iter().enumerate() {
+            for (d, total) in values.into_iter().enumerate() {
+                cons.push(leq(total, var(x[t + 1][v][d])));
             }
         }
 
@@ -326,6 +398,24 @@ fn solve_at(task: &Task, l: usize, steps: &[CommittedStep], operators: Operators
                 lower -= std::mem::take(&mut moves[v][d]);
                 cons.push(geq(var(x[t + 1][v][d]), lower));
             }
+        }
+    }
+
+    // Domain-transition counting. Independent of the per-step constraints: it
+    // bounds how often the operators writing a variable fire across the whole
+    // horizon, which the telescoped transitions cannot express — they only force
+    // the goal value to be written once.
+    for v in 0..num_variables {
+        if let Some(distance) = dtg_distance(task, v) {
+            let mut writes = Expression::default();
+            for row in o.iter().take(l) {
+                for (i, operator) in task.operators.iter().enumerate() {
+                    if operator.effects.iter().any(|e| e.variable == v) {
+                        writes += row[i];
+                    }
+                }
+            }
+            cons.push(geq(writes, distance as f64));
         }
     }
 
