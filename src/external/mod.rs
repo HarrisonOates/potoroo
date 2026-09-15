@@ -137,7 +137,10 @@ fn in_repo_checkout(rel: &str) -> Option<String> {
     let mut roots: Vec<std::path::PathBuf> = Vec::with_capacity(2);
     roots.push(std::path::PathBuf::from("."));
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(target_parent) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+        if let Some(target_parent) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
         {
             roots.push(target_parent.to_path_buf());
         }

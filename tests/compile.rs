@@ -16,10 +16,12 @@ use potoroo::plan::Plan;
 use potoroo::search::{plan, Outcome, SearchContext};
 use potoroo::validate::is_valid_solution;
 
-fn load(domain_file: &str, problem_file: &str) -> (potoroo::domain::Domain, potoroo::problem::Problem) {
+fn load(
+    domain_file: &str,
+    problem_file: &str,
+) -> (potoroo::domain::Domain, potoroo::problem::Problem) {
     let domain_src = fs::read_to_string(format!("examples/{domain_file}")).expect("read domain");
-    let problem_src =
-        fs::read_to_string(format!("examples/{problem_file}")).expect("read problem");
+    let problem_src = fs::read_to_string(format!("examples/{problem_file}")).expect("read problem");
     let domain = match read_pddl(&domain_src).expect("parse domain") {
         ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
         _ => panic!("expected a domain"),
@@ -75,9 +77,18 @@ fn compile_solution_plan_round_trips() {
 
     // The solution plan has committed steps and causal links, so the compiled
     // domain must contain step actions and guard propositions.
-    assert!(dom_pddl.contains("(:action step-"), "expected committed step actions");
-    assert!(dom_pddl.contains("(guard-0)"), "expected at least one causal-link guard");
-    assert!(dom_pddl.contains("(exec-pos-"), "expected step execution indicators");
+    assert!(
+        dom_pddl.contains("(:action step-"),
+        "expected committed step actions"
+    );
+    assert!(
+        dom_pddl.contains("(guard-0)"),
+        "expected at least one causal-link guard"
+    );
+    assert!(
+        dom_pddl.contains("(exec-pos-"),
+        "expected step execution indicators"
+    );
 
     if !fd_available() {
         eprintln!("skipping FD round-trip: Fast Downward not available");
@@ -103,7 +114,11 @@ fn compile_heuristic_ranks_initial_plan() {
     let ctx = SearchContext::new(&domain, &problem, &params);
     let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
     let rank = initial.rank(&ctx);
-    assert!(rank[0].is_finite(), "COMPILE_FF rank must be finite, got {}", rank[0]);
+    assert!(
+        rank[0].is_finite(),
+        "COMPILE_FF rank must be finite, got {}",
+        rank[0]
+    );
 }
 
 /// Ground-search fast path: grounds the compiled task to FDR and invokes only

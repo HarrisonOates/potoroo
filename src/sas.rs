@@ -180,8 +180,11 @@ impl GroundOp {
         let _ = writeln!(s, "{}", self.name);
 
         // Prevail conditions: preconditions on facts not modified by the op.
-        let prevail: Vec<&(usize, bool)> =
-            self.pre.iter().filter(|(f, _)| !effect_facts.contains(f)).collect();
+        let prevail: Vec<&(usize, bool)> = self
+            .pre
+            .iter()
+            .filter(|(f, _)| !effect_facts.contains(f))
+            .collect();
         let _ = writeln!(s, "{}", prevail.len());
         for &&(f, t) in &prevail {
             let _ = writeln!(s, "{} {}", f, v(t));
@@ -225,10 +228,17 @@ mod tests {
         t.add_op(GroundOp {
             name: "make-p".to_string(),
             pre: vec![],
-            effects: vec![GroundEffect { cond: vec![], fact: p, value: true }],
+            effects: vec![GroundEffect {
+                cond: vec![],
+                fact: p,
+                value: true,
+            }],
         });
         assert_eq!(t.heuristic(FdHeuristic::Ff).unwrap(), HResult::Finite(1.0));
-        assert_eq!(t.heuristic(FdHeuristic::HMax).unwrap(), HResult::Finite(1.0));
+        assert_eq!(
+            t.heuristic(FdHeuristic::HMax).unwrap(),
+            HResult::Finite(1.0)
+        );
     }
 
     /// A two-step chain: goal needs `q`, `q` needs `p`. h^max = 2.
@@ -245,14 +255,25 @@ mod tests {
         t.add_op(GroundOp {
             name: "a1".to_string(),
             pre: vec![],
-            effects: vec![GroundEffect { cond: vec![], fact: p, value: true }],
+            effects: vec![GroundEffect {
+                cond: vec![],
+                fact: p,
+                value: true,
+            }],
         });
         t.add_op(GroundOp {
             name: "a2".to_string(),
             pre: vec![(p, true)],
-            effects: vec![GroundEffect { cond: vec![], fact: q, value: true }],
+            effects: vec![GroundEffect {
+                cond: vec![],
+                fact: q,
+                value: true,
+            }],
         });
-        assert_eq!(t.heuristic(FdHeuristic::HMax).unwrap(), HResult::Finite(2.0));
+        assert_eq!(
+            t.heuristic(FdHeuristic::HMax).unwrap(),
+            HResult::Finite(2.0)
+        );
     }
 
     /// Goal already satisfied in the initial state ⇒ h = 0.

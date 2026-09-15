@@ -13,10 +13,8 @@ use potoroo::validate::is_valid_solution;
 /// Solves `(domain, problem)` and asserts the returned plan is a valid POCL
 /// solution under the independent checker.
 fn check(domain_file: &str, problem_file: &str, heuristic: &str, ground: bool) {
-    let domain_src =
-        fs::read_to_string(format!("examples/{domain_file}")).expect("read domain");
-    let problem_src =
-        fs::read_to_string(format!("examples/{problem_file}")).expect("read problem");
+    let domain_src = fs::read_to_string(format!("examples/{domain_file}")).expect("read domain");
+    let problem_src = fs::read_to_string(format!("examples/{problem_file}")).expect("read problem");
 
     let domain = match read_pddl(&domain_src).expect("parse domain") {
         ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
@@ -45,17 +43,32 @@ fn check(domain_file: &str, problem_file: &str, heuristic: &str, ground: bool) {
 
 #[test]
 fn sussman_valid_lifted() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "UCPOP", false);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "UCPOP",
+        false,
+    );
 }
 
 #[test]
 fn sussman_valid_ground() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "UCPOP", true);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "UCPOP",
+        true,
+    );
 }
 
 #[test]
 fn sussman_valid_add() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "ADD", false);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "ADD",
+        false,
+    );
 }
 
 #[test]
@@ -75,12 +88,22 @@ fn hanoi_valid_lifted() {
 
 #[test]
 fn sussman_valid_relax_lifted() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "RELAX", false);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "RELAX",
+        false,
+    );
 }
 
 #[test]
 fn sussman_valid_relaxr_ground() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "RELAXR", true);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "RELAXR",
+        true,
+    );
 }
 
 #[test]
@@ -90,7 +113,12 @@ fn gripper_valid_relax_ground() {
 
 #[test]
 fn sussman_valid_sample_ff_ground() {
-    check("blocks-world-domain.pddl", "sussman-anomaly.pddl", "SAMPLE_FF", true);
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "SAMPLE_FF",
+        true,
+    );
 }
 
 #[test]
@@ -132,14 +160,29 @@ fn flat_tire_closed_world_link_valid_lifted_2() {
 fn mcd_blocks_world_valid_under_quantified_preconditions_and_effects() {
     // `forall` in both preconditions and effects, with a nested `or` inside a
     // `when` — the richest ADL example in the corpus.
-    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "ADD", false);
-    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "UCPOP", false);
+    check(
+        "mcd-blocks-world-domain.pddl",
+        "mcd-sussman-anomaly.pddl",
+        "ADD",
+        false,
+    );
+    check(
+        "mcd-blocks-world-domain.pddl",
+        "mcd-sussman-anomaly.pddl",
+        "UCPOP",
+        false,
+    );
 }
 
 #[test]
 fn briefcase_world_valid_under_conditional_effects() {
     check("briefcase-world-domain.pddl", "get-paid.pddl", "ADD", false);
-    check("briefcase-world-domain.pddl", "get-paid.pddl", "UCPOP", false);
+    check(
+        "briefcase-world-domain.pddl",
+        "get-paid.pddl",
+        "UCPOP",
+        false,
+    );
 }
 
 #[test]
@@ -161,5 +204,10 @@ fn ho_world_valid_under_conditional_effects() {
 
 #[test]
 fn mcd_blocks_world_valid_ground() {
-    check("mcd-blocks-world-domain.pddl", "mcd-sussman-anomaly.pddl", "ADD", true);
+    check(
+        "mcd-blocks-world-domain.pddl",
+        "mcd-sussman-anomaly.pddl",
+        "ADD",
+        true,
+    );
 }

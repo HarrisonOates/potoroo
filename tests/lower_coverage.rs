@@ -108,5 +108,8 @@ fn all_classical_examples_lower() {
         lower_failures.join("\n")
     );
     assert!(lowered_domains > 0, "expected to lower at least one domain");
-    assert!(lowered_problems > 0, "expected to lower at least one problem");
+    assert!(
+        lowered_problems > 0,
+        "expected to lower at least one problem"
+    );
 }

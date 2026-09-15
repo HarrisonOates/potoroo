@@ -588,8 +588,8 @@ impl Bindings {
     /// Finds the authoritative varset node (and its head-relative position)
     /// for a pinned constant.
     fn find_obj_node(&self, obj: Object) -> Option<(usize, Rc<Chain<Varset>>)> {
-        let found =
-            self.with_index_state(|state| lookup_obj_in(state, &self.varsets, self.num_varsets, obj));
+        let found = self
+            .with_index_state(|state| lookup_obj_in(state, &self.varsets, self.num_varsets, obj));
         debug_assert!(
             {
                 let scanned = scan_obj(&self.varsets, obj);
@@ -648,7 +648,14 @@ impl Bindings {
     }
 
     /// Checks if `l1` is the negation of `l2` and the atoms unify.
-    pub fn affects(&self, ctx: &TypeContext, l1: &Literal, id1: usize, l2: &Literal, id2: usize) -> bool {
+    pub fn affects(
+        &self,
+        ctx: &TypeContext,
+        l1: &Literal,
+        id1: usize,
+        l2: &Literal,
+        id2: usize,
+    ) -> bool {
         let mut mgu = Vec::new();
         self.affects_mgu(ctx, &mut mgu, l1, id1, l2, id2)
     }
@@ -675,7 +682,14 @@ impl Bindings {
     }
 
     /// Checks if two literals can be unified.
-    pub fn unify(&self, ctx: &TypeContext, l1: &Literal, id1: usize, l2: &Literal, id2: usize) -> bool {
+    pub fn unify(
+        &self,
+        ctx: &TypeContext,
+        l1: &Literal,
+        id1: usize,
+        l2: &Literal,
+        id2: usize,
+    ) -> bool {
         let mut mgu = Vec::new();
         self.unify_mgu(ctx, &mut mgu, l1, id1, l2, id2)
     }
@@ -754,13 +768,7 @@ impl Bindings {
                                     ) {
                                         return false;
                                     }
-                                    mgu.push(Binding::new(
-                                        var1,
-                                        idl,
-                                        Term::Object(obj2),
-                                        0,
-                                        true,
-                                    ));
+                                    mgu.push(Binding::new(var1, idl, Term::Object(obj2), 0, true));
                                 }
                             }
                             bind.push((var1, obj2));
@@ -827,64 +835,65 @@ impl Bindings {
             // the existing collection.
             return self.try_add(ctx, new_bindings).map(|_| self.clone());
         }
-        self.try_add(ctx, new_bindings).map(|(varsets, high_step, num_varsets)| {
-            // Inherit the parent's index: the child chain is the parent chain
-            // plus a few consed varsets, so the parent's table stays valid
-            // behind an overlay extended with the new varsets' members. Once
-            // the prefix or overlay would exceed its cap the child starts
-            // unindexed and the usual promotion path re-indexes from scratch,
-            // resetting both to empty for its own descendants.
-            let index = match self.index.borrow().as_ref() {
-                Some(IndexState::Built {
-                    prefix,
-                    overlay,
-                    ix,
-                }) => {
-                    let added = num_varsets - self.num_varsets;
-                    let p = prefix + added;
-                    if p <= MAX_INDEX_PREFIX {
-                        let mut ov = (**overlay).clone();
-                        // The added nodes are the first `added` of the child
-                        // chain; append oldest-first so reverse iteration in
-                        // the lookups sees the newest class first.
-                        let mut nodes: Vec<Rc<Chain<Varset>>> = Vec::with_capacity(added);
-                        let mut cur = &varsets;
-                        for _ in 0..added {
-                            let n = cur.as_ref().expect("added exceeds chain length");
-                            nodes.push(n.clone());
-                            cur = &n.tail;
+        self.try_add(ctx, new_bindings)
+            .map(|(varsets, high_step, num_varsets)| {
+                // Inherit the parent's index: the child chain is the parent chain
+                // plus a few consed varsets, so the parent's table stays valid
+                // behind an overlay extended with the new varsets' members. Once
+                // the prefix or overlay would exceed its cap the child starts
+                // unindexed and the usual promotion path re-indexes from scratch,
+                // resetting both to empty for its own descendants.
+                let index = match self.index.borrow().as_ref() {
+                    Some(IndexState::Built {
+                        prefix,
+                        overlay,
+                        ix,
+                    }) => {
+                        let added = num_varsets - self.num_varsets;
+                        let p = prefix + added;
+                        if p <= MAX_INDEX_PREFIX {
+                            let mut ov = (**overlay).clone();
+                            // The added nodes are the first `added` of the child
+                            // chain; append oldest-first so reverse iteration in
+                            // the lookups sees the newest class first.
+                            let mut nodes: Vec<Rc<Chain<Varset>>> = Vec::with_capacity(added);
+                            let mut cur = &varsets;
+                            for _ in 0..added {
+                                let n = cur.as_ref().expect("added exceeds chain length");
+                                nodes.push(n.clone());
+                                cur = &n.tail;
+                            }
+                            // Oldest first, so a newer class overwrites an older
+                            // entry for the same key and wins the lookup.
+                            for (i, n) in nodes.iter().enumerate().rev() {
+                                let depth = (num_varsets - 1 - i) as u32;
+                                for sv in chain::iter(&n.head.cd_set) {
+                                    ov.vars.insert(*sv, (depth, n.clone()));
+                                }
+                                if let Some(c) = n.head.constant {
+                                    ov.objs.insert(c, (depth, n.clone()));
+                                }
+                            }
+                            (ov.vars.len() + ov.objs.len() <= MAX_OVERLAY).then(|| {
+                                IndexState::Built {
+                                    prefix: p,
+                                    overlay: Rc::new(ov),
+                                    ix: ix.clone(),
+                                }
+                            })
+                        } else {
+                            None
                         }
-                        // Oldest first, so a newer class overwrites an older
-                        // entry for the same key and wins the lookup.
-                        for (i, n) in nodes.iter().enumerate().rev() {
-                            let depth = (num_varsets - 1 - i) as u32;
-                            for sv in chain::iter(&n.head.cd_set) {
-                                ov.vars.insert(*sv, (depth, n.clone()));
-                            }
-                            if let Some(c) = n.head.constant {
-                                ov.objs.insert(c, (depth, n.clone()));
-                            }
-                        }
-                        (ov.vars.len() + ov.objs.len() <= MAX_OVERLAY).then(|| {
-                            IndexState::Built {
-                                prefix: p,
-                                overlay: Rc::new(ov),
-                                ix: ix.clone(),
-                            }
-                        })
-                    } else {
-                        None
                     }
-                }
-                _ => None,
-            };
-            Rc::new(Bindings {
-                varsets,
-                high_step,
-                num_varsets,
-                index: RefCell::new(index),
+                    _ => None,
+                };
+                Rc::new(Bindings {
+                    varsets,
+                    high_step,
+                    num_varsets,
+                    index: RefCell::new(index),
+                })
             })
-        })
     }
 
     /// Computes the varsets/high-step/length that would result from adding
@@ -1250,14 +1259,11 @@ impl Bindings {
                         Some((p, _)) => ClassKey::Set(*p),
                         None => ClassKey::Fresh(v),
                     };
-                    let class = classes
-                        .iter()
-                        .position(|k| *k == key)
-                        .unwrap_or_else(|| {
-                            classes.push(key);
-                            class_nodes.push(found.map(|(_, n)| n));
-                            classes.len() - 1
-                        });
+                    let class = classes.iter().position(|k| *k == key).unwrap_or_else(|| {
+                        classes.push(key);
+                        class_nodes.push(found.map(|(_, n)| n));
+                        classes.len() - 1
+                    });
                     // An unbound variable's varset carries the most-specific
                     // type of its whole equality class.
                     let ty = match &class_nodes[class] {
@@ -1345,13 +1351,16 @@ impl Bindings {
         // may not assign such a pair the same object.
         let mut ncd_pairs: Vec<(u8, u8)> = Vec::new();
         for (ci, _) in classes.iter().enumerate() {
-            let Some(n_i) = &class_nodes[ci] else { continue };
+            let Some(n_i) = &class_nodes[ci] else {
+                continue;
+            };
             for (cj, _) in classes.iter().enumerate().skip(ci + 1) {
-                let Some(n_j) = &class_nodes[cj] else { continue };
+                let Some(n_j) = &class_nodes[cj] else {
+                    continue;
+                };
                 let ncd = chain::iter(&n_i.head.ncd_set)
                     .any(|sv| n_j.head.includes_var(sv.0, sv.1))
-                    || chain::iter(&n_j.head.ncd_set)
-                        .any(|sv| n_i.head.includes_var(sv.0, sv.1));
+                    || chain::iter(&n_j.head.ncd_set).any(|sv| n_i.head.includes_var(sv.0, sv.1));
                 if ncd {
                     ncd_pairs.push((ci as u8, cj as u8));
                 }

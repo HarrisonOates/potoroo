@@ -387,7 +387,10 @@ fn reports_a_cost_function_the_problem_never_assigns() {
     let message = bind_action_costs(&mut domain, &problem)
         .expect_err("an unassigned cost function must be reported")
         .to_string();
-    assert!(message.contains("drive-cost"), "unexpected error: {message}");
+    assert!(
+        message.contains("drive-cost"),
+        "unexpected error: {message}"
+    );
 }
 
 /// `pick` and `place` are sibling refinements of the same parent, each adding

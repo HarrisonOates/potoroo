@@ -64,10 +64,8 @@ fn load(dp: &str, pp: &str) -> (potoroo::domain::Domain, potoroo::problem::Probl
 #[test]
 #[ignore]
 fn addr_value_and_cost_against_plan_depth() {
-    let dp = std::env::var("DIAG_DOMAIN")
-        .unwrap_or_else(|_| "examples/gripper-domain.pddl".into());
-    let pp = std::env::var("DIAG_PROBLEM")
-        .unwrap_or_else(|_| "examples/gripper-6.pddl".into());
+    let dp = std::env::var("DIAG_DOMAIN").unwrap_or_else(|_| "examples/gripper-domain.pddl".into());
+    let pp = std::env::var("DIAG_PROBLEM").unwrap_or_else(|_| "examples/gripper-6.pddl".into());
     let budget: usize = std::env::var("DIAG_NODES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -160,11 +158,19 @@ fn addr_value_and_cost_against_plan_depth() {
     if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
         println!(
             "\nADD   {:.2}us at {} steps -> {:.2}us at {} steps  ({:.1}x)",
-            first.1, first.0, last.1, last.0, last.1 / first.1.max(1e-9)
+            first.1,
+            first.0,
+            last.1,
+            last.0,
+            last.1 / first.1.max(1e-9)
         );
         println!(
             "ADDR  {:.2}us at {} steps -> {:.2}us at {} steps  ({:.1}x)",
-            first.2, first.0, last.2, last.0, last.2 / first.2.max(1e-9)
+            first.2,
+            first.0,
+            last.2,
+            last.0,
+            last.2 / first.2.max(1e-9)
         );
     }
     println!("expanded {expanded} nodes, deepest {deepest} steps");

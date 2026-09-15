@@ -402,13 +402,25 @@ impl CompiledProblem {
             {
                 let _ = write!(s, " (or (guard-{}) (not (and", og.guard_id);
                 for (ea, &pa) in og.effect_args.iter().zip(&og.protected_args) {
-                    let _ = write!(s, " (= {} {})", render_term(*ea, &empty, ctx), object_name(pa, ctx));
+                    let _ = write!(
+                        s,
+                        " (= {} {})",
+                        render_term(*ea, &empty, ctx),
+                        object_name(pa, ctx)
+                    );
                 }
                 let _ = write!(s, ")))");
             }
             let _ = writeln!(s, ")");
             let _ = write!(s, "   :effect (and");
-            render_effects_into(&mut s, &schema.effects, &empty, &schema.var_types, ctx, typed);
+            render_effects_into(
+                &mut s,
+                &schema.effects,
+                &empty,
+                &schema.var_types,
+                ctx,
+                typed,
+            );
             let _ = writeln!(s, ")");
             let _ = writeln!(s, "  )");
         }
@@ -689,7 +701,9 @@ pub fn ground_task(plan: &Plan, ctx: &SearchContext) -> GroundTask {
     // fresh insertable action threatens link `g` if one of its effects sets the
     // protected literal's fact to its clobbering value; require `guard-g`.
     for (g, v) in &resolved_links {
-        let Some(objs) = all_objects(&v.args) else { continue };
+        let Some(objs) = all_objects(&v.args) else {
+            continue;
+        };
         let pf = int.atom_fact(v.predicate, &objs);
         let clobber_value = v.negative; // positive link clobbered by del (value=false)
         let guard = int.named_fact(format!("guard-{g}"), init_guards.contains(g));
@@ -720,8 +734,16 @@ pub fn ground_task(plan: &Plan, ctx: &SearchContext) -> GroundTask {
         let neg = int.named_fact(format!("exec-neg-{sid}"), true);
         let pos = int.named_fact(format!("exec-pos-{sid}"), false);
         pre.push((neg, true));
-        effects.push(GroundEffect { cond: vec![], fact: pos, value: true });
-        effects.push(GroundEffect { cond: vec![], fact: neg, value: false });
+        effects.push(GroundEffect {
+            cond: vec![],
+            fact: pos,
+            value: true,
+        });
+        effects.push(GroundEffect {
+            cond: vec![],
+            fact: neg,
+            value: false,
+        });
 
         // Partial order: predecessors' exec-pos must hold.
         for &lp in &committed {
@@ -736,11 +758,19 @@ pub fn ground_task(plan: &Plan, ctx: &SearchContext) -> GroundTask {
         for (g, link) in links.iter().enumerate() {
             if link.from_id == sid {
                 let id = int.named_fact(format!("guard-{g}"), init_guards.contains(&g));
-                effects.push(GroundEffect { cond: vec![], fact: id, value: false });
+                effects.push(GroundEffect {
+                    cond: vec![],
+                    fact: id,
+                    value: false,
+                });
             }
             if link.to_id == sid {
                 let id = int.named_fact(format!("guard-{g}"), init_guards.contains(&g));
-                effects.push(GroundEffect { cond: vec![], fact: id, value: true });
+                effects.push(GroundEffect {
+                    cond: vec![],
+                    fact: id,
+                    value: true,
+                });
             }
         }
         for (g, v) in &resolved_links {
@@ -818,9 +848,11 @@ fn resolve_conjunction(f: &Rc<Formula>, step_id: usize, plan: &Plan) -> Vec<RLit
 fn collect_literals(f: &Rc<Formula>, step_id: usize, plan: &Plan, out: &mut Vec<RLit>) {
     match f.as_ref() {
         Formula::Atom(a) => out.push(resolve_literal(&Literal::Atom(a.clone()), step_id, plan)),
-        Formula::Negation(a) => {
-            out.push(resolve_literal(&Literal::Negation(a.clone()), step_id, plan))
-        }
+        Formula::Negation(a) => out.push(resolve_literal(
+            &Literal::Negation(a.clone()),
+            step_id,
+            plan,
+        )),
         Formula::Conjunction(cs) => {
             for c in cs {
                 collect_literals(c, step_id, plan, out);
@@ -936,10 +968,20 @@ fn render_formula_into(s: &mut String, f: &Rc<Formula>, subst: &Subst, ctx: &Sea
             let _ = write!(s, " (not {})", render_atom_subst(a, subst, ctx));
         }
         Formula::Equality { left, right, .. } => {
-            let _ = write!(s, " (= {} {})", render_term(*left, subst, ctx), render_term(*right, subst, ctx));
+            let _ = write!(
+                s,
+                " (= {} {})",
+                render_term(*left, subst, ctx),
+                render_term(*right, subst, ctx)
+            );
         }
         Formula::Inequality { left, right, .. } => {
-            let _ = write!(s, " (not (= {} {}))", render_term(*left, subst, ctx), render_term(*right, subst, ctx));
+            let _ = write!(
+                s,
+                " (not (= {} {}))",
+                render_term(*left, subst, ctx),
+                render_term(*right, subst, ctx)
+            );
         }
         Formula::Conjunction(cs) => {
             for c in cs {
@@ -965,10 +1007,18 @@ fn render_formula_expr(f: &Rc<Formula>, subst: &Subst, ctx: &SearchContext) -> S
         Formula::Atom(a) => render_atom_subst(a, subst, ctx),
         Formula::Negation(a) => format!("(not {})", render_atom_subst(a, subst, ctx)),
         Formula::Equality { left, right, .. } => {
-            format!("(= {} {})", render_term(*left, subst, ctx), render_term(*right, subst, ctx))
+            format!(
+                "(= {} {})",
+                render_term(*left, subst, ctx),
+                render_term(*right, subst, ctx)
+            )
         }
         Formula::Inequality { left, right, .. } => {
-            format!("(not (= {} {}))", render_term(*left, subst, ctx), render_term(*right, subst, ctx))
+            format!(
+                "(not (= {} {}))",
+                render_term(*left, subst, ctx),
+                render_term(*right, subst, ctx)
+            )
         }
         Formula::Conjunction(cs) => {
             let mut s = String::from("(and");
@@ -1013,7 +1063,11 @@ fn render_effects_into(
         let mut inner = if e.condition.tautology() {
             lit
         } else {
-            format!("(when {} {})", render_formula_expr(&e.condition, subst, ctx), lit)
+            format!(
+                "(when {} {})",
+                render_formula_expr(&e.condition, subst, ctx),
+                lit
+            )
         };
         if !e.parameters.is_empty() {
             let mut params = String::new();
@@ -1064,6 +1118,12 @@ fn all_objects_with_types(ctx: &SearchContext) -> Vec<(Object, Type)> {
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }

@@ -101,9 +101,11 @@ fn normalize(src: &str) -> String {
     for c in uncommented.chars() {
         match c {
             '(' if prev != '(' && !prev.is_whitespace() => out.push(' '),
-            ')' => while out.ends_with(char::is_whitespace) {
-                out.pop();
-            },
+            ')' => {
+                while out.ends_with(char::is_whitespace) {
+                    out.pop();
+                }
+            }
             _ => {}
         }
         out.push(c);

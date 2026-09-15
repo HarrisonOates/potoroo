@@ -50,7 +50,10 @@ fn all_classical_examples_parse() {
         }
     }
 
-    eprintln!("parsed {checked} classical files, skipped {} deferred", skipped.len());
+    eprintln!(
+        "parsed {checked} classical files, skipped {} deferred",
+        skipped.len()
+    );
     assert!(
         failures.is_empty(),
         "the following classical example files failed to parse:\n{}",

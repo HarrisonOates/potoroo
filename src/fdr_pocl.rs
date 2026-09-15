@@ -229,9 +229,8 @@ impl PartialPlan {
     /// only ever discharged by a causal link carrying the very same equality,
     /// and a finite-domain variable holds one value at a time.
     fn step_excludes(&self, step: usize, fact: Fact) -> bool {
-        let conflicts = |condition: Fact| {
-            condition.variable == fact.variable && condition.value != fact.value
-        };
+        let conflicts =
+            |condition: Fact| condition.variable == fact.variable && condition.value != fact.value;
         self.open_conditions
             .iter()
             .any(|open| open.consumer == step && conflicts(open.condition))
@@ -1001,12 +1000,15 @@ impl<'a> Planner<'a> {
             effect_conditions.len(),
         );
         let link_index = child.links.len();
-        push_cow(&mut child.links, CausalLink {
-            producer,
-            consumer,
-            condition,
-            effect,
-        });
+        push_cow(
+            &mut child.links,
+            CausalLink {
+                producer,
+                consumer,
+                condition,
+                effect,
+            },
+        );
         for &effect_condition in effect_conditions {
             child.push_open(OpenCondition {
                 consumer: producer,
@@ -1039,22 +1041,28 @@ impl<'a> Planner<'a> {
         child.cost = child
             .cost
             .saturating_add(self.action_cost.resolve(operator.cost));
-        push_cow(&mut child.steps, Step {
-            id: new_id,
-            operator: achiever.operator,
-        });
+        push_cow(
+            &mut child.steps,
+            Step {
+                id: new_id,
+                operator: achiever.operator,
+            },
+        );
         swap_remove_cow(
             &mut child.open_conditions,
             open_index,
             self.operator_preconditions[achiever.operator].len() + effect.conditions.len(),
         );
         let link_index = child.links.len();
-        push_cow(&mut child.links, CausalLink {
-            producer: new_id,
-            consumer: open.consumer,
-            condition: open.condition,
-            effect: Some(achiever.effect),
-        });
+        push_cow(
+            &mut child.links,
+            CausalLink {
+                producer: new_id,
+                consumer: open.consumer,
+                condition: open.condition,
+                effect: Some(achiever.effect),
+            },
+        );
         for &condition in &self.operator_preconditions[achiever.operator] {
             child.push_open(OpenCondition {
                 consumer: new_id,
@@ -1526,7 +1534,11 @@ impl<'a> Planner<'a> {
         let mut values = self.base_relaxed.clone();
         let mut changed = false;
         for step in plan.steps.iter() {
-            for (index, effect) in self.task.operators[step.operator].effects.iter().enumerate() {
+            for (index, effect) in self.task.operators[step.operator]
+                .effects
+                .iter()
+                .enumerate()
+            {
                 if plan.effect_cannot_fire(self.task, step, index) {
                     continue;
                 }
@@ -2291,14 +2303,16 @@ mod tests {
         };
         let mut updates = Vec::new();
         let mut report = |progress| updates.push(progress);
-        let (outcome, stats) =
-            solve_with_params_and_progress(&task, &params, &mut report).unwrap();
+        let (outcome, stats) = solve_with_params_and_progress(&task, &params, &mut report).unwrap();
 
         assert!(matches!(outcome, Outcome::Solved(_)));
         assert!(!updates.is_empty());
         assert_eq!(updates[0].nodes_visited, 1);
         assert_eq!(updates.last().unwrap().nodes_visited, stats.nodes_visited);
-        assert_eq!(updates.last().unwrap().nodes_generated, stats.nodes_generated);
+        assert_eq!(
+            updates.last().unwrap().nodes_generated,
+            stats.nodes_generated
+        );
         assert!(stats.max_queued > 0);
     }
 
@@ -2518,8 +2532,14 @@ mod tests {
                     .unwrap_or_else(|| panic!("{algorithm:?} omitted operator {operator}"))
             };
             // `make-safe` must precede `run`, or `run` trips the breaker.
-            assert!(position(2) < position(1), "{algorithm:?} ran before making safe");
-            assert!(position(0) < position(1), "{algorithm:?} ran before powering on");
+            assert!(
+                position(2) < position(1),
+                "{algorithm:?} ran before making safe"
+            );
+            assert!(
+                position(0) < position(1),
+                "{algorithm:?} ran before powering on"
+            );
             assert!(solution.plan.complete(&task));
         }
     }
@@ -2533,7 +2553,10 @@ mod tests {
 
         // Promotion cannot follow the goal and demotion contradicts `run`'s own
         // ordering, so the only alternative value of `mode` is left.
-        assert_eq!(planner.confrontations(&plan, &threat), vec![Fact::new(2, 1)]);
+        assert_eq!(
+            planner.confrontations(&plan, &threat),
+            vec![Fact::new(2, 1)]
+        );
         let children = planner.resolve_threat(&plan, &threat);
         assert_eq!(children.len(), 1);
         let child = &children[0];

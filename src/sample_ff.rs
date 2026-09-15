@@ -99,9 +99,9 @@ impl SampleFfModel {
         let mut map: HashMap<(crate::predicates::Predicate, Vec<Object>), usize> = HashMap::new();
         let mut init: Vec<bool> = Vec::new();
         let intern = |map: &mut HashMap<_, _>,
-                          init: &mut Vec<bool>,
-                          pred: crate::predicates::Predicate,
-                          args: Vec<Object>| {
+                      init: &mut Vec<bool>,
+                      pred: crate::predicates::Predicate,
+                      args: Vec<Object>| {
             let atom = Atom {
                 predicate: pred,
                 terms: args.iter().map(|&o| Term::Object(o)).collect(),
@@ -210,17 +210,25 @@ pub fn sample_ff_rank(plan: &Plan, ctx: &SearchContext, weight: f32, k: usize) -
 
     // Step id ↦ index into `committed`/`resolved`, for mapping a sampled
     // linearization (a sequence of ids) back to resolved steps in O(1).
-    let pos_of: HashMap<usize, usize> =
-        committed.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
+    let pos_of: HashMap<usize, usize> = committed
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id, i))
+        .collect();
 
     let mut rng = Rng::seed(plan);
     let mut best: Option<usize> = None;
     for _ in 0..k {
         let lin = sample_linearization(plan, &order, &mut rng);
         let steps: Vec<&ResolvedStep> = lin.iter().map(|&id| &resolved[pos_of[&id]]).collect();
-        if let Some(est) =
-            estimate_linearization(&init, &init_reach, &steps, &model.goal, &model.relaxed, nfacts)
-        {
+        if let Some(est) = estimate_linearization(
+            &init,
+            &init_reach,
+            &steps,
+            &model.goal,
+            &model.relaxed,
+            nfacts,
+        ) {
             best = Some(best.map_or(est, |b| b.min(est)));
         }
     }
@@ -286,10 +294,8 @@ fn estimate_linearization(
             // with the step's own precondition.
             let step = steps[i - 1];
             let add: HashSet<usize> = step.add.iter().copied().collect();
-            let mut next: HashSet<usize> = base_reqs
-                .into_iter()
-                .filter(|r| !add.contains(r))
-                .collect();
+            let mut next: HashSet<usize> =
+                base_reqs.into_iter().filter(|r| !add.contains(r)).collect();
             next.extend(step.pre.iter().copied());
             goals = next.into_iter().collect();
         }
@@ -411,9 +417,9 @@ fn resolve_step(
     init: &mut Vec<bool>,
 ) -> ResolvedStep {
     let intern = |map: &mut HashMap<_, _>,
-                      init: &mut Vec<bool>,
-                      pred: crate::predicates::Predicate,
-                      args: Vec<Object>| {
+                  init: &mut Vec<bool>,
+                  pred: crate::predicates::Predicate,
+                  args: Vec<Object>| {
         let key = (pred, args);
         if let Some(&id) = map.get(&key) {
             return id;
@@ -461,10 +467,7 @@ fn resolve_step(
 /// dropped (relaxation); a violated ground (in)equality makes the whole formula
 /// statically false, returning `None`.
 fn positive_atoms(f: &Rc<Formula>) -> Option<Vec<(crate::predicates::Predicate, Vec<Object>)>> {
-    fn go(
-        f: &Rc<Formula>,
-        out: &mut Vec<(crate::predicates::Predicate, Vec<Object>)>,
-    ) -> bool {
+    fn go(f: &Rc<Formula>, out: &mut Vec<(crate::predicates::Predicate, Vec<Object>)>) -> bool {
         match f.as_ref() {
             Formula::True => true,
             Formula::False => false,
@@ -557,7 +560,10 @@ mod tests {
     #[test]
     fn saturate_reaches_via_action() {
         let init = vec![false]; // fact 0 = p
-        let relaxed = vec![RAction { pre: vec![], add: 0 }];
+        let relaxed = vec![RAction {
+            pre: vec![],
+            add: 0,
+        }];
         let r = saturate(&init, &relaxed, 1);
         assert!(r.reached[0]);
         assert_eq!(r.achiever[0], Some(0));
@@ -570,8 +576,14 @@ mod tests {
         // facts: 0 = p, 1 = q. a0: {} -> p ; a1: {p} -> q.
         let init = vec![false, false];
         let relaxed = vec![
-            RAction { pre: vec![], add: 0 },
-            RAction { pre: vec![0], add: 1 },
+            RAction {
+                pre: vec![],
+                add: 0,
+            },
+            RAction {
+                pre: vec![0],
+                add: 1,
+            },
         ];
         let reach = saturate(&init, &relaxed, 2);
         let (count, base) = extract(&reach, &init, &[1], &relaxed).unwrap();
@@ -590,7 +602,10 @@ mod tests {
     #[test]
     fn extract_unreachable_is_none() {
         let init = vec![false, false];
-        let relaxed = vec![RAction { pre: vec![], add: 0 }];
+        let relaxed = vec![RAction {
+            pre: vec![],
+            add: 0,
+        }];
         let reach = saturate(&init, &relaxed, 2);
         assert!(extract(&reach, &init, &[1], &relaxed).is_none());
     }

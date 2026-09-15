@@ -64,8 +64,7 @@ impl Literal {
     /// link, so it stays to inline field reads.
     #[inline]
     pub fn may_affect(&self, other: &Literal) -> bool {
-        (self.negative() || other.negative())
-            && self.atom().predicate == other.atom().predicate
+        (self.negative() || other.negative()) && self.atom().predicate == other.atom().predicate
     }
 
     /// Lifts this literal into a formula.
@@ -113,9 +112,15 @@ pub enum Formula {
     /// Disjunction (flattened).
     Disjunction(Vec<Rc<Formula>>),
     /// Existential quantification.
-    Exists { params: Vec<Variable>, body: Rc<Formula> },
+    Exists {
+        params: Vec<Variable>,
+        body: Rc<Formula>,
+    },
     /// Universal quantification.
-    Forall { params: Vec<Variable>, body: Rc<Formula> },
+    Forall {
+        params: Vec<Variable>,
+        body: Rc<Formula>,
+    },
 }
 
 impl Formula {
@@ -182,12 +187,12 @@ impl Formula {
                 right: subst_term(*right, subst),
                 right_id: *right_id,
             }),
-            Formula::Conjunction(cs) => {
-                Rc::new(Formula::Conjunction(cs.iter().map(|c| c.substitute(subst)).collect()))
-            }
-            Formula::Disjunction(ds) => {
-                Rc::new(Formula::Disjunction(ds.iter().map(|d| d.substitute(subst)).collect()))
-            }
+            Formula::Conjunction(cs) => Rc::new(Formula::Conjunction(
+                cs.iter().map(|c| c.substitute(subst)).collect(),
+            )),
+            Formula::Disjunction(ds) => Rc::new(Formula::Disjunction(
+                ds.iter().map(|d| d.substitute(subst)).collect(),
+            )),
             Formula::Exists { params, body } => {
                 let inner = shadowed(subst, params);
                 Rc::new(Formula::Exists {
@@ -353,13 +358,9 @@ impl Formula {
                 right_id: *right_id,
             }),
             // De Morgan: !(a & b) == !a | !b.
-            Formula::Conjunction(cs) => {
-                Formula::disjoin_all(cs.iter().map(|c| c.negation()))
-            }
+            Formula::Conjunction(cs) => Formula::disjoin_all(cs.iter().map(|c| c.negation())),
             // De Morgan: !(a | b) == !a & !b.
-            Formula::Disjunction(ds) => {
-                Formula::conjoin_all(ds.iter().map(|d| d.negation()))
-            }
+            Formula::Disjunction(ds) => Formula::conjoin_all(ds.iter().map(|d| d.negation())),
             // !exists x. p == forall x. !p.
             Formula::Exists { params, body } => Rc::new(Formula::Forall {
                 params: params.clone(),
@@ -479,7 +480,9 @@ mod tests {
         match neg.as_ref() {
             Formula::Disjunction(ds) => {
                 assert_eq!(ds.len(), 2);
-                assert!(ds.iter().all(|d| matches!(d.as_ref(), Formula::Negation(_))));
+                assert!(ds
+                    .iter()
+                    .all(|d| matches!(d.as_ref(), Formula::Negation(_))));
             }
             _ => panic!("expected disjunction of negations"),
         }
