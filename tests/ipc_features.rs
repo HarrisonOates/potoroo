@@ -828,3 +828,64 @@ fn every_representation_agrees_on_a_parameterised_cost() {
     costs.sort_unstable();
     assert_eq!(costs, vec![1, 1, 10]);
 }
+
+#[test]
+fn an_undeclared_predicate_keeps_the_arity_of_its_first_use() {
+    // `(:predicates ...)` omits `road`, so it is declared on first use. Giving
+    // it no parameters left the emitted domain contradicting its own actions,
+    // which the translator rejects.
+    let domain_source = r#"
+    (define (domain undeclared)
+      (:requirements :strips :typing)
+      (:types loc)
+      (:predicates (at ?x - loc))
+      (:action move
+        :parameters (?a - loc ?b - loc)
+        :precondition (and (at ?a) (road ?a ?b))
+        :effect (and (at ?b) (not (at ?a)))))
+    "#;
+    let problem_source = r#"
+    (define (problem undeclared-p)
+      (:domain undeclared)
+      (:objects l1 l2 - loc)
+      (:init (at l1) (road l1 l2))
+      (:goal (at l2)))
+    "#;
+    let (domain, _) = lower(domain_source, problem_source);
+    let road = domain
+        .predicates
+        .find_predicate("road")
+        .expect("`road` is declared on first use");
+    assert_eq!(domain.predicates.parameters(road).len(), 2);
+}
+
+#[test]
+fn a_domain_and_a_problem_in_one_source_are_read_as_two_units() {
+    // The documented stdin workflow pipes a domain and a problem together, and
+    // the parser reads only the first form in a string.
+    let combined = format!("{COST_DOMAIN}\n{COST_PROBLEM}");
+    let units = potoroo::parser::split_units(&combined);
+    assert_eq!(units.len(), 2);
+    assert!(matches!(
+        read_pddl(&units[0]).unwrap(),
+        ParsedUnit::Domain(_)
+    ));
+    assert!(matches!(
+        read_pddl(&units[1]).unwrap(),
+        ParsedUnit::Problem(_)
+    ));
+}
+
+#[test]
+fn a_parse_failure_reports_a_line_and_column() {
+    let broken = "(define (domain broken)\n  (:requirements :strips)\n  (:predicates (at ?x))\n\
+                    (:action move :parameters (?a) :precondition (at ?a :effect (at ?a)))";
+    let Err(error) = read_pddl(broken) else {
+        panic!("a precondition left unclosed must not parse");
+    };
+    let message = error.to_string();
+    assert!(message.contains("line "), "no line in `{message}`");
+    assert!(message.contains("column "), "no column in `{message}`");
+    // The whole remaining input used to be echoed into the message.
+    assert!(message.len() < 200, "message is not bounded: `{message}`");
+}

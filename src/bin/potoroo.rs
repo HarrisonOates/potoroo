@@ -63,16 +63,21 @@ fn run() -> Result<ExitCode, String> {
     // Problems are solved in name order, matching the C++ `std::map` iteration.
     let mut problems: BTreeMap<String, Problem> = BTreeMap::new();
 
+    // Each buffer may hold several `(define ...)` forms — the documented stdin
+    // workflow pipes a domain and a problem together — and the parser reads only
+    // the first form in a string, so split before parsing.
     let sources: Vec<String> = if cli.files.is_empty() {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| format!("error reading stdin: {e}"))?;
-        vec![buf]
+        potoroo::parser::split_units(&buf)
     } else {
         let mut v = Vec::new();
         for f in &cli.files {
-            v.push(std::fs::read_to_string(f).map_err(|e| format!("error reading {f}: {e}"))?);
+            let source =
+                std::fs::read_to_string(f).map_err(|e| format!("error reading {f}: {e}"))?;
+            v.extend(potoroo::parser::split_units(&source));
         }
         v
     };

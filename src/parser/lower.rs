@@ -216,12 +216,27 @@ fn lower_term(
 // Formulas (goal descriptions)
 // ---------------------------------------------------------------------------
 
-fn predicate_for(preds: &mut PredicateTable, name: &str) -> crate::predicates::Predicate {
+/// Looks up a predicate, declaring it on first use if `(:predicates ...)` left
+/// it out.
+///
+/// An auto-declared predicate takes its arity from that first use. Declaring it
+/// with no parameters instead left its atoms carrying arguments its signature
+/// denied, and [`crate::pddl_emit`] then handed Fast Downward a domain whose
+/// `(:predicates)` block contradicted its own actions — the translator rejects
+/// it and grounding silently falls back to naive instantiation.
+fn predicate_for(
+    preds: &mut PredicateTable,
+    name: &str,
+    arity: usize,
+) -> crate::predicates::Predicate {
     if let Some(p) = preds.find_predicate(name) {
-        p
-    } else {
-        preds.add_predicate(name)
+        return p;
     }
+    let p = preds.add_predicate(name);
+    for _ in 0..arity {
+        preds.add_parameter(p, crate::types::OBJECT);
+    }
+    p
 }
 
 /// Lowers an `AtomicFormula<Term>` into either an [`Atom`] (for predicates) or an
@@ -245,7 +260,7 @@ fn lower_atomic(
             Ok(LoweredAtomic::Equality(l, r))
         }
         AtomicFormula::Predicate(pa) => {
-            let pred = predicate_for(preds, s(pa.predicate()));
+            let pred = predicate_for(preds, s(pa.predicate()), pa.values().len());
             let mut terms = Vec::with_capacity(pa.values().len());
             for t in pa.values() {
                 terms.push(lower_term(t, scope, consts, objects)?);
@@ -970,7 +985,7 @@ fn lower_init_element(
             // means false.
             match af {
                 AtomicFormula::Predicate(pa) => {
-                    let pred = predicate_for(preds, s(pa.predicate()));
+                    let pred = predicate_for(preds, s(pa.predicate()), pa.values().len());
                     let mut terms = Vec::with_capacity(pa.values().len());
                     for n in pa.values() {
                         let o = resolve_object(n.as_ref(), consts, objects)?;
