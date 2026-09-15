@@ -555,3 +555,91 @@ fn effect_separator_preserves_a_disjunctive_precondition() {
     };
     assert_eq!(solution.num_steps(), 1);
 }
+
+const QUANTIFIED_PRECONDITION_DOMAIN: &str = r#"
+(define (domain quantified-pre)
+  (:requirements :strips :typing :conditional-effects
+                 :existential-preconditions :universal-preconditions)
+  (:types loc key)
+  (:predicates (at ?x - loc) (clean ?l - loc) (visited ?l - loc)
+               (holds ?k - key) (opens ?k - key ?l - loc) (safe ?l - loc))
+  (:action move
+    :parameters (?a - loc ?b - loc)
+    :precondition (and (at ?a) (exists (?k - key) (and (holds ?k) (opens ?k ?b))))
+    :effect (and (at ?b) (not (at ?a)) (visited ?b)))
+  (:action sweep
+    :parameters (?a - loc)
+    :precondition (at ?a)
+    :effect (when (visited ?a) (clean ?a))))
+"#;
+
+const UNIVERSAL_PRECONDITION_DOMAIN: &str = r#"
+(define (domain universal-pre)
+  (:requirements :strips :typing :conditional-effects :universal-preconditions)
+  (:types loc key)
+  (:predicates (at ?x - loc) (clean ?l - loc) (visited ?l - loc)
+               (holds ?k - key) (opens ?k - key ?l - loc) (safe ?l - loc))
+  (:action move
+    :parameters (?a - loc ?b - loc)
+    :precondition (and (at ?a) (forall (?l - loc) (safe ?l)))
+    :effect (and (at ?b) (not (at ?a)) (visited ?b)))
+  (:action sweep
+    :parameters (?a - loc)
+    :precondition (at ?a)
+    :effect (when (visited ?a) (clean ?a))))
+"#;
+
+/// Solves the two-step `move`-then-`sweep` task, whose only route to `(clean l2)`
+/// runs through a conditional effect whose guard is established by an action with
+/// a quantified precondition.
+fn solve_quantified_precondition(
+    domain_source: &str,
+    domain_name: &str,
+    heuristic: &str,
+) -> Outcome {
+    let problem_source = format!(
+        "(define (problem quantified-pre-p)\n\
+           (:domain {domain_name})\n\
+           (:objects l1 l2 - loc k1 - key)\n\
+           (:init (at l1) (visited l1) (holds k1) (opens k1 l2) (safe l1) (safe l2))\n\
+           (:goal (clean l2)))"
+    );
+    let (domain, problem) = lower(domain_source, &problem_source);
+    let params = Parameters {
+        heuristic: Heuristic::parse(heuristic).unwrap(),
+        search_limits: vec![10_000],
+        ..Parameters::default()
+    };
+    let context = SearchContext::new(&domain, &problem, &params);
+    plan(&context)
+}
+
+#[test]
+fn planning_graph_heuristics_reach_through_an_existential_precondition() {
+    // A quantified precondition must not make its action unreachable in the
+    // relaxed planning graph: doing so reports a solvable task unsolvable.
+    for heuristic in ["ADD", "ADDR", "RELAX"] {
+        let Outcome::Solved(solution) = solve_quantified_precondition(
+            QUANTIFIED_PRECONDITION_DOMAIN,
+            "quantified-pre",
+            heuristic,
+        ) else {
+            panic!("`{heuristic}` failed to solve past an existential precondition");
+        };
+        assert_eq!(solution.num_steps(), 2, "heuristic `{heuristic}`");
+    }
+}
+
+#[test]
+fn planning_graph_heuristics_reach_through_a_universal_precondition() {
+    for heuristic in ["ADD", "ADDR", "RELAX"] {
+        let Outcome::Solved(solution) = solve_quantified_precondition(
+            UNIVERSAL_PRECONDITION_DOMAIN,
+            "universal-pre",
+            heuristic,
+        ) else {
+            panic!("`{heuristic}` failed to solve past a universal precondition");
+        };
+        assert_eq!(solution.num_steps(), 2, "heuristic `{heuristic}`");
+    }
+}

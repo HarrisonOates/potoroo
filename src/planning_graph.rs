@@ -14,7 +14,8 @@ use crate::effect::Effect;
 use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Atom, Formula, Literal};
 use crate::instantiate::{
-    instantiate_atom, instantiate_effect, instantiate_formula, precondition_consistent,
+    instantiate_atom, instantiate_effect, instantiate_formula, instantiate_formula_expanded,
+    precondition_consistent, quantified_variables,
 };
 use crate::params::ActionCost;
 use crate::plan::{Plan, StepAction, INIT_ID};
@@ -443,15 +444,26 @@ impl PlanningGraph {
         // Pre-compute the compatible-object lists for every type that appears
         // as a schema parameter, so `get_objects` is called at most once per type.
         let mut type_domains: FastMap<Type, Vec<Object>> = FastMap::default();
+        let mut quantified: Vec<Variable> = Vec::new();
         for schema in schemas {
             // Quantified-effect variables are enumerated just like parameters,
-            // so their types need a domain as well.
+            // so their types need a domain as well. So do the variables bound by
+            // a quantifier in a precondition or an effect guard, which the graph
+            // expands over their domains rather than leaving free.
+            quantified.clear();
+            quantified_variables(&schema.precondition, &mut quantified);
+            for effect in &schema.effects {
+                quantified_variables(&effect.condition, &mut quantified);
+            }
             let vars = schema
                 .parameters
                 .iter()
-                .chain(schema.effects.iter().flat_map(|e| e.parameters.iter()));
+                .chain(schema.effects.iter().flat_map(|e| e.parameters.iter()))
+                .chain(quantified.iter());
             for &v in vars {
-                let ty = schema.var_types[v.0 as usize];
+                let Some(&ty) = schema.var_types.get(v.0 as usize) else {
+                    continue;
+                };
                 type_domains.entry(ty).or_insert_with(|| get_objects(ty));
             }
         }
@@ -526,6 +538,7 @@ impl PlanningGraph {
                     tuple,
                     &pg,
                     predicates,
+                    &type_domains,
                     &mut reachable_actions,
                 );
             });
@@ -1546,7 +1559,13 @@ fn apply_schema_tuple(
         return;
     }
 
-    let ground_pre = instantiate_formula(&schema.precondition, subst);
+    let mut expanded = subst.to_vec();
+    let ground_pre = instantiate_formula_expanded(
+        &schema.precondition,
+        &mut expanded,
+        &schema.var_types,
+        type_domains,
+    );
     let (pre_value, _) = pg.ground_formula_value(predicates, &ground_pre);
     if pre_value.infinite() {
         return;
@@ -1561,6 +1580,8 @@ fn apply_schema_tuple(
                 &pre_value,
                 pg,
                 predicates,
+                &schema.var_types,
+                type_domains,
                 new_atom_values,
                 new_negation_values,
                 changed,
@@ -1586,6 +1607,8 @@ fn apply_schema_tuple(
                 &pre_value,
                 pg,
                 predicates,
+                &schema.var_types,
+                type_domains,
                 new_atom_values,
                 new_negation_values,
                 changed,
@@ -1605,11 +1628,15 @@ fn apply_effect_tuple(
     pre_value: &HeuristicValue,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
+    var_types: &[Type],
+    type_domains: &FastMap<Type, Vec<Object>>,
     new_atom_values: &mut FastMap<Atom, HeuristicValue>,
     new_negation_values: &mut FastMap<Atom, HeuristicValue>,
     changed: &mut bool,
 ) {
-    let ground_cond = instantiate_formula(&effect.condition, subst);
+    let mut expanded = subst.to_vec();
+    let ground_cond =
+        instantiate_formula_expanded(&effect.condition, &mut expanded, var_types, type_domains);
     let (mut cond_value, _) = pg.ground_formula_value(predicates, &ground_cond);
     if cond_value.infinite() {
         return;
@@ -1698,13 +1725,24 @@ fn collect_reachable_tuple(
     tuple: &[Object],
     pg: &PlanningGraph,
     predicates: &PredicateTable,
+    type_domains: &FastMap<Type, Vec<Object>>,
     out: &mut Vec<Rc<StepAction>>,
 ) {
     if !precondition_consistent(&schema.precondition, subst) {
         return;
     }
     let ground_pre = instantiate_formula(&schema.precondition, subst);
-    let (pre_value, _) = pg.ground_formula_value(predicates, &ground_pre);
+    // Reachability is decided on the quantifier-expanded precondition, but the
+    // action keeps the compact one: expanding every binder into the stored
+    // schema would bloat each ground action for no gain downstream.
+    let mut expanded = subst.to_vec();
+    let reachability_pre = instantiate_formula_expanded(
+        &schema.precondition,
+        &mut expanded,
+        &schema.var_types,
+        type_domains,
+    );
+    let (pre_value, _) = pg.ground_formula_value(predicates, &reachability_pre);
     if pre_value.infinite() {
         return;
     }
