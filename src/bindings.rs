@@ -493,6 +493,10 @@ pub struct Bindings {
     index: RefCell<Option<IndexState>>,
 }
 
+/// The varset chain, high step, and chain length that adding a set of bindings
+/// would produce. See [`Bindings::try_add`].
+type AddedVarsets = (Option<Rc<Chain<Varset>>>, usize, usize);
+
 impl Bindings {
     pub fn empty() -> Rc<Bindings> {
         Rc::new(Bindings::default())
@@ -900,11 +904,7 @@ impl Bindings {
     /// `new_bindings`, or `None` if inconsistent. Shared by [`Bindings::add`]
     /// (which wraps the result in an `Rc`) and the consistency checks in
     /// `unify`/`affects`.
-    fn try_add(
-        &self,
-        ctx: &TypeContext,
-        new_bindings: &[Binding],
-    ) -> Option<(Option<Rc<Chain<Varset>>>, usize, usize)> {
+    fn try_add(&self, ctx: &TypeContext, new_bindings: &[Binding]) -> Option<AddedVarsets> {
         if new_bindings.is_empty() {
             return Some((self.varsets.clone(), self.high_step, self.num_varsets));
         }
@@ -987,15 +987,10 @@ impl Bindings {
                     (None, Some((_, n2))) => n2.head.add_var(ctx, bind.var, bind.var_id),
                     (Some((_, n1)), None) => n1.head.add_term(ctx, bind.term, bind.term_id),
                 };
-                match comb {
-                    None => return None,
-                    Some(new_vs) => {
-                        // Push the combined varset; the resolver searches the
-                        // head first, so the most recent class wins.
-                        varsets = chain::cons(new_vs, varsets);
-                        delta += 1;
-                    }
-                }
+                // Push the combined varset; the resolver searches the head
+                // first, so the most recent class wins.
+                varsets = chain::cons(comb?, varsets);
+                delta += 1;
             } else {
                 // Inequality binding.
                 if let (Some((i1, _)), Some((i2, _))) = (&vs1, &vs2) {

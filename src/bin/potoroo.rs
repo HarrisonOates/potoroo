@@ -223,7 +223,7 @@ fn run() -> Result<ExitCode, String> {
                 if cli.verbosity > 0 {
                     eprintln!("Plan: {} steps | cost {}", p.num_steps(), p.cost());
                 }
-                println!("{}", format_steps(&ctx, &p));
+                println!("{}", format_steps(&ctx, p));
                 (true, p.num_steps(), p.cost(), "solved")
             }
             Outcome::LimitReached => {

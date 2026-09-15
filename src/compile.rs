@@ -1,44 +1,17 @@
-//! Causal-link compilation of a partial POCL plan into a classical STRIPS task.
+//! Causal-link compilation into a classical STRIPS task
+//! (Bercher, Geier & Biundo, 2013).
 //!
-//! Implements the encoding of Bercher, Geier & Biundo (2013), "Using State-Based
-//! Planning Heuristics for Partial-Order Causal-Link Planning" (§3), extended
-//! with the *polynomial* causal-link protection of the position paper's
-//! Proposition 1 (the paper's own `count(v)` link compilation is exponential —
-//! "horrible" — and their evaluation simply ignored link protection).
+//! Each committed step has execution indicators that force it to occur once
+//! and enforce its ordering predecessors. Original task goals remain goals;
+//! open conditions are required through their consuming steps.
 //!
-//! ## Base encoding (Bercher et al. 2013)
-//! For a partial plan `P = (PS, ≺, CL)` and problem `π = (V, A, s_init, g)`, the
-//! encoding `enc(P,π) = (V', A', s'_init, g')` introduces, for each plan step
-//! `l:a` (excluding the artificial init `l_0` and goal `l_∞`), two indicator
-//! propositions `l₋` and `l₊`:
+//! One guard per causal link blocks deleters between producer and consumer.
+//! The producer clears the guard and the consumer restores it. Initial links
+//! start protected; goal links stay protected through completion. Guards are
+//! not goals, and their encoding is O(|CL| * |A|).
 //!
-//! - `enc(l:(pre,add,del)) = (pre ∪ {l₋} ∪ {l'₊ | l' ≺ l, l' ≠ l_0},
-//!                            add ∪ {l₊}, del ∪ {l₋})`
-//! - `s'_init = s_init ∪ {l₋}`  (every step "not yet executed")
-//! - `g' = g ∪ {l₊}`           (every step must be executed)
-//!
-//! `l₋` (precondition + delete of `l`) makes the step fire at most once; `l₊`
-//! (add of `l`, goal) forces it to fire; the `l'₊` preconditions enforce the
-//! partial order `≺`. The original goal `g` is the artificial goal step's
-//! precondition; open conditions are *not* goals — they are forced via the step
-//! preconditions plus the `l₊` flags.
-//!
-//! ## Causal-link protection (position paper, Prop 1 — polynomial)
-//! One guard proposition `g_cl` per causal link `(p, v, c)`:
-//! - true in `s'_init` iff `p` is a real step (which will delete it); for an
-//!   init-produced link it starts false so the protected interval already blocks
-//!   deleters from the start;
-//! - the producer deletes `g_cl`, the consumer adds it back; a goal-consumed link
-//!   never re-adds it, so deleters stay blocked to the end;
-//! - every action deleting the protected literal `v` gets `g_cl` as a
-//!   precondition, so it cannot fire inside the protected interval.
-//! Guards are never goal requirements. This is `O(|CL|·|A|)` (Prop 1).
-//!
-//! The result is a [`CompiledProblem`] IR rendered to PDDL by [`emit_pddl`]; the
-//! IR is the shared root for the FD heuristic (Phase 1) and the LP heuristic
-//! (Phase 4, via FD's translator). Lifted partial plans are handled by leaving
-//! unbound step variables as action parameters (FD grounds them) — per §4
-//! "Ground Planning", ignoring designation constraints is a sound relaxation.
+//! Unbound step variables remain action parameters for external grounding.
+//! Ignoring designation constraints gives a relaxation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;

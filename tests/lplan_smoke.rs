@@ -20,8 +20,10 @@ fn eval(domain_file: &str, problem_file: &str) -> (f32, f32, std::time::Duration
         ParsedUnit::Problem(p) => lower_problem(&p, &domain).unwrap(),
         _ => panic!(),
     };
-    let mut params = Parameters::default();
-    params.ground_actions = true;
+    let params = Parameters {
+        ground_actions: true,
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let initial = Plan::make_initial_plan(&ctx).expect("initial plan");
     let t = Instant::now();
@@ -68,9 +70,11 @@ fn lplan_sussman_solves_valid_optimal() {
         ParsedUnit::Problem(p) => lower_problem(&p, &domain).unwrap(),
         _ => panic!(),
     };
-    let mut params = Parameters::default();
-    params.ground_actions = true;
-    params.heuristic = potoroo::heuristics::Heuristic::parse("LPLAN").unwrap();
+    let params = Parameters {
+        ground_actions: true,
+        heuristic: potoroo::heuristics::Heuristic::parse("LPLAN").unwrap(),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
     let sol = match plan(&ctx) {
         Outcome::Solved(p) => p,

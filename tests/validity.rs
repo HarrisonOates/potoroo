@@ -25,9 +25,11 @@ fn check(domain_file: &str, problem_file: &str, heuristic: &str, ground: bool) {
         _ => panic!("expected a problem"),
     };
 
-    let mut params = Parameters::default();
-    params.ground_actions = ground;
-    params.heuristic = potoroo::heuristics::Heuristic::parse(heuristic).expect("valid heuristic");
+    let params = Parameters {
+        ground_actions: ground,
+        heuristic: potoroo::heuristics::Heuristic::parse(heuristic).expect("valid heuristic"),
+        ..Parameters::default()
+    };
 
     let ctx = SearchContext::new(&domain, &problem, &params);
     let solution = match plan(&ctx) {

@@ -74,8 +74,10 @@ fn addr_value_and_cost_against_plan_depth() {
 
     // The context's heuristic only drives the search; both estimates below are
     // computed explicitly, so the comparison is against identical plans.
-    let mut params = Parameters::default();
-    params.heuristic = Heuristic::parse("ADD").expect("ADD");
+    let params = Parameters {
+        heuristic: Heuristic::parse("ADD").expect("ADD"),
+        ..Parameters::default()
+    };
     let ctx = SearchContext::new(&domain, &problem, &params);
 
     let h_add = Heuristic::parse("ADD_COST").expect("ADD_COST");
