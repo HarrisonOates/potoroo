@@ -44,6 +44,8 @@ pub(crate) enum HVal {
     /// over the causal-link compilation reaches the goal — an admissible lower
     /// bound on the completion length. Ground search only.
     Lplan(crate::lplan::Tightenings),
+    /// The SAS+ LP heuristic over Fast Downward's finite-domain task.
+    Lpsas(crate::lpsas::Operators),
     /// Causal-link compilation heuristic: rank by a state-based heuristic
     /// (computed by Fast Downward) on the initial state of the classical problem
     /// the partial plan compiles to (`crate::compile`). The `FdHeuristic` is the
@@ -74,6 +76,29 @@ impl Heuristic {
             let upper = part.to_ascii_uppercase();
             if upper == "LPLAN" {
                 h.push(HVal::Lplan(crate::lplan::Tightenings::NONE));
+                continue;
+            }
+            // `LPSAS` relaxes the operator variables; `LPSAS:MIP` holds them
+            // integral, and `LPSAS:MIP<millis>` caps each probe at that budget.
+            if upper == "LPSAS" || upper.starts_with("LPSAS:") {
+                let spec = upper.strip_prefix("LPSAS:").unwrap_or("");
+                let operators = match spec {
+                    "" => crate::lpsas::Operators::Fractional,
+                    "MIP" => crate::lpsas::Operators::Integral,
+                    other => match other.strip_prefix("MIP") {
+                        Some(millis) => crate::lpsas::Operators::IntegralWithin(
+                            millis
+                                .parse::<u64>()
+                                .map_err(|_| format!("invalid LPSAS budget `{millis}`"))?,
+                        ),
+                        None => {
+                            return Err(format!(
+                                "unknown LPSAS mode `{other}` (expected MIP or MIP<millis>)"
+                            ))
+                        }
+                    },
+                };
+                h.push(HVal::Lpsas(operators));
                 continue;
             }
             if upper == "LPLAN2" || upper.starts_with("LPLAN2:") {
@@ -369,6 +394,11 @@ impl Heuristic {
                 // ranks use the same value, computed once.
                 HVal::SampleFf(k) => {
                     let v = crate::sample_ff::sample_ff_rank(plan, search_ctx, weight, k);
+                    rank.push(v);
+                    grank.push(v);
+                }
+                HVal::Lpsas(operators) => {
+                    let v = crate::lpsas::lpsas_rank(plan, search_ctx, weight, operators);
                     rank.push(v);
                     grank.push(v);
                 }

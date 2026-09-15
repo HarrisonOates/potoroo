@@ -65,6 +65,11 @@ pub struct SearchContext<'a> {
     /// search node so the `COMPILE` heuristic only re-grounds the per-node delta
     /// (committed steps + indicators + guards). See `crate::compile`.
     compile_base: RefCell<Option<Rc<crate::compile::BaseGroundTask>>>,
+    /// The translated finite-domain task, for the SAS+ LP heuristic. Built once
+    /// per search: translating runs Fast Downward, which costs far more than a
+    /// node. The inner `None` records that translation failed, so it is not
+    /// retried at every node.
+    fdr_task: RefCell<Option<Option<Rc<crate::fdr::Task>>>>,
     /// The problem-constant Sample-FF model (interned ground facts, delete-relaxed
     /// ground actions, cached initial-state fixpoint), built lazily on first use
     /// and reused across every search node. See `crate::sample_ff`.
@@ -143,6 +148,7 @@ impl<'a> SearchContext<'a> {
             planning_graph: RefCell::new(None),
             fresh_vars: RefCell::new(FastMap::default()),
             compile_base: RefCell::new(None),
+            fdr_task: RefCell::new(None),
             sample_ff_model: RefCell::new(None),
             cost_values: crate::parser::lower::cost_function_values(problem),
             h_evals: Cell::new(0),
@@ -425,6 +431,16 @@ impl<'a> SearchContext<'a> {
             *self.compile_base.borrow_mut() = Some(Rc::new(base));
         }
         self.compile_base.borrow().clone().unwrap()
+    }
+
+    /// The translated finite-domain task, or `None` if translation failed.
+    /// Translation runs Fast Downward, so it happens once per search.
+    pub fn fdr_task(&self) -> Option<Rc<crate::fdr::Task>> {
+        if self.fdr_task.borrow().is_none() {
+            let translated = crate::fdr_pocl::translate(self).ok().map(Rc::new);
+            *self.fdr_task.borrow_mut() = Some(translated);
+        }
+        self.fdr_task.borrow().clone().flatten()
     }
 
     /// Returns the problem-constant Sample-FF model (interned facts, delete-relaxed
