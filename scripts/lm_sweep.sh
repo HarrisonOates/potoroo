@@ -4,8 +4,9 @@
 #   scripts/lm_sweep.sh [OPTIONS]
 #     -b DIR      benchmark root, one directory per domain family
 #                 (default: ../downward-benchmarks)
-#     -c CSV      heuristic configurations to compare
+#     -c CSV      configurations to compare, as HEURISTIC[+PRUNE-RULES]
 #                 (default: ADD,RELAX,LM,LMF,LMFO)
+#                 e.g. ADD, ADD+cutset, ADD+all, LM+params
 #     -t SECS     per-run wall timeout (default 60)
 #     -n N        problems per family, smallest first (default 5)
 #     -j N        concurrent runs (default 4)
@@ -54,9 +55,12 @@ BIN="$root/target/release/potoroo"
 run_one() {
   family="$1"; domain="$2"; problem="$3"; config="$4"
   name="$(basename "$problem" .pddl)"
+  # A configuration is a heuristic, optionally with pruning rules after a `+`.
+  heuristic="${config%%+*}"
+  if [ "$heuristic" = "$config" ]; then prune="none"; else prune="${config#*+}"; fi
   stats="$(
     ulimit -v $((MEM_MB * 1024)) 2>/dev/null
-    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" -h "$config" "$domain" "$problem" \
+    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" -h "$heuristic" -p "$prune" "$domain" "$problem" \
       2>&1 >/dev/null | grep '^STATS ' | head -1
   )"
   if [ -z "$stats" ]; then

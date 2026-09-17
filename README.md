@@ -645,6 +645,45 @@ and forcing orderings sooner moves plans out of the state where `cutset` would
 have rejected them outright. The same shape shows up under `--fdr-pocl`. Enable
 it to study it, not to go faster.
 
+### What they are worth, measured for coverage
+
+The verdict below — "the rules do not pay" — was reached on the nine example
+problems, and it does not survive a corpus. On the same sweep as the landmark
+one (147 families, 3 problems each, 20s and 768MB; see
+[Landmark sweep](#landmark-sweep)):
+
+| Configuration | Coverage | against `ADD` |
+|---|---|---|
+| `ADD -p cutset` | **114 / 441** | **+6 solved, −1** |
+| `ADD` | 109 / 441 | — |
+| `ADD -p all` | 109 / 441 | ±0 |
+| `ADD -p params` | 108 / 441 | −1 |
+| `ADD -p recursion` | 108 / 441 | −1 |
+| `ADD -p minimality` | 104 / 441 | −5 |
+
+Raw rows in `docs/prune-sweep-results.csv`.
+
+`cutset` is worth five problems net — more coverage than any heuristic change in
+this planner has bought. The six it gains needed between 5k and 900k generated
+nodes; the nine example problems solve in about a thousand. That is the whole
+explanation for the earlier verdict: on problems that finish in a thousand nodes
+there is nothing to prune and the per-node check is pure overhead, and that is
+all the example set contains. Where both solve, the pattern is exactly that
+trade — median generated nodes fall from 802 to 558 (fewer on 65 of 108
+problems, more on 12) while median wall time *rises* from 3.5ms to 8ms. The rule
+pays only once the node count is large enough for the saving to outrun its own
+cost.
+
+The other three do not improve with scale. `params` and `recursion` cost a
+problem each, and `minimality` costs five — it is the one rule that is actively
+harmful on a corpus, which the example set could not show either. `-p all` is
+`cutset` plus `edelete` and lands back at the baseline, so it remains the wrong
+switch to reach for.
+
+Plan cost moved on 7 of the 108 problems both configurations solve (5 cheaper,
+2 dearer), which is the expected consequence of changing the node set under an
+inadmissible heuristic, not a soundness problem.
+
 ### Does the rest of it pay, in lifted mode?
 
 Not on this example set, and they add nothing on top of `cutset` either. Holding
@@ -739,6 +778,12 @@ them, enabling one is a deliberate act rather than a silent default.
 
 `tests/pruning.rs` pins both halves of that claim: the rules leave the plans
 found on the example suite unchanged, and each rule is shown to actually fire.
+
+The coverage measurement above is an argument for making `-p cutset` the
+default, and deliberately has not been acted on: every number published from
+this planner so far was taken without it, so flipping the default silently would
+invalidate the comparison rather than improve it. It is a decision to take
+explicitly, alongside re-taking those measurements.
 
 ## Landmark sweep
 
