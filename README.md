@@ -493,7 +493,7 @@ discard a refinable plan. Refinement is bounded at three parts.
 This is Fišer's lifted fact-alternating mutex groups (AAAI 2020) in the shape of
 Helmert's invariant synthesis (AIJ 2009).
 
-It is the one rule that makes lifted search do less work rather than reject what
+It is the one rule that makes lifted search explore less rather than reject what
 the heuristic was rejecting anyway. Under `-g -h LPLAN`, which is genuinely
 cost-optimal:
 
@@ -508,6 +508,33 @@ cost-optimal:
 Costs are unchanged in every row. Multi-part groups are most of that: with
 single-predicate groups alone, `test-ferry` stopped at 190 and `logistics-a` did
 not move at all.
+
+But fewer nodes is not the same as less time, and here the two part company. The
+check walks every step against every link, so its cost per node is
+`O(steps × links)` and grows with plan length — while whether it fires at all is
+a property of the domain, not of the plan's size. Measured on problems that
+solve, so that node counts mean something:
+
+| | longest plan | generated | | wall ms | |
+|---|---|---|---|---|---|
+| | | default | `-p cutset` | default | `-p cutset` |
+| `get-paid` | 2 | 17 | 17 | 0 | 0 |
+| `road-test` | 4 | 21 | 21 | 0 | 0 |
+| `test-ferry` | 7 | 254 | **74** | 0 | 0 |
+| `gripper-4` | 9 | 231 | **203** | 0 | 0 |
+| `gripper-6` | 15 | 835 | **330** | 1 | 3 |
+| `logistics-a` | 52 | 13081 | **10458** | 78 | **666** |
+
+So: a clear win where plans stay short and the domain has state-variable
+structure, and a clear loss where plans get long. `logistics-a` explores a fifth
+fewer nodes and takes eight times as long to do it.
+
+That is worth stating plainly, because it is not a fixable constant. Any
+plan-space pruning rule that inspects the whole partial plan pays a price that
+grows with plan length — which is exactly where POCL search is already in
+trouble, and the same tension the HSDIP position paper raises about node growth.
+Hoisting the binding resolution out of the inner loop cut this cost five-fold
+(`logistics-a`: 2781 ms to 666 ms) and the shape did not change.
 
 ### A note on `edelete` outside `--fdr-pocl`
 
@@ -530,8 +557,26 @@ it to study it, not to go faster.
 
 ### Does the rest of it pay, in lifted mode?
 
-Not on this example set — and the reason is worth recording rather than
-rediscovering.
+Not on this example set, and they add nothing on top of `cutset` either. Holding
+`cutset` fixed and adding one rule at a time, generated nodes do not move at all:
+
+| `logistics-a`, generated | |
+|---|---|
+| default | 13081 |
+| `-p cutset` | 10458 |
+| `-p cutset,params` | 10458 |
+| `-p cutset,recursion` | 10458 |
+| `-p cutset,minimality` | 10458 |
+| `-p cutset,edelete` | 13345 |
+| `-p all` | 13345 |
+
+`params` does raise the `pruned` counter (1376 to 5272) without changing a
+single node, which is the clearest demonstration that what it rejects is what
+the `∞`-rank guard was about to reject anyway. `edelete` is the only one of the
+four that changes the search, and it changes it for the worse — so `-p all` is
+exactly `-p cutset,edelete`, and strictly worse than `-p cutset`.
+
+The reason is worth recording rather than rediscovering.
 
 Measured end-to-end with no node cap, `-p params` and `-p all` generate
 **exactly** the same number of nodes as the bare default on every lifted problem

@@ -298,7 +298,7 @@ pub mod lifted {
     use crate::formula::{Atom, Formula, Literal};
     use crate::lifted_mutex::LiftedMutexes;
     use crate::orderings::{BinaryOrderings, StepTime};
-    use crate::plan::Plan;
+    use crate::plan::{Link, Plan};
     use crate::search::SearchContext;
 
     fn necessarily_before(orderings: &BinaryOrderings, before: usize, after: usize) -> bool {
@@ -317,19 +317,48 @@ pub mod lifted {
         crate::lifted_mutex::ground_atom(&plan.bindings, atom, step_id)
     }
 
-    /// Whether the rule could fire at all. Allocation-free.
+    /// Whether the rule could fire at all.
+    ///
+    /// Allocation-free, and it asks the sharper question: not merely whether
+    /// the plan has links, but whether any link carries a condition some group
+    /// covers. On a domain whose groups touch none of the plan's conditions
+    /// this rejects every node without resolving a single term.
     pub fn may_apply(plan: &Plan, mutexes: &LiftedMutexes) -> bool {
-        !mutexes.is_empty() && plan.num_links > 0 && plan.num_steps() > 0
+        if mutexes.is_empty() || plan.num_links == 0 || plan.num_steps() == 0 {
+            return false;
+        }
+        chain::iter(&plan.links).any(|link| mutexes.covers(link.condition.atom().predicate))
     }
 
     /// Whether some cutset of the plan contains a mutex pair.
     ///
     /// Call [`may_apply`] first; this assumes it passed.
+    ///
+    /// Every link condition is resolved through the bindings **once**, not once
+    /// per step: the binding lookup is the expensive part, and doing it inside
+    /// the step-by-link loop made the rule cost more in time than the search it
+    /// saved.
     pub fn has_inconsistent_cutset(
         ctx: &SearchContext,
         plan: &Plan,
         mutexes: &LiftedMutexes,
     ) -> bool {
+        // One pass over the links: keep those whose condition a group covers and
+        // whose terms have all reached objects. Anything else can neither be a
+        // mutex nor be compared to one.
+        let mut links: Vec<(&Link, Atom)> = Vec::new();
+        for link in chain::iter(&plan.links) {
+            if !mutexes.covers(link.condition.atom().predicate) {
+                continue;
+            }
+            if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
+                links.push((link, atom));
+            }
+        }
+        if links.is_empty() {
+            return false;
+        }
+
         let mut spanning: Vec<Atom> = Vec::new();
         let mut cutset: Vec<Atom> = Vec::new();
 
@@ -338,16 +367,14 @@ pub mod lifted {
                 continue;
             }
             spanning.clear();
-            for link in chain::iter(&plan.links) {
+            for (link, atom) in &links {
                 if link.from_id == step.id || link.to_id == step.id {
                     continue;
                 }
                 if necessarily_before(&plan.orderings, link.from_id, step.id)
                     && necessarily_before(&plan.orderings, step.id, link.to_id)
                 {
-                    if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
-                        spanning.push(atom);
-                    }
+                    spanning.push(atom.clone());
                 }
             }
             if spanning.is_empty() {
@@ -359,12 +386,9 @@ pub mod lifted {
             // open conditions, which any completion has to establish there too.
             cutset.clear();
             cutset.extend_from_slice(&spanning);
-            for link in chain::iter(&plan.links) {
-                if link.to_id != step.id {
-                    continue;
-                }
-                if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
-                    cutset.push(atom);
+            for (link, atom) in &links {
+                if link.to_id == step.id {
+                    cutset.push(atom.clone());
                 }
             }
             for open in chain::iter(&plan.open_conds) {
@@ -372,8 +396,11 @@ pub mod lifted {
                     continue;
                 }
                 if let Formula::Atom(atom) = open.condition.as_ref() {
+                    if !mutexes.covers(atom.predicate) {
+                        continue;
+                    }
                     if let Some(atom) =
-                        ground_atom(plan, &Literal::Atom(atom.clone()), open.step_id)
+                        crate::lifted_mutex::ground_atom(&plan.bindings, atom, open.step_id)
                     {
                         cutset.push(atom);
                     }
@@ -391,7 +418,14 @@ pub mod lifted {
                 if effect.conditional() || !effect.parameters.is_empty() {
                     continue;
                 }
-                if let Some(atom) = ground_atom(plan, &effect.literal, step.id) {
+                let Literal::Atom(added) = &effect.literal else {
+                    continue;
+                };
+                if !mutexes.covers(added.predicate) {
+                    continue;
+                }
+                if let Some(atom) = crate::lifted_mutex::ground_atom(&plan.bindings, added, step.id)
+                {
                     cutset.push(atom);
                 }
             }

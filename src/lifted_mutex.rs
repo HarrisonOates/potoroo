@@ -87,6 +87,11 @@ pub struct LiftedMutexes {
     /// `(group index, part index)` pairs per predicate, so a query only looks at
     /// groups that could cover the atom.
     by_predicate: HashMap<Predicate, Vec<(usize, usize)>>,
+    /// Ordered predicate pairs that share a group. Two atoms whose predicates
+    /// are not in here can never be mutex, and the cutset scan is quadratic in
+    /// its input, so settling a pair with one hash lookup rather than a walk
+    /// over groups and parts is most of that scan's cost.
+    co_occurring: HashSet<(Predicate, Predicate)>,
 }
 
 impl LiftedMutexes {
@@ -165,9 +170,19 @@ impl LiftedMutexes {
             }
         }
 
+        let mut co_occurring = HashSet::new();
+        for group in &groups {
+            for left in &group.parts {
+                for right in &group.parts {
+                    co_occurring.insert((left.predicate, right.predicate));
+                }
+            }
+        }
+
         LiftedMutexes {
             groups,
             by_predicate,
+            co_occurring,
         }
     }
 
@@ -180,13 +195,27 @@ impl LiftedMutexes {
         self.groups.is_empty()
     }
 
+    /// Whether any group has a part over this predicate. An atom whose
+    /// predicate no group covers can never be mutex with anything, so callers
+    /// use this to skip resolving it through the bindings at all.
+    pub fn covers(&self, predicate: Predicate) -> bool {
+        self.by_predicate.contains_key(&predicate)
+    }
+
+    /// Whether two predicates share a group at all. One hash lookup, and false
+    /// settles the pair outright.
+    #[inline]
+    pub fn may_pair(&self, left: Predicate, right: Predicate) -> bool {
+        self.co_occurring.contains(&(left, right))
+    }
+
     /// Whether two atoms can never hold in the same reachable state.
     ///
     /// Both must be ground where the comparison reads them; a term still
     /// carrying a variable makes the answer "not known to be mutex", which is
     /// the safe direction.
     pub fn mutex(&self, left: &Atom, right: &Atom) -> bool {
-        if left == right {
+        if left == right || !self.may_pair(left.predicate, right.predicate) {
             return false;
         }
         let (Some(left_parts), Some(right_parts)) = (
@@ -229,7 +258,7 @@ impl LiftedMutexes {
         }
         for (i, left) in atoms.iter().enumerate() {
             for right in &atoms[i + 1..] {
-                if self.mutex(left, right) {
+                if self.may_pair(left.predicate, right.predicate) && self.mutex(left, right) {
                     return true;
                 }
             }
