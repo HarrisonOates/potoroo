@@ -446,3 +446,99 @@ fn disjunctive_orderings_preserve_optimal_plans_and_defer_threats() {
         (a, b) => panic!("expected both runs to solve, got {a:?} and {b:?}"),
     }
 }
+
+/// Runs one finite-domain configuration, returning (solved, cost, pruned).
+fn fdr_run(
+    domain_name: &str,
+    problem_name: &str,
+    prune: PruneOptions,
+    limit: usize,
+) -> (bool, usize, usize) {
+    use potoroo::fdr_pocl::{solve_with_params, translate, Outcome as FdrOutcome};
+
+    let domain_src =
+        fs::read_to_string(format!("examples/{domain_name}.pddl")).expect("read domain");
+    let problem_src =
+        fs::read_to_string(format!("examples/{problem_name}.pddl")).expect("read problem");
+    let domain = match read_pddl(&domain_src).expect("parse domain") {
+        ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
+        _ => panic!("expected a domain"),
+    };
+    let problem = match read_pddl(&problem_src).expect("parse problem") {
+        ParsedUnit::Problem(p) => lower_problem(&p, &domain).expect("lower problem"),
+        _ => panic!("expected a problem"),
+    };
+    let translate_params = Parameters::default();
+    let ctx = SearchContext::new(&domain, &problem, &translate_params);
+    let task = translate(&ctx).expect("translate to SAS+");
+
+    let params = Parameters {
+        heuristic: Heuristic::parse("LMCUT").expect("LMCUT is a valid heuristic"),
+        search_limits: vec![limit],
+        prune,
+        ..Parameters::default()
+    };
+    let (outcome, stats) = solve_with_params(&task, &params).expect("parameters are supported");
+    match outcome {
+        FdrOutcome::Solved(solution) => (true, solution.plan.cost(), stats.pruned),
+        _ => (false, 0, stats.pruned),
+    }
+}
+
+/// Recursion pruning is structural, so it applies to finite-domain plans too —
+/// and fires far more readily there than on the lifted representation, where
+/// `examples/` gave it almost nothing to reject.
+#[test]
+fn recursion_pruning_carries_over_to_finite_domains() {
+    if !fd_available() {
+        eprintln!("skipping: Fast Downward translator not available");
+        return;
+    }
+    let recursion = PruneOptions {
+        recursion: true,
+        ..PruneOptions::default()
+    };
+    let mut fired = false;
+    for (domain, problem) in [("fridge-domain", "fixa"), ("road-domain", "road-test")] {
+        let (base_solved, base_cost, _) = fdr_run(domain, problem, PruneOptions::default(), 30_000);
+        let (solved, cost, pruned) = fdr_run(domain, problem, recursion, 30_000);
+        assert!(base_solved && solved, "{problem} should solve both ways");
+        assert_eq!(
+            base_cost, cost,
+            "{problem}: recursion pruning changed the optimal cost"
+        );
+        fired |= pruned > 0;
+    }
+    assert!(
+        fired,
+        "recursion pruning fired on no finite-domain benchmark"
+    );
+}
+
+/// Likewise for cutset dominance, which on `gripper-6` removes work rather than
+/// merely reshuffling it.
+#[test]
+fn minimality_pruning_carries_over_to_finite_domains() {
+    if !fd_available() {
+        eprintln!("skipping: Fast Downward translator not available");
+        return;
+    }
+    let minimality = PruneOptions {
+        minimality: true,
+        ..PruneOptions::default()
+    };
+    let (base_solved, base_cost, base_pruned) = fdr_run(
+        "gripper-domain",
+        "gripper-6",
+        PruneOptions::default(),
+        30_000,
+    );
+    let (solved, cost, pruned) = fdr_run("gripper-domain", "gripper-6", minimality, 30_000);
+    assert!(base_solved && solved, "gripper-6 should solve both ways");
+    assert_eq!(base_pruned, 0, "the baseline must prune nothing");
+    assert_eq!(
+        base_cost, cost,
+        "minimality pruning changed the optimal cost"
+    );
+    assert!(pruned > 0, "minimality pruning fired on nothing");
+}

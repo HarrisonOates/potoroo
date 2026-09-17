@@ -741,6 +741,11 @@ struct Planner<'a> {
     /// Whether threats are resolved by posting a disjunction instead of by
     /// splitting the plan.
     disjunctive: bool,
+    /// The task's operator graph over facts, for the recursion rule. Built only
+    /// when `-p recursion` asks for it.
+    fact_graph: Option<crate::fdr_pruning::FactGraph>,
+    /// Whether non-minimality pruning is on.
+    minimality: bool,
 }
 
 impl<'a> Planner<'a> {
@@ -819,6 +824,8 @@ impl<'a> Planner<'a> {
             action_cost,
             edelete: None,
             disjunctive: false,
+            fact_graph: None,
+            minimality: false,
         }
     }
 
@@ -881,7 +888,33 @@ impl<'a> Planner<'a> {
             self.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(self.task)));
         }
         self.disjunctive = prune.disjunctive;
+        if prune.recursion {
+            self.fact_graph = Some(crate::fdr_pruning::FactGraph::build(self.task));
+        }
+        self.minimality = prune.minimality;
         self
+    }
+
+    /// Whether an opt-in structural rule discards this refinement.
+    ///
+    /// The rules keep the staging their lifted counterparts use: each opens with
+    /// an allocation-free applicability test, and only a plan that passes one
+    /// pays for the graph searches behind it.
+    fn structurally_pruned(&self, plan: &PartialPlan) -> bool {
+        if self.minimality
+            && crate::fdr_pruning::minimality_may_apply(plan)
+            && crate::fdr_pruning::minimality_prunable(plan)
+        {
+            return true;
+        }
+        if let Some(graph) = &self.fact_graph {
+            if crate::fdr_pruning::recursion_may_apply(plan, graph)
+                && crate::fdr_pruning::recursion_prunable(plan, self.task, graph)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn solve(
@@ -1017,6 +1050,10 @@ impl<'a> Planner<'a> {
                             stats.pruned += 1;
                             continue;
                         }
+                    }
+                    if self.structurally_pruned(&child) {
+                        stats.pruned += 1;
+                        continue;
                     }
                     child.id = stats.nodes_generated;
                     let child = Rc::new(child);

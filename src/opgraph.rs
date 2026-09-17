@@ -202,7 +202,7 @@ impl OperatorGraph {
 /// Iterative Tarjan, returning a component id per node. Iterative because a
 /// domain's operator graph is small but a deep recursion here would be a silly
 /// way to lose a run.
-fn tarjan(adjacency: &[Vec<usize>]) -> Vec<usize> {
+pub(crate) fn tarjan(adjacency: &[Vec<usize>]) -> Vec<usize> {
     let n = adjacency.len();
     let mut index = vec![usize::MAX; n];
     let mut low = vec![0usize; n];

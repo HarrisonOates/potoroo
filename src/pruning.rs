@@ -92,6 +92,17 @@ impl PruneOptions {
         Ok(options)
     }
 
+    /// Enabled rules that cannot fire on the finite-domain representation.
+    /// A SAS⁺ task is already ground and reachability-filtered by the
+    /// translator, so schema parameter domains have nothing to say about it.
+    pub fn lifted_only(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.params {
+            names.push("params");
+        }
+        names
+    }
+
     /// Enabled rules that only ever fire on the finite-domain representation.
     /// Naming them lets `-v` say so rather than let a lifted run pay for `-p
     /// all` and quietly get nothing from three of its six rules.

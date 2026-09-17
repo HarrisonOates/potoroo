@@ -379,14 +379,18 @@ fn print_search_configuration(cli: &Cli) {
     let prune = cli.params.prune.names();
     if !prune.is_empty() {
         eprintln!("Pruning: {}", prune.join(","));
-        if !cli.fdr_pocl {
-            let inert = cli.params.prune.finite_domain_only();
-            if !inert.is_empty() {
-                eprintln!(
-                    "Pruning: {} need finite-domain facts and do nothing without --fdr-pocl",
-                    inert.join(","),
-                );
-            }
+        let inert = if cli.fdr_pocl {
+            cli.params.prune.lifted_only()
+        } else {
+            cli.params.prune.finite_domain_only()
+        };
+        if !inert.is_empty() {
+            let reason = if cli.fdr_pocl {
+                "have nothing to say about an already-ground SAS+ task"
+            } else {
+                "need finite-domain facts and do nothing without --fdr-pocl"
+            };
+            eprintln!("Pruning: {} {reason}", inert.join(","));
         }
     }
 

@@ -22,6 +22,7 @@ pub mod external;
 pub mod fasthash;
 pub mod fdr;
 pub mod fdr_pocl;
+pub mod fdr_pruning;
 pub mod flaws;
 pub mod formula;
 pub mod functions;
