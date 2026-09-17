@@ -280,3 +280,137 @@ mod tests {
         assert!(!has_inconsistent_cutset(&plan, &task, &mutexes));
     }
 }
+
+/// Cutset mutex pruning over the literal representation.
+///
+/// The rule is Proposition 1's, unchanged; what differs is where the mutexes
+/// come from and how much of a condition is known. A finite-domain link carries
+/// a `Fact`, always ground. A literal link carries terms that may still be
+/// variables, so each condition is resolved through the plan's binding
+/// constraints and contributes only when every term has reached an object.
+/// A condition that is still open contributes nothing — which loses pruning,
+/// never soundness.
+///
+/// See [`crate::lifted_mutex`] for where the mutexes come from without an h²
+/// table and without grounding.
+pub mod lifted {
+    use crate::chain;
+    use crate::formula::{Atom, Formula, Literal};
+    use crate::lifted_mutex::LiftedMutexes;
+    use crate::orderings::{BinaryOrderings, StepTime};
+    use crate::plan::Plan;
+    use crate::search::SearchContext;
+    use crate::terms::Term;
+
+    fn necessarily_before(orderings: &BinaryOrderings, before: usize, after: usize) -> bool {
+        before != after
+            && !orderings.possibly_after(before, StepTime::AtEnd, after, StepTime::AtStart)
+    }
+
+    /// Resolves a literal's terms through the bindings, keeping it only if it is
+    /// positive and every term has reached an object.
+    fn ground_atom(plan: &Plan, literal: &Literal, step_id: usize) -> Option<Atom> {
+        let Literal::Atom(atom) = literal else {
+            // A negative condition says a fact is absent, which no lifted mutex
+            // group constrains.
+            return None;
+        };
+        let mut terms = Vec::with_capacity(atom.terms.len());
+        for &term in &atom.terms {
+            match plan.bindings.binding(term, step_id) {
+                Term::Object(object) => terms.push(Term::Object(object)),
+                Term::Variable(_) => return None,
+            }
+        }
+        Some(Atom {
+            predicate: atom.predicate,
+            terms,
+        })
+    }
+
+    /// Whether the rule could fire at all. Allocation-free.
+    pub fn may_apply(plan: &Plan, mutexes: &LiftedMutexes) -> bool {
+        !mutexes.is_empty() && plan.num_links > 0 && plan.num_steps() > 0
+    }
+
+    /// Whether some cutset of the plan contains a mutex pair.
+    ///
+    /// Call [`may_apply`] first; this assumes it passed.
+    pub fn has_inconsistent_cutset(
+        ctx: &SearchContext,
+        plan: &Plan,
+        mutexes: &LiftedMutexes,
+    ) -> bool {
+        let mut spanning: Vec<Atom> = Vec::new();
+        let mut cutset: Vec<Atom> = Vec::new();
+
+        for step in chain::iter(&plan.steps) {
+            if step.action.synthetic() {
+                continue;
+            }
+            spanning.clear();
+            for link in chain::iter(&plan.links) {
+                if link.from_id == step.id || link.to_id == step.id {
+                    continue;
+                }
+                if necessarily_before(&plan.orderings, link.from_id, step.id)
+                    && necessarily_before(&plan.orderings, step.id, link.to_id)
+                {
+                    if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
+                        spanning.push(atom);
+                    }
+                }
+            }
+            if spanning.is_empty() {
+                continue;
+            }
+
+            // C⁻(step): everything that must hold when the step executes — the
+            // conditions spanning it, the conditions supporting it, and its own
+            // open conditions, which any completion has to establish there too.
+            cutset.clear();
+            cutset.extend_from_slice(&spanning);
+            for link in chain::iter(&plan.links) {
+                if link.to_id != step.id {
+                    continue;
+                }
+                if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
+                    cutset.push(atom);
+                }
+            }
+            for open in chain::iter(&plan.open_conds) {
+                if open.step_id != step.id {
+                    continue;
+                }
+                if let Formula::Atom(atom) = open.condition.as_ref() {
+                    if let Some(atom) =
+                        ground_atom(plan, &Literal::Atom(atom.clone()), open.step_id)
+                    {
+                        cutset.push(atom);
+                    }
+                }
+            }
+            if mutexes.inconsistent(&cutset) {
+                return true;
+            }
+
+            // C⁺(step): the conditions spanning it, plus what it asserts. Only
+            // unconditional, unquantified effects are certain to fire.
+            cutset.clear();
+            cutset.extend_from_slice(&spanning);
+            for effect in step.action.effects.iter() {
+                if effect.conditional() || !effect.parameters.is_empty() {
+                    continue;
+                }
+                if let Some(atom) = ground_atom(plan, &effect.literal, step.id) {
+                    cutset.push(atom);
+                }
+            }
+            if mutexes.inconsistent(&cutset) {
+                return true;
+            }
+        }
+        let _ = ctx;
+        false
+    }
+}

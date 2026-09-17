@@ -7,7 +7,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PruneOptions {
     /// Cutset mutex pruning: a partial plan whose pre- or post-cutset contains
-    /// a mutex pair has no executable completion. See [`crate::cutset`].
+    /// a mutex pair has no executable completion. Finite-domain search takes
+    /// its mutexes from the translator; the literal representations synthesise
+    /// lifted mutex groups instead. See [`crate::cutset`] and
+    /// [`crate::lifted_mutex`].
     pub cutset: bool,
     /// e-deletion: extend threats from "deletes the protected fact" to "cannot
     /// hold beside it", using the same mutexes as `cutset`. See
@@ -108,9 +111,6 @@ impl PruneOptions {
     /// all` and quietly get nothing from three of its six rules.
     pub fn finite_domain_only(self) -> Vec<&'static str> {
         let mut names = Vec::new();
-        if self.cutset {
-            names.push("cutset");
-        }
         if self.edelete {
             names.push("edelete");
         }

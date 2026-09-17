@@ -542,3 +542,94 @@ fn minimality_pruning_carries_over_to_finite_domains() {
     );
     assert!(pruned > 0, "minimality pruning fired on nothing");
 }
+
+/// Lifted cutset pruning uses schema-derived mutex groups.
+/// Conditions with unbound variables contribute no ground fact.
+#[test]
+fn lifted_cutset_shrinks_the_search_and_keeps_the_plan() {
+    let cutset = PruneOptions {
+        cutset: true,
+        ..PruneOptions::default()
+    };
+    let baseline = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(PruneOptions::default(), 50_000),
+    );
+    let pruned = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(cutset, 50_000),
+    );
+    assert!(baseline.solved && pruned.solved, "test-ferry should solve");
+    assert_eq!(
+        baseline.cost, pruned.cost,
+        "lifted cutset pruning changed the plan cost"
+    );
+    assert!(pruned.pruned > 0, "lifted cutset pruning fired on nothing");
+}
+
+/// Ground search with `LPLAN` is genuinely cost-optimal, so this is the check
+/// that the synthesised groups do not claim a mutex that is not one: a false
+/// mutex would let the rule discard the optimal plan.
+#[test]
+fn lifted_cutset_preserves_optimal_ground_plans() {
+    let cutset = PruneOptions {
+        cutset: true,
+        ..PruneOptions::default()
+    };
+    for (domain, problem) in [
+        ("blocks-world-domain", "sussman-anomaly"),
+        ("ferry-domain", "test-ferry"),
+        ("road-domain", "road-test"),
+    ] {
+        let domain_path = format!("examples/{domain}.pddl");
+        let problem_path = format!("examples/{problem}.pddl");
+        let optimal = |prune: PruneOptions| Parameters {
+            heuristic: Heuristic::parse("LPLAN").expect("LPLAN is a valid heuristic"),
+            ground_actions: true,
+            search_limits: vec![5_000],
+            prune,
+            ..Parameters::default()
+        };
+        let baseline = run(
+            &domain_path,
+            &problem_path,
+            optimal(PruneOptions::default()),
+        );
+        let pruned = run(&domain_path, &problem_path, optimal(cutset));
+        assert_eq!(
+            baseline.solved, pruned.solved,
+            "{problem}: cutset pruning changed solvability under an admissible heuristic"
+        );
+        if baseline.solved {
+            assert_eq!(
+                baseline.cost, pruned.cost,
+                "{problem}: cutset pruning changed the optimal cost"
+            );
+        }
+    }
+}
+
+/// The groups themselves: a ferry carries one car at a time and sits at one
+/// location, which is the state-variable invariant a SAS+ variable encodes.
+#[test]
+fn lifted_mutex_groups_recover_state_variable_invariants() {
+    use potoroo::lifted_mutex::LiftedMutexes;
+
+    let domain_src = fs::read_to_string("examples/ferry-domain.pddl").expect("read domain");
+    let problem_src = fs::read_to_string("examples/test-ferry.pddl").expect("read problem");
+    let domain = match read_pddl(&domain_src).expect("parse domain") {
+        ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
+        _ => panic!("expected a domain"),
+    };
+    let problem = match read_pddl(&problem_src).expect("parse problem") {
+        ParsedUnit::Problem(p) => lower_problem(&p, &domain).expect("lower problem"),
+        _ => panic!("expected a problem"),
+    };
+    let mutexes = LiftedMutexes::synthesise(&domain, &problem);
+    assert!(
+        !mutexes.is_empty(),
+        "no lifted mutex group found in the ferry domain"
+    );
+}

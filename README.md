@@ -390,7 +390,7 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 
 | Rule | Source | Representation | What it discards |
 |---|---|---|---|
-| `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | `--fdr-pocl` | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. |
+| `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | every representation | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. Finite-domain search takes its mutexes from the translator; lifted and ground search synthesise **lifted mutex groups** from the schemas (see below). |
 | `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | `--fdr-pocl` | Extends threats from "assigns the protected variable another value" to "cannot hold beside the protected fact". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. |
 | `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
@@ -409,9 +409,9 @@ potoroo -p all,no-recursion,no-minimality domain.pddl problem.pddl
 ```
 
 `-v` reports the active rules, and says which of them cannot fire for the chosen
-representation: `cutset`, `edelete` and `disjunctive` need finite-domain facts,
+representation: `edelete` and `disjunctive` need finite-domain facts,
 and `params` has nothing to say about an already-ground SAS+ task. So `-p all`
-is `-p params,recursion,minimality` in lifted and ground mode, and
+is `-p cutset,params,recursion,minimality` in lifted and ground mode, and
 `-p cutset,edelete,disjunctive,recursion,minimality` under `--fdr-pocl`.
 The `pruned` counter in the telemetry line
 and in `POTOROO_STATS_JSON` counts the plans they discard. `max_disjunctions` in
@@ -460,6 +460,102 @@ being rewritten around a per-plan link index with dense step slots (`recursion`
 on `logistics-a`: 68 us/node, now 8.8); what is left is the work the rules
 actually are. Enable them where a domain loops or where plans grow redundant
 tails, not by reflex.
+
+### Lifted mutex groups
+
+`cutset` needs sound mutexes, and the literal representation has none to hand.
+An h² table would supply them, but it is quadratic in the reachable atoms.
+Instead Potoroo synthesises **lifted mutex groups** from the action schemas: a
+predicate together with one *counted* argument position, asserting that for each
+assignment of the other positions at most one instance holds in any reachable
+state. `⟨at(?v, ?l), counted = 1⟩` says a vehicle is at one location, which is
+exactly the invariant a SAS+ variable encodes.
+
+A candidate survives if at most one instance per fixed-argument tuple holds
+initially, and if every schema that adds an instance also deletes one from the
+same group *and* required that deleted atom as a precondition — the
+fact-alternating condition. Conditional effects, quantified effects, two adds on
+one predicate, and a delete that only maybe matches the add all reject the
+candidate, because a mutex claimed wrongly would let the rule discard a
+refinable plan.
+
+This is the single-predicate case of Fišer's lifted fact-alternating mutex
+groups (AAAI 2020), and the same shape as the invariant candidates in Helmert's
+finite-domain translation (AIJ 2009). Multi-predicate groups — `{at(?p, ?l),
+in(?p, ?v)}`, a package at a location or in a vehicle but never both — need
+candidate refinement rather than one pass, and are not implemented.
+
+It is the one rule that makes lifted search do less work rather than reject what
+the heuristic was rejecting anyway. Under `-g -h LPLAN`, which is genuinely
+cost-optimal:
+
+| | generated | cost |
+|---|---|---|
+| `test-ferry`, default | 720 | 7 |
+| `test-ferry`, `-p cutset` | **344** | 7 |
+| `sussman-anomaly`, default | 43 | 3 |
+| `sussman-anomaly`, `-p cutset` | **37** | 3 |
+
+### Does the rest of it pay, in lifted mode?
+
+Not on this example set — and the reason is worth recording rather than
+rediscovering.
+
+Measured end-to-end with no node cap, `-p params` and `-p all` generate
+**exactly** the same number of nodes as the bare default on every lifted problem
+that solves, under both `ADD` and the planning-graph-free `UCPOP`. The rules are
+sound and they do fire (`params` reports 3484 discards on `logistics-a`), but
+every node they discard is one the search was going to throw away anyway: the
+non-viable instances are already gone from the achiever index before search
+starts, and what the per-node check catches later is a plan the `∞`-rank guard
+would have dropped a moment afterwards. All that is saved is the heuristic
+evaluation, and the check costs more than the evaluation does.
+
+| `logistics-a`, time to solve | generated | ms |
+|---|---|---|
+| default | 13081 | 74 |
+| `-p params` | 13081 | 107 |
+| `-p all` | 13081 | 317 |
+
+So the honest recommendation for lifted and ground search is `-p cutset` and
+nothing else. The finite-domain rules are a different story — `cutset` cuts visited
+nodes on `gripper-4` from 184 to 170 and on `sussman-anomaly` from 13 to 12
+under admissible `LMCUT`, because it discards plans on structural grounds the
+heuristic cannot see.
+
+That contrast is the whole point: a pruning rule earns its keep only by catching
+plans the heuristic does not. Giving lifted mode a rule of that kind means
+porting `cutset` and `edelete` to the planner's own literal space, which needs an
+h² mutex table over ground atoms and a cutset test that resolves link conditions
+through the binding constraints and skipping the ones still carrying variables.
+That is the open work.
+
+The obvious objection is that an h² table means grounding, which is the thing
+lifted search exists to avoid. It mostly does not, because **lifted mode already
+grounds**. Every planning-graph heuristic — `ADD` (the default), `ADDR`,
+`RELAX`, `RELAXR` and their variants — builds `PlanningGraph` from the schemas
+by a Datalog-style join, and that join materialises both the reachable ground
+atom set and, for relaxed-plan extraction, the reachable ground action list.
+It is lifted *evaluation*, never a Cartesian product, but the result is the same
+reachable set a grounder produces, computed once per search and cached. An h²
+fixpoint over it adds a pair table and a pass over actions that already exist;
+it does not add grounding.
+
+The exceptions are real but narrow:
+
+* `-h UCPOP`, `-h OC`, `-h UC`, `-h BUC`, `-h LIFO` and `-h FIFO` build no
+  planning graph, so those configurations really are ground-free and an h² table
+  would introduce grounding-scale work they deliberately avoid.
+* The pair table is quadratic in the reachable atoms. These benchmarks are tiny
+  — `logistics-a` has 100 facts and so 4,950 pairs — but 10⁴ facts is 6 MB as a
+  bitset and 10⁵ facts is 625 MB, so it needs a cap, as `lplan::fact_mutexes`
+  already has one.
+
+For both exceptions the published answer is lifted mutex groups — Fišer,
+*Lifted Fact-Alternating Mutex Groups and Pruned Grounding* (AAAI 2020) and
+*Operator Pruning Using Lifted Mutex Groups* (ICAPS 2023) — which are computed
+from the schemas, stay lifted, and are matched against a pair of conditions
+without instantiating anything.
 
 ### Why they are off by default
 

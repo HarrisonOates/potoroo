@@ -28,6 +28,7 @@ pub mod formula;
 pub mod functions;
 pub mod heuristics;
 pub(crate) mod instantiate;
+pub mod lifted_mutex;
 pub(crate) mod lmcut;
 pub mod lplan;
 pub mod lpsas;
