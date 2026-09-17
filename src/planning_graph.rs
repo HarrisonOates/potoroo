@@ -981,6 +981,21 @@ impl PlanningGraph {
         plan: &Plan,
         reuse: bool,
     ) -> Option<f32> {
+        let chosen = self.extract_relaxed_plan(search_ctx, plan, reuse)?;
+        Some(
+            chosen
+                .into_iter()
+                .map(|index| search_ctx.action_cost(&self.actions[index]) as f32)
+                .sum(),
+        )
+    }
+
+    fn extract_relaxed_plan(
+        &self,
+        search_ctx: &crate::search::SearchContext,
+        plan: &Plan,
+        reuse: bool,
+    ) -> Option<FastSet<usize>> {
         let ctx = search_ctx.type_ctx();
         let bindings = plan.bindings.clone();
         let mut chosen: FastSet<usize> = FastSet::default();
@@ -1020,12 +1035,7 @@ impl PlanningGraph {
                 }
             }
         }
-        Some(
-            chosen
-                .into_iter()
-                .map(|index| search_ctx.action_cost(&self.actions[index]) as f32)
-                .sum(),
-        )
+        Some(chosen)
     }
 
     /// Resolves a (possibly lifted) atomic open condition to the cheapest ground
