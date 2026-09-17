@@ -88,7 +88,9 @@ fn all_open_conditions_precede(plan: &Plan, step: usize, orderings: &BinaryOrder
 ///
 /// The np-cutsets are computed once per candidate step rather than once per
 /// pair: the inner loop reruns for every `s″`, and rebuilding a step's
-/// necessarily-spanning set each time was most of the rule's cost.
+/// necessarily-spanning set each time was most of the rule's cost. Counting
+/// them lazily instead was tried and is worse — the count is a link scan of its
+/// own, and for `s″ = goal` every step reaches the inner loop anyway.
 pub fn prunable(plan: &Plan) -> bool {
     // Nothing to remove without at least three real steps (two anchors and
     // something between them).

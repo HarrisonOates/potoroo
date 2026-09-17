@@ -393,7 +393,7 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 | `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | `--fdr-pocl` | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. |
 | `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | `--fdr-pocl` | Extends threats from "assigns the protected variable another value" to "cannot hold beside the protected fact". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. |
 | `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
-| `params` | Gerevini & Schubert, JAIR 5 (1996), §4 | lifted and ground | An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph. |
+| `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
 | `recursion` | Smith & Peot, AIPS-96, Thms. 1 and 4 | lifted and ground | A plan whose remaining open conditions are all suspended inside a regression loop, so every completion is non-minimal. |
 | `minimality` | Kambhampati, IJCAI-95, Strategy 2 | lifted and ground | A plan with steps `s′ ≺ s″` where everything `s″` might rely on is already guaranteed at `s′`, making the steps between them removable. |
 
@@ -408,7 +408,10 @@ potoroo -p all domain.pddl problem.pddl
 potoroo -p all,no-recursion,no-minimality domain.pddl problem.pddl
 ```
 
-`-v` reports the active rules, and the `pruned` counter in the telemetry line
+`-v` reports the active rules, and says which of them cannot fire for the chosen
+representation — `cutset`, `edelete` and `disjunctive` need finite-domain facts,
+so in lifted or ground mode `-p all` is really `-p params,recursion,minimality`.
+The `pruned` counter in the telemetry line
 and in `POTOROO_STATS_JSON` counts the plans they discard. `max_disjunctions` in
 the finite-domain JSON reports the peak number of deferred threat resolutions,
 and is zero unless `disjunctive` is on.
@@ -421,11 +424,11 @@ runs; `us/node` is per generated node.
 
 | Rule | `hanoi-3` | `fixit` | `logistics-a` | `gripper-6` |
 |---|---|---|---|---|
-| **baseline** (lifted, `ADD`) | 2.1 us/node | 1.6 us/node | 5.0 us/node | — |
-| `params` | +24% | +50% | +30% | — |
-| `recursion` | +114% | +138% | +76% | — |
-| `minimality` | +76% | +350% | +128% | — |
-| all three | +219% | +531% | +210% | — |
+| **baseline** (lifted, `ADD`) | 2.1 us/node | 1.6 us/node | 5.1 us/node | — |
+| `params` | +29% | +56% | +33% | — |
+| `recursion` | +119% | +138% | +71% | — |
+| `minimality` | +86% | +356% | +128% | — |
+| all three | +233% | +544% | +214% | — |
 | **baseline** (`--fdr-pocl`, `LMCUT`) | 7.5 us/node | — | 120 us/node | 12.0 us/node |
 | `cutset` | +13% | — | −0.2% | +10% |
 | `edelete` | +4% | — | −1.7% | +5% |

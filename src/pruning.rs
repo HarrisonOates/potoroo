@@ -92,6 +92,23 @@ impl PruneOptions {
         Ok(options)
     }
 
+    /// Enabled rules that only ever fire on the finite-domain representation.
+    /// Naming them lets `-v` say so rather than let a lifted run pay for `-p
+    /// all` and quietly get nothing from three of its six rules.
+    pub fn finite_domain_only(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.cutset {
+            names.push("cutset");
+        }
+        if self.edelete {
+            names.push("edelete");
+        }
+        if self.disjunctive {
+            names.push("disjunctive");
+        }
+        names
+    }
+
     /// The enabled rules, in declaration order, for `-v` reporting.
     pub fn names(self) -> Vec<&'static str> {
         let mut names = Vec::new();

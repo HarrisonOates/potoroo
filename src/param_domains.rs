@@ -271,6 +271,38 @@ impl ParameterDomains {
         }
     }
 
+    /// Whether two parameter positions can ever take the same object.
+    ///
+    /// Gerevini & Schubert's second use of the domains: a threat whose unifier
+    /// would have to identify two parameters with disjoint domains cannot be
+    /// realised, so it is not a flaw at all and must not be refined.
+    pub fn positions_can_agree(
+        &self,
+        left_action: &str,
+        left_position: usize,
+        right_action: &str,
+        right_position: usize,
+    ) -> bool {
+        let (Some(left), Some(right)) = (
+            self.domain_at(left_action, left_position),
+            self.domain_at(right_action, right_position),
+        ) else {
+            return true;
+        };
+        match (left, right) {
+            (ArgDomain::Any, _) | (_, ArgDomain::Any) => true,
+            (ArgDomain::Only(a), ArgDomain::Only(b)) => {
+                let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                small.iter().any(|object| large.contains(object))
+            }
+        }
+    }
+
+    fn domain_at(&self, action_name: &str, position: usize) -> Option<&ArgDomain> {
+        let index = *self.by_name.get(action_name)?;
+        self.schemas[index].intersected.get(position)
+    }
+
     /// Parameter domains of one schema, for tests and `-v` reporting. `None` at
     /// a position means unconstrained.
     pub fn domain_of(&self, action_name: &str, position: usize) -> Option<Vec<Object>> {
@@ -513,6 +545,26 @@ mod tests {
         let domains = fixture.domains();
         assert_eq!(domains.domain_of("act", 0), None);
         assert!(domains.permits_arguments("act", &[fixture.object("v")]));
+    }
+
+    #[test]
+    fn disjoint_parameter_domains_cannot_agree() {
+        let fixture = Fixture::new(TRANSPORT_DOMAIN, TRANSPORT_PROBLEM);
+        let domains = fixture.domains();
+        // `drive`'s ?from is {a} and its ?to is {b}, so a threat whose unifier
+        // required the two to be the same object could never be realised.
+        assert!(!domains.positions_can_agree("drive", 1, "drive", 2));
+        // ?v against itself always can.
+        assert!(domains.positions_can_agree("drive", 0, "drive", 0));
+    }
+
+    #[test]
+    fn an_unconstrained_position_always_can_agree() {
+        let fixture = Fixture::new(TRANSPORT_DOMAIN, TRANSPORT_PROBLEM);
+        let domains = fixture.domains();
+        // `load`'s ?p is unconstrained, so nothing may be concluded about it.
+        assert!(domains.positions_can_agree("load", 0, "drive", 1));
+        assert!(domains.positions_can_agree("drive", 1, "load", 0));
     }
 
     #[test]

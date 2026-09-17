@@ -379,6 +379,15 @@ fn print_search_configuration(cli: &Cli) {
     let prune = cli.params.prune.names();
     if !prune.is_empty() {
         eprintln!("Pruning: {}", prune.join(","));
+        if !cli.fdr_pocl {
+            let inert = cli.params.prune.finite_domain_only();
+            if !inert.is_empty() {
+                eprintln!(
+                    "Pruning: {} need finite-domain facts and do nothing without --fdr-pocl",
+                    inert.join(","),
+                );
+            }
+        }
     }
 
     if cli.fdr_pocl

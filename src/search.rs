@@ -10,7 +10,7 @@ use crate::fasthash::FastMap;
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
-use crate::bindings::{Bindings, StepVarTypes, TypeContext};
+use crate::bindings::{Binding, Bindings, StepVarTypes, TypeContext};
 use crate::chain;
 use crate::domain::Domain;
 use crate::effect::Effect;
@@ -550,6 +550,13 @@ impl<'a> SearchContext<'a> {
     }
 
     /// Registers a step's action for variable-type lookups.
+    /// The action currently registered for a step id, if any. Step ids repeat
+    /// across sibling plans, so this answers for the plan most recently
+    /// registered — which is the one being refined.
+    pub fn step_action(&self, step_id: usize) -> Option<Rc<StepAction>> {
+        self.step_var_types.borrow().get(&step_id).cloned()
+    }
+
     pub fn register_step(&self, step_id: usize, action: &Rc<StepAction>) {
         self.step_var_types
             .borrow_mut()
@@ -853,6 +860,65 @@ fn discarded_by_pruning(ctx: &SearchContext, plan: &Plan) -> bool {
         return true;
     }
     false
+}
+
+/// Whether parameter domains rule out a threat's unifier
+/// (Gerevini & Schubert, JAIR 5, 1996, §5).
+///
+/// Reject a parameter/object equality outside the parameter's domain or a
+/// parameter/parameter equality whose domains are disjoint.
+pub(crate) fn threat_unifier_impossible(ctx: &SearchContext, unifier: &[Binding]) -> bool {
+    if unifier.is_empty() {
+        return false;
+    }
+    let domains = ctx.param_domains();
+    for binding in unifier {
+        if !binding.equality {
+            continue;
+        }
+        let Some((action, position)) = parameter_position(ctx, binding.var, binding.var_id) else {
+            continue;
+        };
+        match binding.term {
+            Term::Object(object) => {
+                if !domains.permits(&action.name, position, object) {
+                    return true;
+                }
+            }
+            Term::Variable(other) => {
+                let Some((other_action, other_position)) =
+                    parameter_position(ctx, other, binding.term_id)
+                else {
+                    continue;
+                };
+                if !domains.positions_can_agree(
+                    &action.name,
+                    position,
+                    &other_action.name,
+                    other_position,
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The action a step was instantiated from, and the index of `var` among its
+/// parameters. `None` for a synthetic step, or a variable that is not one of the
+/// action's own parameters (a `forall` instance variable, say).
+fn parameter_position(
+    ctx: &SearchContext,
+    var: Variable,
+    step_id: usize,
+) -> Option<(Rc<StepAction>, usize)> {
+    let action = ctx.step_action(step_id)?;
+    if action.synthetic() {
+        return None;
+    }
+    let position = action.parameters.iter().position(|p| *p == var)?;
+    Some((action, position))
 }
 
 /// Whether any step of the plan binds a parameter to an object outside the

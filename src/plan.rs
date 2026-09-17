@@ -352,6 +352,13 @@ impl Plan {
             &link.condition,
             link.to_id,
         );
+        // With `-p params`, a threat whose unifier the parameter domains rule out
+        // is not a flaw: dropping it here saves the two or three children that
+        // resolving it would have cost.
+        let affected = affected
+            && !(ctx.params.prune.params
+                && crate::search::threat_unifier_impossible(ctx, &unifier));
+
         if affected {
             self.separate(ctx, plans, unsafe_, &unifier);
             self.promote(ctx, plans, unsafe_);

@@ -69,6 +69,15 @@ fn signed(literal: &Literal) -> SignedPredicate {
     (literal.atom().predicate, literal.negative())
 }
 
+/// An open condition's signed predicate, without cloning its atom.
+fn open_condition_predicate(open_cond: &OpenCondition) -> Option<SignedPredicate> {
+    match open_cond.condition.as_ref() {
+        Formula::Atom(atom) => Some((atom.predicate, false)),
+        Formula::Negation(atom) => Some((atom.predicate, true)),
+        _ => None,
+    }
+}
+
 /// Collects the literals a precondition formula requires, over-approximating:
 /// every atom that appears anywhere in the formula is treated as potentially
 /// required. Over-approximating grows the graph, which is the safe direction
@@ -591,9 +600,33 @@ pub fn prunable(ctx: &SearchContext, plan: &Plan) -> bool {
         return false;
     }
     let graph = ctx.operator_graph();
+
+    // A second filter, and the one that earns its keep: *exact* recursion
+    // regresses an open condition through a link carrying the syntactically
+    // same condition, so unless such a link is already in the plan there is no
+    // root link and nothing to suspend. Checking that costs a scan over the
+    // links; the alternative is building the link index and running a graph
+    // search per open condition, which is what the rule used to do on every
+    // node whether or not a recursion was possible.
+    //
+    // The predicate pass runs first because it compares two integers where the
+    // structural pass compares a predicate and a term vector.
     let any_candidate = chain::iter(&plan.open_conds).any(|oc| {
-        oc.literal()
-            .is_some_and(|literal| graph.may_recurse(&literal))
+        // Read the predicate off the formula rather than through
+        // `OpenCondition::literal`, which clones the atom's term vector — this
+        // runs for every open condition of every generated node.
+        let Some(key) = open_condition_predicate(oc) else {
+            return false;
+        };
+        if !graph.cyclic.contains(&key) {
+            return false;
+        }
+        chain::iter(&plan.links).any(|link| {
+            signed(&link.condition) == key
+                && oc
+                    .literal()
+                    .is_some_and(|literal| link.condition.as_ref() == &literal)
+        })
     });
     if !any_candidate {
         return false;
