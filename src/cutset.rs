@@ -132,7 +132,7 @@ fn necessarily_before(orderings: &BinaryOrderings, before: usize, after: usize) 
 pub fn has_inconsistent_cutset(plan: &PartialPlan, task: &Task, mutexes: &FactMutexes) -> bool {
     // With no link there is no spanning condition, and a step's own
     // preconditions and effects are individually consistent by construction.
-    if plan.links.is_empty() {
+    if plan.num_links() == 0 {
         return false;
     }
 
@@ -141,9 +141,9 @@ pub fn has_inconsistent_cutset(plan: &PartialPlan, task: &Task, mutexes: &FactMu
     let mut spanning: Vec<Fact> = Vec::new();
     let mut cutset: Vec<Fact> = Vec::new();
 
-    for step in plan.steps.iter() {
+    for step in plan.steps() {
         spanning.clear();
-        for link in plan.links.iter() {
+        for link in plan.links() {
             if link.producer == step.id || link.consumer == step.id {
                 continue;
             }

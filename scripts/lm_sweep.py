@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Tabulates a sweep CSV from lm_sweep.sh: coverage per configuration, overall
-and per domain family, plus the families where the configurations disagree."""
+and per domain family, the families where the configurations disagree, and —
+for CSVs that carry them — how each configuration's failures split between
+running out of time and running out of memory, and how many bytes a generated
+node cost."""
 
 import collections
 import csv
+import statistics
 import sys
 
 
@@ -33,6 +37,32 @@ def main(path: str) -> None:
     for config in configs:
         n = len(solved[config])
         print(f"  {config:<{width}}  {n:4d} / {len(attempted)}  ({100 * n / len(attempted):.1f}%)")
+
+    # Older CSVs have no outcome column; the tables below only mean something
+    # when the sweep recorded why a run stopped.
+    if all(r.get("outcome") for r in rows):
+        outcomes = sorted({r["outcome"] for r in rows})
+        print("\noutcomes")
+        header = "  " + "".ljust(width) + "".join(o.rjust(9) for o in outcomes)
+        print(header)
+        for config in configs:
+            counts = collections.Counter(r["outcome"] for r in rows if r["config"] == config)
+            print("  " + config.ljust(width) + "".join(str(counts.get(o, 0)).rjust(9) for o in outcomes))
+
+        # Bytes per generated node, from peak RSS over the nodes generated, on
+        # runs that generated enough nodes for the process baseline not to
+        # dominate. This is the number the node-size work is measured by.
+        print("\nbytes per generated node (median over runs with >= 10k nodes)")
+        for config in configs:
+            per_node = [
+                1024 * int(r["rss_kb"]) / int(r["nodes"])
+                for r in rows
+                if r["config"] == config and int(r["nodes"] or 0) >= 10_000 and int(r.get("rss_kb") or 0) > 0
+            ]
+            if per_node:
+                print(f"  {config:<{width}}  {statistics.median(per_node):8.0f} B  (n={len(per_node)})")
+            else:
+                print(f"  {config:<{width}}         -")
 
     families = sorted({family for family, _ in attempted})
     disagreeing = []

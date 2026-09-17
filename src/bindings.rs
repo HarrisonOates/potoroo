@@ -360,19 +360,50 @@ const INDEX_THRESHOLD: usize = 8;
 const MAX_INDEX_PREFIX: usize = 32;
 
 /// Overlay entry cap; entries are class members, so the overlay can outgrow
-/// the node prefix. Bounds the linear pass every indexed lookup makes before
-/// the hash maps.
+/// the node prefix. Bounds the scan every indexed lookup makes before the
+/// hash maps.
 const MAX_OVERLAY: usize = 96;
 
-/// Lookup entries for the varsets newer than a shared [`VarsetIndex`].
-/// Entries are inserted oldest→newest so that the newest class overwrites any
-/// older one and wins, matching a head-first scan. `depth` is the node's
-/// distance from the chain tail — stable as children cons more varsets on —
-/// and converts to a head-relative position as `num_varsets - 1 - depth`.
+/// Lookup entries for the varsets newer than a shared [`VarsetIndex`], as a
+/// persistent chain shared with the parent's overlay: a child conses its new
+/// varsets' members onto the front and the lookups scan head-first, so the
+/// newest class wins exactly as in a head-first scan of the varsets. It used
+/// to be two hash maps cloned whole for every child that added a binding —
+/// on lifted search that is nearly every child, and the clone was the largest
+/// single allocation a node retained. `depth` is the node's distance from the
+/// chain tail — stable as children cons more varsets on — and converts to a
+/// head-relative position as `num_varsets - 1 - depth`.
 #[derive(Debug, Default, Clone)]
 struct Overlay {
-    vars: FastMap<StepVariable, (u32, Rc<Chain<Varset>>)>,
-    objs: FastMap<Object, (u32, Rc<Chain<Varset>>)>,
+    entries: Option<Rc<Chain<OverlayEntry>>>,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+enum OverlayEntry {
+    Var(StepVariable, u32, Rc<Chain<Varset>>),
+    Obj(Object, u32, Rc<Chain<Varset>>),
+}
+
+impl Overlay {
+    fn var(&self, key: StepVariable) -> Option<(u32, Rc<Chain<Varset>>)> {
+        chain::iter(&self.entries).find_map(|entry| match entry {
+            OverlayEntry::Var(var, depth, node) if *var == key => Some((*depth, node.clone())),
+            _ => None,
+        })
+    }
+
+    fn obj(&self, key: Object) -> Option<(u32, Rc<Chain<Varset>>)> {
+        chain::iter(&self.entries).find_map(|entry| match entry {
+            OverlayEntry::Obj(obj, depth, node) if *obj == key => Some((*depth, node.clone())),
+            _ => None,
+        })
+    }
+
+    fn push(&mut self, entry: OverlayEntry) {
+        self.entries = chain::cons(entry, self.entries.take());
+        self.len += 1;
+    }
 }
 
 /// Whether a chain is worth indexing (cached alongside the index itself).
@@ -410,8 +441,8 @@ fn lookup_var_in(
             overlay,
             ix,
         } => {
-            if let Some((depth, node)) = overlay.vars.get(&(var, step_id)) {
-                return Some((num_varsets - 1 - *depth as usize, node.clone()));
+            if let Some((depth, node)) = overlay.var((var, step_id)) {
+                return Some((num_varsets - 1 - depth as usize, node));
             }
             ix.vars
                 .get(&(var, step_id))
@@ -434,8 +465,8 @@ fn lookup_obj_in(
             overlay,
             ix,
         } => {
-            if let Some((depth, node)) = overlay.objs.get(&obj) {
-                return Some((num_varsets - 1 - *depth as usize, node.clone()));
+            if let Some((depth, node)) = overlay.obj(obj) {
+                return Some((num_varsets - 1 - depth as usize, node));
             }
             ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))
         }
@@ -856,6 +887,8 @@ impl Bindings {
                         let added = num_varsets - self.num_varsets;
                         let p = prefix + added;
                         if p <= MAX_INDEX_PREFIX {
+                            // A shallow clone: the entries are shared with
+                            // the parent and only the new ones are consed on.
                             let mut ov = (**overlay).clone();
                             // The added nodes are the first `added` of the child
                             // chain; append oldest-first so reverse iteration in
@@ -872,18 +905,16 @@ impl Bindings {
                             for (i, n) in nodes.iter().enumerate().rev() {
                                 let depth = (num_varsets - 1 - i) as u32;
                                 for sv in chain::iter(&n.head.cd_set) {
-                                    ov.vars.insert(*sv, (depth, n.clone()));
+                                    ov.push(OverlayEntry::Var(*sv, depth, n.clone()));
                                 }
                                 if let Some(c) = n.head.constant {
-                                    ov.objs.insert(c, (depth, n.clone()));
+                                    ov.push(OverlayEntry::Obj(c, depth, n.clone()));
                                 }
                             }
-                            (ov.vars.len() + ov.objs.len() <= MAX_OVERLAY).then(|| {
-                                IndexState::Built {
-                                    prefix: p,
-                                    overlay: Rc::new(ov),
-                                    ix: ix.clone(),
-                                }
+                            (ov.len <= MAX_OVERLAY).then(|| IndexState::Built {
+                                prefix: p,
+                                overlay: Rc::new(ov),
+                                ix: ix.clone(),
                             })
                         } else {
                             None

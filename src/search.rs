@@ -3,7 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::fasthash::FastMap;
@@ -20,6 +20,7 @@ use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
 use crate::problem::Metric;
 use crate::problem::Problem;
+use crate::rank::Rank;
 use crate::terms::{Object, Term, Variable};
 use crate::types::{Type, OBJECT};
 
@@ -98,6 +99,7 @@ pub struct SearchContext<'a> {
     /// Lifted mutex groups, synthesised on first use when `-p cutset` is on.
     /// See [`crate::lifted_mutex`].
     lifted_mutexes: RefCell<Option<Rc<crate::lifted_mutex::LiftedMutexes>>>,
+    object_symmetries: RefCell<Option<Rc<crate::symmetry::ObjectSymmetries>>>,
 }
 
 impl<'a> StepVarTypes for SearchContext<'a> {
@@ -171,6 +173,7 @@ impl<'a> SearchContext<'a> {
             param_domains: RefCell::new(None),
             operator_graph: RefCell::new(None),
             lifted_mutexes: RefCell::new(None),
+            object_symmetries: RefCell::new(None),
             landmarks: RefCell::new(None),
             landmarks_fam: RefCell::new(None),
         };
@@ -490,6 +493,15 @@ impl<'a> SearchContext<'a> {
         self.lifted_mutexes.borrow().clone().unwrap()
     }
 
+    /// The task's interchangeable objects, computed once per search.
+    pub fn object_symmetries(&self) -> Rc<crate::symmetry::ObjectSymmetries> {
+        if self.object_symmetries.borrow().is_none() {
+            let symmetries = crate::symmetry::ObjectSymmetries::compute(self.domain, self.problem);
+            *self.object_symmetries.borrow_mut() = Some(Rc::new(symmetries));
+        }
+        self.object_symmetries.borrow().clone().unwrap()
+    }
+
     /// The domain's operator graph, computed once per search.
     pub fn operator_graph(&self) -> Rc<crate::opgraph::OperatorGraph> {
         if self.operator_graph.borrow().is_none() {
@@ -693,7 +705,7 @@ fn schema_to_action(schema: &ActionSchema) -> StepAction {
 /// `BinaryHeap` is a max-heap; the best plan must sort largest to be popped).
 struct QueuedPlan {
     plan: Rc<Plan>,
-    rank: Vec<f32>,
+    rank: Rank,
     /// When true the rank is a cheap proxy (parent's h + structural tiebreakers)
     /// and the real h must be computed when this plan is popped. Used by
     /// `LazyGbfs` and `LazyGbfsDual`.
@@ -714,17 +726,7 @@ impl PartialOrd for QueuedPlan {
 impl Ord for QueuedPlan {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         // Greater = better, so the heap pops the best plan. Smaller rank is better.
-        let n = self.rank.len().max(other.rank.len());
-        for i in 0..n {
-            let a = self.rank.get(i).copied().unwrap_or(0.0);
-            let b = other.rank.get(i).copied().unwrap_or(0.0);
-            if a < b {
-                return CmpOrdering::Greater; // self better
-            } else if a > b {
-                return CmpOrdering::Less;
-            }
-        }
-        CmpOrdering::Equal
+        self.rank.better_first(&other.rank)
     }
 }
 
@@ -759,6 +761,9 @@ pub struct SearchStats {
     pub max_threats: usize,
     /// Largest primary open-list size observed during search.
     pub max_queued: usize,
+    /// Queued plans discarded by an open-list bound (`--max-queued`,
+    /// `--mem-mb`). Zero unless one is set; see [`crate::memory`].
+    pub dropped: usize,
 }
 
 /// A point-in-time view of an active search, delivered after an expansion.
@@ -778,6 +783,11 @@ pub struct SearchProgress {
     pub h_evals: usize,
     pub h_eval_ms: u128,
     pub pruned: usize,
+    /// Queued plans discarded by an open-list bound so far.
+    pub dropped: usize,
+    /// The process's resident set in kilobytes, read for this update; zero
+    /// where it cannot be measured.
+    pub resident_kb: u64,
     /// Shape of the partial plan expanded for this update.
     pub current_steps: usize,
     pub current_open_conditions: usize,
@@ -815,7 +825,6 @@ pub fn plan_with_progress(
 fn pop_next(
     primary: &mut BinaryHeap<QueuedPlan>,
     mut secondary: Option<&mut BinaryHeap<QueuedPlan>>,
-    expanded_ids: &HashSet<usize>,
     ctx: &SearchContext,
     is_lazy: bool,
     is_gbfs: bool,
@@ -863,7 +872,7 @@ fn pop_next(
         };
 
         // Skip plans already expanded (stale secondary-queue duplicates).
-        if (is_dual || is_alt) && expanded_ids.contains(&q.plan.id.get()) {
+        if (is_dual || is_alt) && q.plan.expanded.get() {
             continue;
         }
 
@@ -881,7 +890,7 @@ fn pop_next(
         if real_rank[0].is_finite() {
             primary.push(QueuedPlan {
                 plan: q.plan,
-                rank: real_rank,
+                rank: real_rank.into(),
                 is_lazy: false,
             });
         }
@@ -1106,8 +1115,6 @@ fn plan_impl(
     } else {
         Vec::new()
     };
-    // Plan IDs already expanded; used to skip stale secondary-queue entries.
-    let mut expanded_ids: HashSet<usize> = HashSet::new();
 
     // Dual-queue boost state.
     let mut best_h: f32 = inf;
@@ -1121,6 +1128,8 @@ fn plan_impl(
     let mut max_open_conditions: usize = 0;
     let mut max_threats: usize = 0;
     let mut max_queued: usize = 0;
+    let mut bound = crate::memory::OpenListBound::new(ctx.params);
+    let mut num_dropped: usize = 0;
     let stats = std::env::var_os("POTOROO_STATS").is_some();
 
     let mut current_flaw_order: usize = 0;
@@ -1154,7 +1163,7 @@ fn plan_impl(
             max_open_conditions = max_open_conditions.max(plan.num_open_conds());
             max_threats = max_threats.max(plan.num_unsafes());
             if is_dual || is_alt {
-                expanded_ids.insert(plan.id.get());
+                plan.expanded.set(true);
             }
             if is_dual {
                 // Update boost when this plan's h improves the incumbent.
@@ -1240,7 +1249,7 @@ fn plan_impl(
                         // Secondary queue: pure FIFO ordered by plan id.
                         secondary_queues[cfo].push(QueuedPlan {
                             plan: new_plan.clone(),
-                            rank: vec![new_plan.id.get() as f32],
+                            rank: Rank::from_slice(&[new_plan.id.get() as f32]),
                             is_lazy: is_lazy_push,
                         });
                     } else if is_alt {
@@ -1250,13 +1259,14 @@ fn plan_impl(
                             plan: new_plan.clone(),
                             rank: alt_gbfs_rank
                                 .take()
-                                .expect("ALT child ranked without GBFS rank"),
+                                .expect("ALT child ranked without GBFS rank")
+                                .into(),
                             is_lazy: false,
                         });
                     }
                     queues[cfo].push(QueuedPlan {
                         plan: new_plan,
-                        rank,
+                        rank: rank.into(),
                         is_lazy: is_lazy_push,
                     });
                     generated_plans[cfo] += 1;
@@ -1266,6 +1276,12 @@ fn plan_impl(
 
             let queued = queues.iter().map(BinaryHeap::len).sum();
             max_queued = max_queued.max(queued);
+            if let Some(bound) = bound.as_mut() {
+                if let Some(keep) = bound.trim_target(num_generated_plans, queued) {
+                    num_dropped += crate::memory::trim_all(&mut queues, keep);
+                    crate::memory::trim_all(&mut secondary_queues, keep);
+                }
+            }
             if let Some(report) = progress.as_deref_mut() {
                 report(SearchProgress {
                     elapsed: search_started.elapsed(),
@@ -1275,6 +1291,8 @@ fn plan_impl(
                     h_evals: ctx.h_evals.get(),
                     h_eval_ms: ctx.h_eval_nanos.get() / 1_000_000,
                     pruned: ctx.pruned.get(),
+                    dropped: num_dropped,
+                    resident_kb: crate::memory::resident_set_kb(),
                     current_steps: plan.num_steps(),
                     current_open_conditions: plan.num_open_conds(),
                     current_threats: plan.num_unsafes(),
@@ -1326,7 +1344,6 @@ fn plan_impl(
                         } else {
                             None
                         },
-                        &expanded_ids,
                         ctx,
                         is_lazy,
                         is_gbfs,
@@ -1372,12 +1389,13 @@ fn plan_impl(
                                             open_conds: inst.open_conds.clone(),
                                             num_open_conds: inst.num_open_conds,
                                             id: std::cell::Cell::new(num_generated_plans),
+                                            expanded: std::cell::Cell::new(false),
                                         });
                                         let rank = corrected.rank(ctx);
                                         if rank[0].is_finite() {
                                             queues[current_flaw_order].push(QueuedPlan {
                                                 plan: corrected,
-                                                rank,
+                                                rank: rank.into(),
                                                 is_lazy: false,
                                             });
                                         }
@@ -1388,7 +1406,6 @@ fn plan_impl(
                                             } else {
                                                 None
                                             },
-                                            &expanded_ids,
                                             ctx,
                                             is_lazy,
                                             is_gbfs,
@@ -1410,7 +1427,6 @@ fn plan_impl(
                                         } else {
                                             None
                                         },
-                                        &expanded_ids,
                                         ctx,
                                         is_lazy,
                                         is_gbfs,
@@ -1460,6 +1476,7 @@ fn plan_impl(
         max_open_conditions,
         max_threats,
         max_queued,
+        dropped: num_dropped,
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {
@@ -1479,7 +1496,8 @@ fn plan_impl(
             );
             Outcome::Solved(p)
         }
-        _ if limit_reached => Outcome::LimitReached,
+        // Queues emptied by an open-list bound say nothing about solvability.
+        _ if limit_reached || num_dropped > 0 => Outcome::LimitReached,
         _ => Outcome::NoSolution,
     };
     (outcome, search_stats)
@@ -1569,6 +1587,7 @@ fn step_instantiation(ctx: &SearchContext, plan: &Rc<Plan>) -> Option<Rc<Plan>> 
         open_conds: None,
         num_open_conds: 0,
         id: std::cell::Cell::new(plan.id.get()),
+        expanded: std::cell::Cell::new(false),
     }))
 }
 

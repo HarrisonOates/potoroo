@@ -177,15 +177,12 @@ pub struct Recursion {
 /// Allocation-free: an open condition on a cycle whose fact already labels a
 /// link in the plan. Everything else stops here.
 pub fn recursion_may_apply(plan: &PartialPlan, graph: &FactGraph) -> bool {
-    if plan.links.is_empty() || plan.open_conditions.is_empty() {
+    if plan.num_links() == 0 || plan.num_open_conditions() == 0 {
         return false;
     }
-    plan.open_conditions.iter().any(|open| {
+    plan.open_conditions().any(|open| {
         graph.may_recurse(open.condition)
-            && plan
-                .links
-                .iter()
-                .any(|link| link.condition == open.condition)
+            && plan.links().any(|link| link.condition == open.condition)
     })
 }
 
@@ -193,7 +190,7 @@ pub fn recursion_may_apply(plan: &PartialPlan, graph: &FactGraph) -> bool {
 ///
 /// Call [`recursion_may_apply`] first; this assumes it passed.
 pub fn recursion_prunable(plan: &PartialPlan, task: &Task, graph: &FactGraph) -> bool {
-    let Some((anchor, recursion)) = plan.open_conditions.iter().find_map(|open| {
+    let Some((anchor, recursion)) = plan.open_conditions().find_map(|open| {
         suspension_of(plan, task, graph, open.condition, open.consumer)
             .map(|recursion| (open.clone(), recursion))
     }) else {
@@ -203,7 +200,7 @@ pub fn recursion_prunable(plan: &PartialPlan, task: &Task, graph: &FactGraph) ->
     // Theorem 1: every open condition suspended, as a recursion in its own
     // right or as a loop predecessor of one, and no unresolved threats.
     if plan.threats(task).is_empty() {
-        let all_suspended = plan.open_conditions.iter().all(|open| {
+        let all_suspended = plan.open_conditions().all(|open| {
             open == &anchor
                 || is_loop_predecessor(plan, open.consumer, &recursion)
                 || suspension_of(plan, task, graph, open.condition, open.consumer).is_some()
@@ -247,8 +244,7 @@ fn recursion_of(plan: &PartialPlan, condition: Fact, consumer: usize) -> Option<
     let forward = reachable_forward(plan, consumer);
     let to_goal = reaches_goal(plan);
     let root_links: Vec<CausalLink> = plan
-        .links
-        .iter()
+        .links()
         .filter(|link| {
             link.condition == condition
                 && to_goal.contains(&link.producer)
@@ -290,7 +286,7 @@ fn has_loop_threat(
     condition: Fact,
     recursion: &Recursion,
 ) -> bool {
-    for step in plan.steps.iter() {
+    for step in plan.steps() {
         if recursion.region.contains(&step.id) {
             continue;
         }
@@ -320,7 +316,7 @@ fn links_out_of_region(plan: &PartialPlan, recursion: &Recursion) -> bool {
         .iter()
         .map(|link| link.consumer)
         .collect();
-    plan.links.iter().any(|link| {
+    plan.links().any(|link| {
         recursion.region.contains(&link.producer)
             && !recursion.region.contains(&link.consumer)
             && !root_consumers.contains(&link.consumer)
@@ -341,7 +337,7 @@ fn is_loop_predecessor(plan: &PartialPlan, consumer: usize, recursion: &Recursio
         if node == GOAL_ID {
             return false;
         }
-        for link in plan.links.iter().filter(|link| link.producer == node) {
+        for link in plan.links().filter(|link| link.producer == node) {
             if roots.contains(&(link.producer, link.consumer)) {
                 continue;
             }
@@ -367,7 +363,7 @@ fn theorem_four(
     };
 
     let mut relevant: HashSet<usize> = HashSet::new();
-    for open in plan.open_conditions.iter() {
+    for open in plan.open_conditions() {
         if open.condition == anchor {
             continue;
         }
@@ -396,7 +392,7 @@ fn theorem_four(
 
     // (3) No unresolved threat to a root link.
     for threat in plan.threats(task) {
-        let threatened = &plan.links[threat.link];
+        let threatened = plan.threatened_link(&threat);
         if recursion.root_links.iter().any(|link| {
             link.producer == threatened.producer && link.consumer == threatened.consumer
         }) {
@@ -416,7 +412,7 @@ fn goal_reachable_avoiding(plan: &PartialPlan, start: usize, cut: Fact) -> bool 
         if node == GOAL_ID {
             return true;
         }
-        for link in plan.links.iter().filter(|link| link.producer == node) {
+        for link in plan.links().filter(|link| link.producer == node) {
             if link.condition == cut {
                 continue;
             }
@@ -432,7 +428,7 @@ fn reachable_forward(plan: &PartialPlan, start: usize) -> HashSet<usize> {
     let mut seen: HashSet<usize> = HashSet::from([start]);
     let mut stack = vec![start];
     while let Some(node) = stack.pop() {
-        for link in plan.links.iter().filter(|link| link.producer == node) {
+        for link in plan.links().filter(|link| link.producer == node) {
             if seen.insert(link.consumer) {
                 stack.push(link.consumer);
             }
@@ -449,7 +445,7 @@ fn reachable_backward_from(plan: &PartialPlan, seeds: &HashSet<usize>) -> HashSe
     let mut seen: HashSet<usize> = seeds.clone();
     let mut stack: Vec<usize> = seeds.iter().copied().collect();
     while let Some(node) = stack.pop() {
-        for link in plan.links.iter().filter(|link| link.consumer == node) {
+        for link in plan.links().filter(|link| link.consumer == node) {
             if seen.insert(link.producer) {
                 stack.push(link.producer);
             }
@@ -464,13 +460,12 @@ fn reachable_backward_from(plan: &PartialPlan, seeds: &HashSet<usize>) -> HashSe
 
 /// Whether the minimality rule could fire on this plan.
 pub fn minimality_may_apply(plan: &PartialPlan) -> bool {
-    plan.steps.len() >= 3 && !plan.links.is_empty()
+    plan.num_steps() >= 3 && plan.num_links() > 0
 }
 
 /// Conditions of links necessarily spanning `step`.
 fn np_cutset(plan: &PartialPlan, step: usize) -> Vec<Fact> {
-    plan.links
-        .iter()
+    plan.links()
         .filter(|link| {
             link.producer != step
                 && link.consumer != step
@@ -483,8 +478,7 @@ fn np_cutset(plan: &PartialPlan, step: usize) -> Vec<Fact> {
 
 /// Conditions of links possibly spanning `step`, plus those supporting it.
 fn pp_cutset(plan: &PartialPlan, step: usize) -> Vec<Fact> {
-    plan.links
-        .iter()
+    plan.links()
         .filter(|link| {
             if link.consumer == step {
                 return true;
@@ -498,7 +492,7 @@ fn pp_cutset(plan: &PartialPlan, step: usize) -> Vec<Fact> {
 }
 
 fn step_strictly_between(plan: &PartialPlan, before: usize, after: usize) -> bool {
-    plan.steps.iter().any(|step| {
+    plan.steps().any(|step| {
         necessarily_before(&plan.orderings, before, step.id)
             && necessarily_before(&plan.orderings, step.id, after)
     })
@@ -511,13 +505,12 @@ fn step_strictly_between(plan: &PartialPlan, before: usize, after: usize) -> boo
 /// *terminate* at `s″`, and some step must lie strictly between the two anchors.
 pub fn minimality_prunable(plan: &PartialPlan) -> bool {
     let candidates = plan
-        .steps
-        .iter()
+        .steps()
         .map(|step| step.id)
         .chain(std::iter::once(GOAL_ID));
 
     for second in candidates {
-        let precedes = plan.open_conditions.iter().all(|open| {
+        let precedes = plan.open_conditions().all(|open| {
             open.consumer == second || necessarily_before(&plan.orderings, open.consumer, second)
         });
         if !precedes {
@@ -527,7 +520,7 @@ pub fn minimality_prunable(plan: &PartialPlan) -> bool {
         if inner.is_empty() {
             continue;
         }
-        for first in plan.steps.iter().map(|step| step.id) {
+        for first in plan.steps().map(|step| step.id) {
             if first == second || first == INIT_ID {
                 continue;
             }

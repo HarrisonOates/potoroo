@@ -66,6 +66,12 @@ pub struct Parameters {
     /// Opt-in pruning rules from the POCL literature. All off by default; see
     /// [`PruneOptions`].
     pub prune: PruneOptions,
+    /// Halve every open list once it holds more than this many plans in
+    /// total. Incomplete; see [`crate::memory`].
+    pub max_queued: Option<usize>,
+    /// Halve every open list once the process's resident set exceeds this
+    /// many megabytes. Incomplete; see [`crate::memory`].
+    pub memory_limit_mb: Option<usize>,
 }
 
 impl Default for Parameters {
@@ -82,6 +88,8 @@ impl Default for Parameters {
             ground_actions: false,
             time_h_evals: false,
             prune: PruneOptions::default(),
+            max_queued: None,
+            memory_limit_mb: None,
         }
     }
 }

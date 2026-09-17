@@ -49,6 +49,12 @@ pub(crate) enum HVal {
     /// committed steps as initially available. FDR POCL search only.
     LmCut,
     LmCutR,
+    /// The causal-link compilation (Bercher, Geier & Biundo 2013), delete
+    /// relaxed and evaluated natively over the finite-domain task: `h_add` or
+    /// `h_FF` of the classical task in which every committed step is an
+    /// action that must run. FDR POCL search only. See [`crate::cl_relax`].
+    ClAdd,
+    ClFf,
     /// Sample-FF heuristic (Bercher et al. 2013): keep the committed plan steps
     /// non-relaxed and fill the gaps between them with delete relaxation, over
     /// `usize` sampled linearizations of the partial order. Ground search only.
@@ -192,6 +198,8 @@ impl Heuristic {
                 }
                 "LMCUT" | "LM-CUT" => HVal::LmCut,
                 "LMCUTR" | "LM-CUTR" => HVal::LmCutR,
+                "CLADD" | "CL_ADD" => HVal::ClAdd,
+                "CLFF" | "CL_FF" => HVal::ClFf,
 
                 "MAKESPAN" => {
                     return Err("heuristic `MAKESPAN` is temporal and not yet supported".to_string())
@@ -199,6 +207,15 @@ impl Heuristic {
                 other => return Err(format!("invalid heuristic `{other}`")),
             };
             h.push(v);
+        }
+        // A queue entry stores its rank inline, with room for the composed
+        // terms plus the two tiebreakers a search algorithm appends.
+        if h.len() > crate::rank::MAX_HEURISTIC_TERMS {
+            return Err(format!(
+                "at most {} heuristics can be composed with `/`, got {}",
+                crate::rank::MAX_HEURISTIC_TERMS,
+                h.len()
+            ));
         }
         Ok(Heuristic { h, needs_pg })
     }
@@ -212,7 +229,7 @@ impl Heuristic {
     pub fn requires_fdr_pocl(&self) -> bool {
         self.h
             .iter()
-            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR))
+            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf))
     }
 
     /// Parsed ranking terms for alternate plan representations. Keeping the
@@ -421,7 +438,7 @@ impl Heuristic {
                     rank.push(g + weight * v);
                     grank.push(weight * v);
                 }
-                HVal::LmCut | HVal::LmCutR => {
+                HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf => {
                     unreachable!("native LMCUT/LMCUTR requires FDR POCL search")
                 }
                 // Delegating heuristics carry no separable g component; both

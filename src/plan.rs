@@ -105,6 +105,10 @@ pub struct Plan {
     pub num_open_conds: usize,
     /// Serial number (set before rank is computed).
     pub id: std::cell::Cell<usize>,
+    /// Set once the search has expanded this plan. Dual-queue algorithms
+    /// queue a plan twice and skip the second entry by this flag, which costs
+    /// nothing per plan where a set of expanded ids grew with the search.
+    pub expanded: std::cell::Cell<bool>,
 }
 
 impl Plan {
@@ -241,6 +245,7 @@ impl Plan {
             open_conds,
             num_open_conds,
             id: std::cell::Cell::new(0),
+            expanded: std::cell::Cell::new(false),
         })
     }
 
@@ -678,8 +683,30 @@ impl Plan {
         open_cond: &OpenCondition,
         achievers: &[(Rc<StepAction>, usize)],
     ) {
+        // Under `-p symmetry`, a ground step may introduce an interchangeable
+        // object only if it is the first of its class the plan has not used;
+        // the objects a plan uses are exactly its steps' arguments. Lifted
+        // steps carry no arguments yet and pass through. See `crate::symmetry`.
+        let symmetries = ctx
+            .params
+            .prune
+            .symmetry
+            .then(|| ctx.object_symmetries())
+            .filter(|symmetries| !symmetries.is_empty());
+        let used: Option<crate::fasthash::FastSet<crate::terms::Object>> =
+            symmetries.as_ref().map(|_| {
+                chain::iter(&self.steps)
+                    .flat_map(|step| step.action.arguments.iter().copied())
+                    .collect()
+            });
         for (action, effect_idx) in achievers {
             if !action.synthetic() {
+                if let (Some(symmetries), Some(used)) = (&symmetries, &used) {
+                    if !symmetries.canonical_arguments(&action.arguments, |o| used.contains(&o)) {
+                        ctx.pruned.set(ctx.pruned.get() + 1);
+                        continue;
+                    }
+                }
                 let step = Step {
                     id: self.num_steps + 1,
                     action: action.clone(),

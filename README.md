@@ -216,9 +216,58 @@ unconditional SAS+ effects.
 |------|-------------|
 | `LMCUT` | Joint LM-cut estimate for all open conditions, starting from the problem initial state |
 | `LMCUTR` | Reuse-aware LM-cut: committed-step effects are free; an admissible lower bound on additional task cost |
+| `CLFF` | `h_FF` of the **causal-link compilation** (Bercher, Geier & Biundo 2013), delete-relaxed and evaluated natively: every committed step is a zero-cost action that must run once its preconditions hold and its link producers have run. Inadmissible; the satisficing heuristic of choice here. |
+| `CLADD` | `h_add` of the same compiled task. |
+| `LM` | Count of the task's ground **fact landmarks** (first-achiever backchaining from the goals, Richter, Helmert & Westphal 2008) that no step of the plan produces and the initial state does not hold. Weak alone; see below. |
 
 These are direct POCL open-condition relaxations and are distinct from
 `COMPILE_LMCUT`, which evaluates LM-cut on the causal-link compilation.
+
+#### The compiled relaxation, natively
+
+`COMPILE_FF` was the best-informed heuristic in the position paper's survey
+and unusable in practice: a Fast Downward subprocess per node, on the ground
+literal representation. `CLFF` and `CLADD` are the same estimate over the
+finite-domain task, in-process (`src/cl_relax.rs`): the translator's operators
+propositionised once, plus one zero-cost action per committed step built at
+each node, and one Dijkstra pass. Tens of microseconds a node at the sweep's
+sizes.
+
+What it sees that `ADD` does not is the partial plan. `ADD` under `--fdr-pocl`
+is a table lookup of `h_add` *from the initial state* per open condition — the
+committed steps are invisible to it, and search on the families it fails is
+brute force. Under the compilation a committed step's effects become available
+only once the step is executable, so a plan that has committed to steps it
+cannot yet support is not rewarded, and a plan whose steps chain properly is
+charged only for the gaps. On the smallest problems of families the sweep
+recorded as unsolved (20 s, 768 MB, `--fdr-pocl`):
+
+| generated nodes | `ADD` | `CLFF` | `CLFF -s ALT` | `CLADD -s ALT` |
+|---|---|---|---|---|
+| `nomystery-opt11` p01 | 1,241,019 (607 MB) | **17,906** | 36,322 | 53,186 |
+| `grid` prob01 | 1,080,885 (634 MB) | 20,112 | **3,434** | — |
+| `transport-sat08` p01 | — (out of memory) | 1,325 | **989** | — |
+| `depot` p02 | 4,286 | **1,002** | | |
+| `rovers` p03 | 681 (`ALT`) | | **97** | |
+| `fixit` (examples) | 1,024,167 (`ALT`) | | 836 | **267** |
+| `simple-grid2` (examples) | 139,506 (`ALT`) | | **129** | 400 |
+| `rocket-ext-a` (examples) | 31,468 (`ALT`) | | **1,476** | 1,370,785 |
+
+Two cautions, both visible in the table. Under plain A\* at weight 1 an
+informative heuristic that *under*-estimates makes A\* near-exhaustive:
+`CLFF` needs 29,033 nodes on `gripper-6` where `ADD`'s inflated sums behave
+greedily and need 492 — and 354 under `ALT`, 341 at `-w 2`. Use `-s ALT` or a
+weight with it. And it is not uniformly better: `ADD` keeps `gripper-20` at
+3,981 nodes and cost 61 where `CLFF` under `ALT` takes 5,407 and cost 77, and
+`CLADD` can lose badly to `CLFF` (`rocket-ext-a`). The [sweep](#landmark-sweep)
+is what decides between them.
+
+The ground `LM` is the finite-domain reading of the lifted landmark count. On
+its own it is weak (`nomystery` p01: 615,918 nodes), and as a tiebreaker
+behind `CLFF` it changes little (`CLFF/LM` 18,161 against `CLFF` 17,906) —
+the same finding as for the lifted `ADD/LM` composition. Kept because it is
+cheap and because `psr-small`, where landmarks were the only heuristic that
+solved anything, now solves under it in 1,245 nodes.
 
 For resource-shuttling problems, `-s ALT -h ADD` is generally more robust than
 pure GBFS: ALT interleaves greedy `h_add` guidance with total estimated plan
@@ -267,7 +316,9 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
 | `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
-| `-p` | `--prune` | RULES | Opt-in pruning rules (see [Pruning rules](#pruning-rules)) | none |
+| — | `--max-queued` | N | Hold the open lists at N plans, discarding the worst (incomplete; see [Node size and memory](#node-size-and-memory)) | off |
+| — | `--mem-mb` | M | Hold the open lists so the resident set stays near M MB (incomplete; same section) | off |
+| `-p` | `--prune` | RULES | Opt-in pruning rules (see [Pruning rules](#pruning-rules)); `symmetry` is the one new here | none |
 | `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
 | `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
 | `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
@@ -486,6 +537,7 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
 | `recursion` | Smith & Peot, AIPS-96, Thms. 1 and 4 | every representation | A plan whose remaining open conditions are all suspended inside a regression loop, so every completion is non-minimal. |
 | `minimality` | Kambhampati, IJCAI-95, Strategy 2 | every representation | A plan with steps `s′ ≺ s″` where everything `s″` might rely on is already guaranteed at `s′`, making the steps between them removable. |
+| `symmetry` | Fox & Long, IJCAI-99 (object symmetry), read for plan space | ground and `--fdr-pocl` | An achiever that introduces an **interchangeable object** other than the first unused one of its class. Two objects are interchangeable when swapping them leaves the initial state, the cost functions and the goal unchanged; a plan mentions an object only through its steps' arguments, so while it mentions neither, the child introducing the second has a renamed sibling introducing the first. Solution-preserving up to renaming, for any heuristic. Lifted steps carry no arguments yet, so it is inert there. |
 
 ```bash
 # The three finite-domain rules, which are also the three cheapest
@@ -625,6 +677,32 @@ grows with plan length — which is exactly where POCL search is already in
 trouble, and the same tension the HSDIP position paper raises about node growth.
 Hoisting the binding resolution out of the inner loop cut this cost five-fold
 (`logistics-a`: 2781 ms to 666 ms) and the shape did not change.
+
+### Interchangeable objects
+
+`-p symmetry` is the one rule here that removes children the heuristic would
+have *explored*, and it is sound for any heuristic: every child it skips has a
+sibling that differs from it by a renaming of objects the plan has not yet told
+apart. Classes are computed once from the lowered PDDL (`src/symmetry.rs`) —
+a single transposition `(o₁ o₂)` checked exactly against the initial atoms,
+the `:init` cost assignments and the goal — so `road-test`'s locations, priced
+by a road-length function, are never merged, and nothing the goal names is.
+
+It bites exactly where the objects are truly identical, and nowhere else:
+
+| generated nodes | default | `-p symmetry` |
+|---|---|---|
+| `gripper-6` (`--fdr-pocl`) | 492 | **425** |
+| `gripper-6` (`-g`) | 2,211 | **790** |
+| `depot` p02 (`--fdr-pocl`) | 4,286 | **2,830** |
+| `satellite` p01 (`--fdr-pocl`) | 269 | **179** |
+| `nomystery`, `transport`, `elevators` p01 | unchanged | unchanged |
+
+Costs are unchanged in every row. The trucks of `nomystery` and `transport`
+start at different locations with different fuel or capacity, so no
+transposition fixes the initial state and no class forms — the rule is as
+precise as the initial state lets it be, and says so under `-v`
+(`Symmetry: 1 interchangeable-object class(es) of size 2`).
 
 ### A note on `edelete` outside `--fdr-pocl`
 
@@ -785,6 +863,69 @@ this planner so far was taken without it, so flipping the default silently would
 invalidate the comparison rather than improve it. It is a decision to take
 explicitly, alongside re-taking those measurements.
 
+## Node size and memory
+
+Plan-space search here dies of memory, not time. On the smallest problems of
+the families the sweep records as unsolved, run 12 s under a 1.5 GB cap in
+every representation, nearly every unsolved run ended in
+`memory allocation … failed` within 2–8 s, at 100k–1M generated nodes a
+second and roughly 1 KB per generated node (lifted, `-g`) or 2.5 KB per queued
+node (`--fdr-pocl`) — with the heuristic taking under a tenth of the time. The
+sweep's `outcome` column (below) says the same over the corpus: under
+`--fdr-pocl` 179 of 441 runs are killed for memory and 91 for time.
+
+So the node layout is a coverage question, and three things changed in it.
+
+**The finite-domain plan is on persistent chains.** `PartialPlan` kept its
+steps, links and open conditions in `Rc<Vec<_>>`s copied whole on every
+change, and a child that added a step copied three of them — `16S + 48L + 24C`
+bytes a node. They are now the same persistent `Chain` the literal plan uses,
+newest first, so a child conses onto its parent's chain and shares the rest;
+threats stay a vector, being few and kept in discovery order. Node counts are
+identical on every case of `scripts/bench_ground.sh` and wall time is 5%
+lower overall (−13% on `gripper-12`). At the sweep's 768 MB:
+
+| `--fdr-pocl`, 768 MB | before | after |
+|---|---|---|
+| `nomystery-opt11` p01 | out of memory in under a second | **solved**, 1,241,019 nodes, 608 MB |
+| `grid` prob01 | out of memory in under a second | **solved**, 1,080,885 nodes, 615 MB |
+| `elevators-sat08` p01 | 6,114 nodes, 16.2 MB | 6,114 nodes, **8.7 MB** |
+
+**Queue entries carry their rank inline.** Every queued plan held a heap
+`Vec<f32>`; it is now a fixed six-term array (four composed heuristics plus
+two tiebreakers, which the parser enforces), and the dual-queue algorithms
+mark an expanded plan on the plan rather than in a set that grew with the
+search.
+
+**The lifted bindings index no longer clones per child.** A child that adds a
+binding inherits its parent's varset index behind an *overlay* of the new
+varsets' members, and that overlay was two hash maps cloned for every such
+child — on lifted search, nearly every child. It is now a persistent chain
+scanned newest-first, under the same cap. Peak resident set at a 300,000-node
+limit, lifted `ADD`: `nomystery` p01 292 → **198 MB**, `floortile` p01
+336 → **301 MB**, `rovers` p01 112 → 119 MB.
+
+### A memory-bounded open list
+
+`--mem-mb M` and `--max-queued N` are the one **incomplete** device in this
+planner, and off by default. Once the resident set crosses `M`, the open lists
+are held at a capacity — the worst entries are discarded whenever they
+overflow — and the capacity is tightened by a tenth each time the resident
+set is found above the limit *and* two percent above where it stood at the
+last tightening, since the allocator keeps freed memory for the next nodes
+and the set stays flat while the lists refill (`src/memory.rs`). A first
+version halved every list at each reading and drained a low-branching search
+in five seconds. Bound the resident set at about 200 MB under an
+address-space cap.
+
+It does what it says — on the eight probe instances every run used the whole
+20 s instead of dying at eight — and it solved none of them, which is the
+honest summary: it buys time to search, not a better search. A search that
+empties its lists after dropping anything reports the limit reached rather
+than the problem unsolvable, and `dropped` in the statistics counts what it
+threw away. Under an admissible heuristic the returned plan is no longer
+guaranteed optimal.
+
 ## Landmark sweep
 
 `scripts/lm_sweep.sh` compares planner configurations for **coverage** over a
@@ -793,9 +934,23 @@ default:
 
 ```
 scripts/lm_sweep.sh -b ../downward-benchmarks \
-                    -c ADD,RELAX,LM,LMO,LMF,LMFO,ADD/LMF \
-                    -t 20 -n 3 -j 6 -m 2560 -o sweep-results.csv
+                    -c ADD,fdr:ADD,fdr:CLFF@ALT,fdr:ADD+cutset+edelete+disjunctive \
+                    -t 20 -n 3 -j 8 -m 768 -o sweep-results.csv
 ```
+
+A configuration is `[MODE:]HEURISTIC[+RULE+RULE…][@SEARCH]`: `MODE` is
+`lifted` (default), `g` or `fdr`, `SEARCH` an `-s` value, and rules are joined
+with `+`. `-x FLAGS` adds flags to every run. Each row records an `outcome` —
+`solved`, `noplan`, `limit`, `timeout` or `oom` — with peak resident set and
+the largest open list, so a configuration that loses coverage can be read as
+dying of memory or of time; `lm_sweep.py` tabulates outcomes and bytes per
+generated node alongside coverage.
+
+Families that ship one domain per problem (`airport`'s `p01-domain.pddl`,
+`openstacks`' `domain_p20_1.pddl`, `flashfill`'s `domain-p04.pddl`) were
+matched to the wrong domain by earlier versions of the script and recorded as
+errors; the sweeps below `docs/repr-sweep-results.csv` predate that fix and
+those families count as unsolved in them.
 
 It takes the `-n` smallest problems of each family, runs every configuration on
 each under a wall timeout (`-t`) and an address-space cap (`-m` MB, so a run

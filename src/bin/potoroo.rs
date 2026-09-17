@@ -132,12 +132,26 @@ fn run() -> Result<ExitCode, String> {
                     task.operators.len()
                 );
             }
+            let symmetries = cli.params.prune.symmetry.then(|| ctx.object_symmetries());
+            if let (Some(symmetries), true) = (&symmetries, cli.verbosity > 0) {
+                eprintln!("Symmetry: {}", symmetries.summary());
+            }
             let search_result = if cli.verbosity > 0 {
                 let mut printer = ProgressPrinter::new(cli.verbosity);
                 let mut report = |progress| printer.report(progress);
-                potoroo::fdr_pocl::solve_with_params_and_progress(&task, &cli.params, &mut report)
+                potoroo::fdr_pocl::solve_with_context(
+                    &task,
+                    &cli.params,
+                    symmetries.as_deref(),
+                    Some(&mut report),
+                )
             } else {
-                potoroo::fdr_pocl::solve_with_params(&task, &cli.params)
+                potoroo::fdr_pocl::solve_with_context(
+                    &task,
+                    &cli.params,
+                    symmetries.as_deref(),
+                    None,
+                )
             };
             let (outcome, stats) = search_result.map_err(|e| e.to_string())?;
             let (solved, plan_len, plan_cost, status) = match outcome {
@@ -192,7 +206,7 @@ fn run() -> Result<ExitCode, String> {
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
-                     \"max_disjunctions\":{},\"max_queued\":{}}}",
+                     \"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
@@ -209,6 +223,9 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_threats,
                     stats.max_disjunctions,
                     stats.max_queued,
+                    stats.dropped,
+                    outcome_label(status),
+                    peak_rss_kb(),
                 );
             }
             continue;
@@ -267,7 +284,8 @@ fn run() -> Result<ExitCode, String> {
                 "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
                  \"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
                  \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\"max_steps\":{},\
-                 \"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{}}}",
+                 \"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{},\
+                 \"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
                 json_escape(&problem.name),
                 json_escape(&label),
                 cli.params.ground_actions,
@@ -284,6 +302,9 @@ fn run() -> Result<ExitCode, String> {
                 stats.max_open_conditions,
                 stats.max_threats,
                 stats.max_queued,
+                stats.dropped,
+                outcome_label(status),
+                peak_rss_kb(),
             );
         }
     }
@@ -322,7 +343,7 @@ impl ProgressPrinter {
         }
         self.last_report = Some(progress.elapsed);
         eprintln!(
-            "Search [{:>7.2}s] visited {} | generated {} | queued {} | h {} evals / {} ms | pruned {} | current steps={} open={} threats={} order={}",
+            "Search [{:>7.2}s] visited {} | generated {} | queued {} | h {} evals / {} ms | pruned {} | dropped {} | rss {} MB | current steps={} open={} threats={} order={}",
             progress.elapsed.as_secs_f64(),
             progress.nodes_visited,
             progress.nodes_generated,
@@ -330,6 +351,8 @@ impl ProgressPrinter {
             progress.h_evals,
             progress.h_eval_ms,
             progress.pruned,
+            progress.dropped,
+            progress.resident_kb / 1024,
             progress.current_steps,
             progress.current_open_conditions,
             progress.current_threats,
@@ -379,6 +402,15 @@ fn print_search_configuration(cli: &Cli) {
     let prune = cli.params.prune.names();
     if !prune.is_empty() {
         eprintln!("Pruning: {}", prune.join(","));
+        if !cli.fdr_pocl && !cli.params.ground_actions {
+            let inert = cli.params.prune.ground_only();
+            if !inert.is_empty() {
+                eprintln!(
+                    "  {} cannot fire: lifted steps have no arguments yet (use -g or --fdr-pocl)",
+                    inert.join(",")
+                );
+            }
+        }
         let inert = if cli.fdr_pocl {
             cli.params.prune.lifted_only()
         } else {
@@ -443,6 +475,29 @@ fn print_search_summary(
         max_open,
         max_threats,
     );
+}
+
+/// Peak resident set size in kilobytes from `/proc/self/status`.
+/// Returns zero when the file is unavailable.
+fn peak_rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// The STATS outcome reported by the search.
+fn outcome_label(status: &str) -> &'static str {
+    match status {
+        "solved" => "solved",
+        "limit reached" => "limit",
+        _ => "noplan",
+    }
 }
 
 /// Minimal JSON string escaping for the opt-in `POTOROO_STATS_JSON` line. Problem
@@ -563,6 +618,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 params.prune = potoroo::pruning::PruneOptions::parse(&v)?;
             }
+            "max-queued" => {
+                let v = required_value!();
+                params.max_queued = Some(parse_count(&flag, &v)?);
+            }
+            "mem-mb" => {
+                let v = required_value!();
+                params.memory_limit_mb = Some(parse_count(&flag, &v)?);
+            }
             "r" => return Err("-r (random open conditions) is not yet supported".to_string()),
             "S" => {
                 let _ = required_value!(); // seed; only relevant with -r
@@ -647,6 +710,8 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "heuristic" => "h",
         "help" => "H",
         "limit" => "l",
+        "max-queued" => "max-queued",
+        "mem-mb" => "mem-mb",
         "prune" => "p",
         "random-open-conditions" => "r",
         "seed" => "S",
@@ -660,6 +725,16 @@ fn long_to_short(name: &str) -> Result<String, String> {
         other => return Err(format!("unknown option `--{other}`")),
     };
     Ok(short.to_string())
+}
+
+/// A positive integer option value.
+fn parse_count(flag: &str, v: &str) -> Result<usize, String> {
+    match v.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!(
+            "option --{flag} requires a positive integer, got `{v}`"
+        )),
+    }
 }
 
 fn parse_action_cost(v: &str) -> Result<ActionCost, String> {
@@ -705,8 +780,10 @@ fn print_help() {
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
-         \x20 -p, --prune=RULES          opt-in pruning: cutset, params, recursion,\n\
-         \x20                            minimality, all, none (default none)\n\
+         \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
+         \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
+         \x20 -p, --prune=RULES          opt-in pruning: cutset, edelete, disjunctive, params,\n\
+         \x20                            recursion, minimality, symmetry, all, none (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20 -v, --verbose[=N]          live search telemetry (repeat for more frequent updates)\n\
          \x20 -w, --weight=W             heuristic weight (default 1)\n\

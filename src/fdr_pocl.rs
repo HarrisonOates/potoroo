@@ -19,6 +19,7 @@
 //! reported as a threat.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
@@ -26,6 +27,7 @@ use std::time::Instant;
 
 use thiserror::Error;
 
+use crate::chain::{self, Chain};
 use crate::external::FdError;
 use crate::fdr::{Fact, ParseError, Task};
 use crate::heuristics::{HVal, Heuristic, OrderType, SelectionCriterion};
@@ -33,18 +35,19 @@ use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
 use crate::params::{ActionCost, Parameters, SearchAlgorithm};
 use crate::plan::{GOAL_ID, INIT_ID};
+use crate::rank::Rank;
 use crate::search::{SearchContext, SearchProgress};
 
 /// A committed real step. Init and goal are represented by [`INIT_ID`] and
 /// [`GOAL_ID`] and are not stored in this vector.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
     pub id: usize,
     pub operator: usize,
 }
 
 /// A finite-domain causal link `producer --(variable=value)--> consumer`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CausalLink {
     pub producer: usize,
     pub consumer: usize,
@@ -92,60 +95,13 @@ pub struct OrderingDisjunction {
 pub const NO_EFFECT: usize = usize::MAX;
 
 /// An assignment that can occur inside a causal link's protected interval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Threat {
     pub step: usize,
     /// Index of the clobbering effect, or [`NO_EFFECT`] for a precondition-based
     /// e-deletion threat.
     pub effect: usize,
     pub link: usize,
-}
-
-/// Copy-on-write append that allocates once instead of twice.
-///
-/// `Rc::make_mut(&mut v).push(x)` on a shared vector clones it at *exact*
-/// capacity and then reallocates on the push, because the clone leaves
-/// `len == capacity`. Every child plan appends to `steps`, `links` and
-/// `open_conditions`, so that doubling showed up as the largest single source
-/// of allocation traffic in the search. Building the replacement with room for
-/// the new element costs one allocation and one copy.
-#[inline]
-fn push_cow<T: Clone>(slot: &mut Rc<Vec<T>>, value: T) {
-    match Rc::get_mut(slot) {
-        // Uniquely owned (an earlier refinement in this same child already
-        // forced the copy): append in place.
-        Some(vec) => vec.push(value),
-        None => {
-            let current = &**slot;
-            let mut next = Vec::with_capacity(current.len() + 1);
-            next.extend_from_slice(current);
-            next.push(value);
-            *slot = Rc::new(next);
-        }
-    }
-}
-
-/// Copy-on-write `swap_remove` that leaves room for `extra` later appends.
-///
-/// Every refinement removes the open condition it resolved and then pushes the
-/// new step's preconditions. Cloning through `Rc::make_mut` leaves
-/// `len == capacity`, so those pushes reallocate the vector that was just
-/// cloned; sizing the clone for both at once costs a single allocation.
-#[inline]
-fn swap_remove_cow<T: Clone>(slot: &mut Rc<Vec<T>>, index: usize, extra: usize) {
-    match Rc::get_mut(slot) {
-        Some(vec) => {
-            vec.swap_remove(index);
-            vec.reserve(extra);
-        }
-        None => {
-            let current = &**slot;
-            let mut next = Vec::with_capacity(current.len() + extra);
-            next.extend_from_slice(current);
-            next.swap_remove(index);
-            *slot = Rc::new(next);
-        }
-    }
 }
 
 /// Copy-on-write `extend` that allocates once, and not at all when there is
@@ -168,12 +124,18 @@ fn extend_cow<T: Clone>(slot: &mut Rc<Vec<T>>, items: Vec<T>) {
     }
 }
 
-/// One immutable-by-convention finite-domain POCL search node.
+/// A finite-domain POCL search node.
+///
+/// Steps, links, and open conditions share persistent chains with ancestors.
+/// Threats retain discovery order to preserve flaw-selection ties.
 #[derive(Debug, Clone)]
 pub struct PartialPlan {
-    pub steps: Rc<Vec<Step>>,
-    pub links: Rc<Vec<CausalLink>>,
-    pub open_conditions: Rc<Vec<OpenCondition>>,
+    steps: Option<Rc<Chain<Step>>>,
+    num_steps: usize,
+    links: Option<Rc<Chain<CausalLink>>>,
+    num_links: usize,
+    open_conditions: Option<Rc<Chain<OpenCondition>>>,
+    num_open_conditions: usize,
     pub orderings: Rc<BinaryOrderings>,
     threats: Rc<Vec<Threat>>,
     /// Conditional effects `(step, effect)` that a confrontation refinement has
@@ -192,23 +154,19 @@ pub struct PartialPlan {
     edelete: Option<Rc<crate::cutset::FactMutexes>>,
     next_step_id: usize,
     id: usize,
+    /// Set once the search has expanded this plan; see `Plan::expanded`.
+    expanded: Cell<bool>,
 }
 
 impl PartialPlan {
     pub fn initial(task: &Task) -> Self {
-        PartialPlan {
-            steps: Rc::new(Vec::new()),
-            links: Rc::new(Vec::new()),
-            open_conditions: Rc::new(
-                task.goals
-                    .iter()
-                    .copied()
-                    .map(|condition| OpenCondition {
-                        consumer: GOAL_ID,
-                        condition,
-                    })
-                    .collect(),
-            ),
+        let mut plan = PartialPlan {
+            steps: None,
+            num_steps: 0,
+            links: None,
+            num_links: 0,
+            open_conditions: None,
+            num_open_conditions: 0,
             orderings: Rc::new(BinaryOrderings::new()),
             threats: Rc::new(Vec::new()),
             suppressed: Rc::new(Vec::new()),
@@ -217,11 +175,115 @@ impl PartialPlan {
             edelete: None,
             next_step_id: 1,
             id: 0,
+            expanded: Cell::new(false),
+        };
+        for &condition in &task.goals {
+            plan.push_open(OpenCondition {
+                consumer: GOAL_ID,
+                condition,
+            });
         }
+        plan
+    }
+
+    /// A plan assembled from its parts, in insertion order, for tests that
+    /// need a specific shape without refining their way to it.
+    #[cfg(test)]
+    fn assemble(
+        steps: Vec<Step>,
+        links: Vec<CausalLink>,
+        open_conditions: Vec<OpenCondition>,
+        orderings: Rc<BinaryOrderings>,
+        threats: Vec<Threat>,
+        cost: usize,
+        next_step_id: usize,
+    ) -> Self {
+        let mut plan = PartialPlan {
+            steps: None,
+            num_steps: 0,
+            links: None,
+            num_links: 0,
+            open_conditions: None,
+            num_open_conditions: 0,
+            orderings,
+            threats: Rc::new(threats),
+            suppressed: Rc::new(Vec::new()),
+            cost,
+            disjunctions: Rc::new(Vec::new()),
+            edelete: None,
+            next_step_id,
+            id: 0,
+            expanded: Cell::new(false),
+        };
+        for step in steps {
+            plan.push_step(step);
+        }
+        for link in links {
+            plan.push_link(link);
+        }
+        for open in open_conditions {
+            plan.push_open(open);
+        }
+        plan
     }
 
     pub fn complete(&self, _task: &Task) -> bool {
-        self.open_conditions.is_empty() && self.threats.is_empty()
+        self.num_open_conditions == 0 && self.threats.is_empty()
+    }
+
+    /// The committed steps, newest first.
+    pub fn steps(&self) -> chain::Iter<'_, Step> {
+        chain::iter(&self.steps)
+    }
+
+    /// The causal links, newest first. A link's index — the handle a
+    /// [`Threat`] carries — counts from the oldest, so the newest link has
+    /// index `num_links() - 1`.
+    pub fn links(&self) -> chain::Iter<'_, CausalLink> {
+        chain::iter(&self.links)
+    }
+
+    /// The open conditions, newest first.
+    pub fn open_conditions(&self) -> chain::Iter<'_, OpenCondition> {
+        chain::iter(&self.open_conditions)
+    }
+
+    pub fn num_links(&self) -> usize {
+        self.num_links
+    }
+
+    /// The link with the given index, which is `num_links - 1 - index` hops
+    /// from the newest. Threats mostly concern recent links, so the walk is
+    /// short where it is frequent.
+    pub fn link(&self, index: usize) -> Option<&CausalLink> {
+        let hops = self.num_links.checked_sub(index + 1)?;
+        self.links().nth(hops)
+    }
+
+    /// The link a threat stands against. Threats are only ever created from
+    /// links of the same plan, and links are never removed.
+    pub fn threatened_link(&self, threat: &Threat) -> &CausalLink {
+        self.link(threat.link)
+            .expect("a threat refers to a link of its own plan")
+    }
+
+    fn push_step(&mut self, step: Step) {
+        self.steps = chain::cons(step, self.steps.take());
+        self.num_steps += 1;
+    }
+
+    fn push_link(&mut self, link: CausalLink) {
+        self.links = chain::cons(link, self.links.take());
+        self.num_links += 1;
+    }
+
+    /// Discharges an open condition. Removal rebuilds the chain down to the
+    /// element, so it is cheapest for the newest conditions — which is where
+    /// the LIFO orders look first.
+    fn remove_open(&mut self, open: &OpenCondition) {
+        debug_assert!(chain::contains(&self.open_conditions, open));
+        self.open_conditions = chain::remove(&self.open_conditions, open);
+        self.num_open_conditions -= 1;
     }
 
     /// Cached threats, cloned for compatibility with callers that previously
@@ -233,8 +295,10 @@ impl PartialPlan {
     #[cfg(test)]
     fn rediscover_threats(&self, task: &Task) -> Vec<Threat> {
         let mut threats = Vec::new();
-        for (link_index, link) in self.links.iter().enumerate() {
-            for step in self.steps.iter() {
+        let links: Vec<&CausalLink> = self.links().collect();
+        let steps: Vec<&Step> = self.steps().collect();
+        for (link_index, link) in links.iter().rev().enumerate() {
+            for &step in steps.iter().rev() {
                 if step.id == link.producer
                     || step.id == link.consumer
                     || !self.can_be_inside(step.id, link)
@@ -272,12 +336,11 @@ impl PartialPlan {
         threats
     }
 
-    /// The committed step with the given id. Steps are only ever appended, so
-    /// `id` doubles as a 1-based index into [`PartialPlan::steps`].
+    /// The committed step with the given id. Steps are only ever appended and
+    /// ids are dense, so the step sits `num_steps - id` hops from the newest.
     fn step(&self, id: usize) -> Option<&Step> {
-        id.checked_sub(1)
-            .and_then(|index| self.steps.get(index))
-            .filter(|step| step.id == id)
+        let hops = self.num_steps.checked_sub(id)?;
+        self.steps().nth(hops).filter(|step| step.id == id)
     }
 
     /// Whether `step` is already committed to a value of `fact`'s variable
@@ -287,12 +350,10 @@ impl PartialPlan {
     fn step_excludes(&self, step: usize, fact: Fact) -> bool {
         let conflicts =
             |condition: Fact| condition.variable == fact.variable && condition.value != fact.value;
-        self.open_conditions
-            .iter()
+        self.open_conditions()
             .any(|open| open.consumer == step && conflicts(open.condition))
             || self
-                .links
-                .iter()
+                .links()
                 .any(|link| link.consumer == step && conflicts(link.condition))
     }
 
@@ -449,13 +510,14 @@ impl PartialPlan {
     }
 
     fn push_open(&mut self, open: OpenCondition) {
-        if !self.open_conditions.contains(&open) {
-            push_cow(&mut self.open_conditions, open);
+        if !chain::contains(&self.open_conditions, &open) {
+            self.open_conditions = chain::cons(open, self.open_conditions.take());
+            self.num_open_conditions += 1;
         }
     }
 
     fn threat_active(&self, task: &Task, threat: &Threat) -> bool {
-        let Some(link) = self.links.get(threat.link) else {
+        let Some(link) = self.link(threat.link) else {
             return false;
         };
         if threat.step == link.producer || threat.step == link.consumer {
@@ -519,10 +581,15 @@ impl PartialPlan {
     }
 
     fn add_link_threats(&mut self, task: &Task, link_index: usize) {
-        debug_assert_eq!(link_index + 1, self.links.len());
-        let link = &self.links[link_index];
+        debug_assert_eq!(link_index + 1, self.num_links);
+        let link = *self.threatened_link(&Threat {
+            step: 0,
+            effect: 0,
+            link: link_index,
+        });
+        let link = &link;
         let mut additions = Vec::new();
-        for step in self.steps.iter() {
+        for step in self.steps() {
             if step.id == link.producer
                 || step.id == link.consumer
                 || !self.can_be_inside(step.id, link)
@@ -550,6 +617,9 @@ impl PartialPlan {
                 }
             }
         }
+        // Steps were visited newest first; the cache is kept in discovery
+        // order, which is ascending `(link, step, effect)`.
+        additions.sort_by_key(threat_key);
         debug_assert!(self
             .threats
             .last()
@@ -559,9 +629,12 @@ impl PartialPlan {
     }
 
     fn add_step_threats(&mut self, task: &Task, step_id: usize) {
-        let step = &self.steps[step_id - 1];
+        let step = *self.step(step_id).expect("the step was just added");
+        let step = &step;
         let mut additions = Vec::new();
-        for (link_index, link) in self.links.iter().enumerate() {
+        let num_links = self.num_links;
+        for (position, link) in self.links().enumerate() {
+            let link_index = num_links - 1 - position;
             if step.id == link.producer
                 || step.id == link.consumer
                 || !self.can_be_inside(step.id, link)
@@ -597,6 +670,7 @@ impl PartialPlan {
         // newly added step can threaten old links, so merge those entries into
         // the cached order instead of simply appending them. Flaw-selection
         // tie-breaking therefore remains identical to full rediscovery.
+        additions.sort_by_key(threat_key);
         let existing = &self.threats;
         let mut merged = Vec::with_capacity(existing.len() + additions.len());
         let mut existing_index = 0;
@@ -604,7 +678,7 @@ impl PartialPlan {
             while existing_index < existing.len()
                 && threat_key(&existing[existing_index]) < threat_key(&addition)
             {
-                merged.push(existing[existing_index].clone());
+                merged.push(existing[existing_index]);
                 existing_index += 1;
             }
             merged.push(addition);
@@ -613,16 +687,16 @@ impl PartialPlan {
         self.threats = Rc::new(merged);
     }
 
-    fn num_steps(&self) -> usize {
-        self.steps.len()
+    pub fn num_steps(&self) -> usize {
+        self.num_steps
     }
 
     pub fn cost(&self) -> usize {
         self.cost
     }
 
-    fn num_open_conditions(&self) -> usize {
-        self.open_conditions.len()
+    pub fn num_open_conditions(&self) -> usize {
+        self.num_open_conditions
     }
 }
 
@@ -659,6 +733,8 @@ pub struct SearchStats {
     /// resolution is being deferred rather than branched on.
     pub max_disjunctions: usize,
     pub max_queued: usize,
+    /// Queued plans discarded by an open-list bound; see [`crate::memory`].
+    pub dropped: usize,
     h_eval_nanos: u128,
 }
 
@@ -697,7 +773,7 @@ pub fn solve_with_params(
     task: &Task,
     params: &Parameters,
 ) -> Result<(Outcome, SearchStats), Error> {
-    solve_impl(task, params, None)
+    solve_with_context(task, params, None, None)
 }
 
 /// Like [`solve_with_params`], while also reporting a representation-neutral
@@ -707,17 +783,26 @@ pub fn solve_with_params_and_progress(
     params: &Parameters,
     progress: &mut dyn FnMut(SearchProgress),
 ) -> Result<(Outcome, SearchStats), Error> {
-    solve_impl(task, params, Some(progress))
+    solve_with_context(task, params, None, Some(progress))
 }
 
-fn solve_impl(
+/// The general entry point: `symmetries` are the task's interchangeable
+/// objects, consulted only under `-p symmetry`. The SAS+ task carries only
+/// operator names, so the caller computes them from the lowered PDDL
+/// (`SearchContext::object_symmetries`).
+pub fn solve_with_context(
     task: &Task,
     params: &Parameters,
+    symmetries: Option<&crate::symmetry::ObjectSymmetries>,
     progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> Result<(Outcome, SearchStats), Error> {
-    let planner = Planner::with_action_cost(task, params.action_cost).with_pruning(params.prune);
+    let planner = Planner::with_action_cost(task, params.action_cost)
+        .with_pruning(params.prune)
+        .with_symmetries(params.prune.symmetry.then_some(symmetries).flatten());
     planner.validate_params(params)?;
-    Ok(planner.solve(params, progress))
+    let (outcome, mut stats) = planner.solve(params, progress);
+    stats.pruned += planner.symmetry_skipped.get();
+    Ok((outcome, stats))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -744,8 +829,18 @@ struct Planner<'a> {
     /// The task's operator graph over facts, for the recursion rule. Built only
     /// when `-p recursion` asks for it.
     fact_graph: Option<crate::fdr_pruning::FactGraph>,
+    /// The compiled relaxation behind `CLADD`/`CLFF`; see [`crate::cl_relax`].
+    compiled: crate::cl_relax::CompiledRelaxation,
+    /// The task's fact landmarks, for `LM`; see
+    /// [`crate::cl_relax::CompiledRelaxation::fact_landmarks`].
+    landmarks: Vec<Fact>,
     /// Whether non-minimality pruning is on.
     minimality: bool,
+    /// Interchangeable objects laid out over the operators, when `-p symmetry`
+    /// is on and the task has any. See [`crate::symmetry`].
+    symmetry: Option<crate::symmetry::SymmetryTable>,
+    /// Achievers skipped as non-canonical, folded into `pruned` at the end.
+    symmetry_skipped: Cell<usize>,
 }
 
 impl<'a> Planner<'a> {
@@ -812,12 +907,17 @@ impl<'a> Planner<'a> {
                     });
             }
         }
+        let compiled =
+            crate::cl_relax::CompiledRelaxation::new(task, &effect_requirements, action_cost);
+        let landmarks = compiled.fact_landmarks();
         Planner {
             task,
             achievers,
             variable_has_effect,
             operator_preconditions,
             effect_requirements,
+            compiled,
+            landmarks,
             derived_supports,
             base_relaxed,
             lmcut,
@@ -826,7 +926,26 @@ impl<'a> Planner<'a> {
             disjunctive: false,
             fact_graph: None,
             minimality: false,
+            symmetry: None,
+            symmetry_skipped: Cell::new(0),
         }
+    }
+
+    /// Installs the interchangeable-object classes, indexed by the objects
+    /// each operator's name lists: the translator writes an operator as its
+    /// schema name followed by its arguments.
+    fn with_symmetries(mut self, symmetries: Option<&crate::symmetry::ObjectSymmetries>) -> Self {
+        if let Some(symmetries) = symmetries.filter(|s| !s.is_empty()) {
+            let table = crate::symmetry::SymmetryTable::from_names(
+                symmetries,
+                self.task
+                    .operators
+                    .iter()
+                    .map(|operator| operator.name.split_whitespace().skip(1)),
+            );
+            self.symmetry = Some(table);
+        }
+        self
     }
 
     fn validate_params(&self, params: &Parameters) -> Result<(), Error> {
@@ -864,19 +983,18 @@ impl<'a> Planner<'a> {
                 | HVal::AddrCost
                 | HVal::AddrWork
                 | HVal::Relax
-                | HVal::RelaxR => {}
+                | HVal::RelaxR
+                | HVal::ClAdd
+                | HVal::ClFf
+                | HVal::Landmarks { .. } => {}
                 HVal::LmCut | HVal::LmCutR => {
                     if let Err(error) = &self.lmcut {
                         return Err(Error::Unsupported(error.to_string()));
                     }
                 }
-                HVal::Landmarks { .. }
-                | HVal::SampleFf(_)
-                | HVal::Lplan(_)
-                | HVal::Lpsas(_)
-                | HVal::Compile(_) => {
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_) => {
                     return Err(Error::Unsupported(
-                        "LM, SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
+                        "SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
                             .to_string(),
                     ));
                 }
@@ -968,9 +1086,9 @@ impl<'a> Planner<'a> {
         } else {
             Vec::new()
         };
-        let mut expanded_ids = HashSet::new();
         let mut generated_per_order = vec![0usize; n_orders];
         let mut stats = SearchStats::default();
+        let mut bound = crate::memory::OpenListBound::new(params);
         let mut current_order = 0usize;
         let mut orders_left = n_orders;
         let mut next_switch = 1_000usize;
@@ -1016,7 +1134,6 @@ impl<'a> Planner<'a> {
                         } else {
                             None
                         },
-                        &expanded_ids,
                         params,
                         is_lazy,
                         is_gbfs,
@@ -1030,13 +1147,13 @@ impl<'a> Planner<'a> {
                 }
 
                 stats.nodes_visited += 1;
-                stats.max_steps = stats.max_steps.max(plan.steps.len());
+                stats.max_steps = stats.max_steps.max(plan.num_steps());
                 stats.max_open_conditions =
-                    stats.max_open_conditions.max(plan.open_conditions.len());
+                    stats.max_open_conditions.max(plan.num_open_conditions());
                 stats.max_threats = stats.max_threats.max(plan.threats.len());
                 stats.max_disjunctions = stats.max_disjunctions.max(plan.pending_disjunctions());
                 if is_dual || is_alt {
-                    expanded_ids.insert(plan.id);
+                    plan.expanded.set(true);
                 }
                 if is_dual {
                     if current_rank0 < best_h {
@@ -1060,6 +1177,9 @@ impl<'a> Planner<'a> {
                         continue;
                     }
                     child.id = stats.nodes_generated;
+                    // A child is a clone of its parent, which is being
+                    // expanded right now.
+                    child.expanded = Cell::new(false);
                     let child = Rc::new(child);
                     let mut alt_gbfs_rank = None;
                     let (rank, lazy_push) = if is_bfs {
@@ -1100,7 +1220,7 @@ impl<'a> Planner<'a> {
                         if is_dual {
                             secondary_queues[order_index].push(QueuedPlan {
                                 plan: child.clone(),
-                                rank: vec![child.id as f32],
+                                rank: Rank::from_slice(&[child.id as f32]),
                                 is_lazy: lazy_push,
                             });
                         } else if is_alt {
@@ -1108,13 +1228,14 @@ impl<'a> Planner<'a> {
                                 plan: child.clone(),
                                 rank: alt_gbfs_rank
                                     .take()
-                                    .expect("ALT child has both rank vectors"),
+                                    .expect("ALT child has both rank vectors")
+                                    .into(),
                                 is_lazy: false,
                             });
                         }
                         queues[order_index].push(QueuedPlan {
                             plan: child,
-                            rank,
+                            rank: rank.into(),
                             is_lazy: lazy_push,
                         });
                         generated_per_order[order_index] += 1;
@@ -1124,6 +1245,12 @@ impl<'a> Planner<'a> {
 
                 let queued = queues.iter().map(BinaryHeap::len).sum();
                 stats.max_queued = stats.max_queued.max(queued);
+                if let Some(bound) = bound.as_mut() {
+                    if let Some(keep) = bound.trim_target(stats.nodes_generated, queued) {
+                        stats.dropped += crate::memory::trim_all(&mut queues, keep);
+                        crate::memory::trim_all(&mut secondary_queues, keep);
+                    }
+                }
                 if let Some(report) = progress.as_deref_mut() {
                     report(SearchProgress {
                         elapsed: search_started.elapsed(),
@@ -1133,8 +1260,10 @@ impl<'a> Planner<'a> {
                         h_evals: stats.h_evals,
                         h_eval_ms: stats.h_eval_ms,
                         pruned: stats.pruned,
-                        current_steps: plan.steps.len(),
-                        current_open_conditions: plan.open_conditions.len(),
+                        dropped: stats.dropped,
+                        resident_kb: crate::memory::resident_set_kb(),
+                        current_steps: plan.num_steps(),
+                        current_open_conditions: plan.num_open_conditions(),
                         current_threats: plan.threats.len(),
                         flaw_order: current_order,
                     });
@@ -1183,7 +1312,6 @@ impl<'a> Planner<'a> {
                         } else {
                             None
                         },
-                        &expanded_ids,
                         params,
                         is_lazy,
                         is_gbfs,
@@ -1208,21 +1336,21 @@ impl<'a> Planner<'a> {
             }
         }
 
-        if limit_reached {
+        // Queues emptied by an open-list bound say nothing about solvability.
+        if limit_reached || stats.dropped > 0 {
             (Outcome::LimitReached, stats)
         } else {
             (Outcome::NoSolution, stats)
         }
     }
 
-    fn resolve_open(&self, plan: &PartialPlan, open_index: usize) -> Vec<PartialPlan> {
-        let open = plan.open_conditions[open_index].clone();
+    fn resolve_open(&self, plan: &PartialPlan, open: OpenCondition) -> Vec<PartialPlan> {
         if let Some(supports) = self.derived_supports.get(&open.condition) {
             return supports
                 .iter()
                 .map(|support| {
                     let mut child = plan.clone();
-                    swap_remove_cow(&mut child.open_conditions, open_index, support.len());
+                    child.remove_open(&open);
                     for &condition in support {
                         child.push_open(OpenCondition {
                             consumer: open.consumer,
@@ -1240,8 +1368,25 @@ impl<'a> Planner<'a> {
             // its final GBFS tiebreaker, so this ordering makes reuse win equal
             // heuristic ranks instead of repeatedly inserting the same ground
             // operator.
+            //
+            // Under `-p symmetry`, a new step may introduce an interchangeable
+            // object only if it is the first of its class the plan has not
+            // used; the objects a plan uses are exactly its steps' arguments.
+            let used = self.symmetry.as_ref().map(|table| {
+                let mut used = vec![false; table.len()];
+                for step in plan.steps() {
+                    table.mark_used(step.operator, &mut used);
+                }
+                used
+            });
             for achiever in achievers {
-                if let Some(child) = self.add_step(plan, open_index, &open, achiever) {
+                if let (Some(table), Some(used)) = (&self.symmetry, &used) {
+                    if !table.canonical(achiever.operator, used) {
+                        self.symmetry_skipped.set(self.symmetry_skipped.get() + 1);
+                        continue;
+                    }
+                }
+                if let Some(child) = self.add_step(plan, &open, achiever) {
                     children.push(child);
                 }
             }
@@ -1249,7 +1394,7 @@ impl<'a> Planner<'a> {
             // The regular plan representation stores steps newest-first and
             // emits reuse in that order. Reverse the insertion-ordered vector
             // to preserve the same deterministic preference.
-            for step in plan.steps.iter().rev() {
+            for step in plan.steps() {
                 if !plan.orderings.possibly_before(
                     step.id,
                     StepTime::AtEnd,
@@ -1265,7 +1410,7 @@ impl<'a> Planner<'a> {
                     let effect = &self.task.operators[achiever.operator].effects[achiever.effect];
                     if let Some(child) = self.support(
                         plan,
-                        open_index,
+                        &open,
                         step.id,
                         Some(achiever.effect),
                         &effect.conditions,
@@ -1280,7 +1425,7 @@ impl<'a> Planner<'a> {
         // The initial state is the oldest reusable producer and is emitted
         // last, making it the preferred equal-rank child.
         if self.task.initial[open.condition.variable] == open.condition.value {
-            if let Some(child) = self.support(plan, open_index, INIT_ID, None, &[], open.consumer) {
+            if let Some(child) = self.support(plan, &open, INIT_ID, None, &[], open.consumer) {
                 children.push(child);
             }
         }
@@ -1290,13 +1435,13 @@ impl<'a> Planner<'a> {
     fn support(
         &self,
         plan: &PartialPlan,
-        open_index: usize,
+        open: &OpenCondition,
         producer: usize,
         effect: Option<usize>,
         effect_conditions: &[Fact],
         consumer: usize,
     ) -> Option<PartialPlan> {
-        let condition = plan.open_conditions[open_index].condition;
+        let condition = open.condition;
         let orderings = plan.orderings.refine(Ordering::new(
             producer,
             StepTime::AtEnd,
@@ -1305,21 +1450,14 @@ impl<'a> Planner<'a> {
         ))?;
         let mut child = plan.clone();
         child.orderings = orderings;
-        swap_remove_cow(
-            &mut child.open_conditions,
-            open_index,
-            effect_conditions.len(),
-        );
-        let link_index = child.links.len();
-        push_cow(
-            &mut child.links,
-            CausalLink {
-                producer,
-                consumer,
-                condition,
-                effect,
-            },
-        );
+        child.remove_open(open);
+        let link_index = child.num_links;
+        child.push_link(CausalLink {
+            producer,
+            consumer,
+            condition,
+            effect,
+        });
         for &effect_condition in effect_conditions {
             child.push_open(OpenCondition {
                 consumer: producer,
@@ -1336,7 +1474,6 @@ impl<'a> Planner<'a> {
     fn add_step(
         &self,
         plan: &PartialPlan,
-        open_index: usize,
         open: &OpenCondition,
         achiever: &Achiever,
     ) -> Option<PartialPlan> {
@@ -1354,28 +1491,18 @@ impl<'a> Planner<'a> {
         child.cost = child
             .cost
             .saturating_add(self.action_cost.resolve(operator.cost));
-        push_cow(
-            &mut child.steps,
-            Step {
-                id: new_id,
-                operator: achiever.operator,
-            },
-        );
-        swap_remove_cow(
-            &mut child.open_conditions,
-            open_index,
-            self.operator_preconditions[achiever.operator].len() + effect.conditions.len(),
-        );
-        let link_index = child.links.len();
-        push_cow(
-            &mut child.links,
-            CausalLink {
-                producer: new_id,
-                consumer: open.consumer,
-                condition: open.condition,
-                effect: Some(achiever.effect),
-            },
-        );
+        child.push_step(Step {
+            id: new_id,
+            operator: achiever.operator,
+        });
+        child.remove_open(open);
+        let link_index = child.num_links;
+        child.push_link(CausalLink {
+            producer: new_id,
+            consumer: open.consumer,
+            condition: open.condition,
+            effect: Some(achiever.effect),
+        });
         for &condition in &self.operator_preconditions[achiever.operator] {
             child.push_open(OpenCondition {
                 consumer: new_id,
@@ -1429,7 +1556,7 @@ impl<'a> Planner<'a> {
     }
 
     fn resolve_threat(&self, plan: &PartialPlan, threat: &Threat) -> Vec<PartialPlan> {
-        let link = &plan.links[threat.link];
+        let link = plan.threatened_link(threat);
         let mut children = Vec::new();
 
         // Confrontation: UCPOP's resolver for conditional effects, which VHPOP
@@ -1444,8 +1571,7 @@ impl<'a> Planner<'a> {
             // An established link already commits the step to the alternative
             // value, so only an unsupported one needs a new open condition.
             let linked = plan
-                .links
-                .iter()
+                .links()
                 .any(|link| link.consumer == threat.step && link.condition == alternative);
             if !linked {
                 child.push_open(OpenCondition {
@@ -1514,7 +1640,7 @@ impl<'a> Planner<'a> {
     /// straight into an ordering rather than stored. `None` means neither
     /// disjunct is possible and the threat cannot be resolved this way.
     fn post_disjunction(&self, plan: &PartialPlan, threat: &Threat) -> Option<PartialPlan> {
-        let link = &plan.links[threat.link];
+        let link = plan.threatened_link(threat);
         // The goal follows everything and the initial state precedes it, so
         // those two cases rule the corresponding disjunct out up front.
         let promote = (link.consumer != GOAL_ID).then_some((link.consumer, threat.step));
@@ -1575,7 +1701,7 @@ impl<'a> Planner<'a> {
     ) -> Vec<PartialPlan> {
         let refinements = match self.select_flaw(plan, order) {
             SelectedFlaw::Threat(threat) => self.resolve_threat(plan, &threat),
-            SelectedFlaw::Open(index) => self.resolve_open(plan, index),
+            SelectedFlaw::Open(open) => self.resolve_open(plan, open),
             SelectedFlaw::Disjunction(index) => self.split_disjunction(plan, index),
         };
 
@@ -1597,7 +1723,10 @@ impl<'a> Planner<'a> {
         order: &crate::heuristics::FlawSelectionOrder,
     ) -> SelectedFlaw {
         let threats = &plan.threats;
-        let local_consumer = plan.open_conditions.last().map(|open| open.consumer);
+        // The chain is newest first, so the newest open condition is its head;
+        // recency counts up from the oldest, as it does for threats.
+        let local_consumer = plan.open_conditions().next().map(|open| open.consumer);
+        let num_open = plan.num_open_conditions();
 
         for criterion in order.criteria() {
             let mut candidates = Vec::new();
@@ -1626,7 +1755,7 @@ impl<'a> Planner<'a> {
                     let refinements = self.threat_refinement_count(plan, threat, confrontations);
                     if refinements <= criterion.max_refinements {
                         candidates.push(FlawCandidate {
-                            flaw: SelectedFlaw::Threat(threat.clone()),
+                            flaw: SelectedFlaw::Threat(*threat),
                             is_threat: true,
                             refinements,
                             recency: index,
@@ -1637,7 +1766,8 @@ impl<'a> Planner<'a> {
                     }
                 }
             }
-            for (index, open) in plan.open_conditions.iter().enumerate() {
+            for (position, open) in plan.open_conditions().enumerate() {
+                let index = num_open - 1 - position;
                 if !self.open_matches(criterion, plan, open, local_consumer) {
                     continue;
                 }
@@ -1659,7 +1789,7 @@ impl<'a> Planner<'a> {
                     0.0
                 };
                 candidates.push(FlawCandidate {
-                    flaw: SelectedFlaw::Open(index),
+                    flaw: SelectedFlaw::Open(open.clone()),
                     is_threat: false,
                     refinements,
                     recency: index,
@@ -1696,7 +1826,7 @@ impl<'a> Planner<'a> {
     }
 
     fn unsafe_open_condition(&self, plan: &PartialPlan, open: &OpenCondition) -> bool {
-        plan.steps.iter().any(|step| {
+        plan.steps().any(|step| {
             plan.orderings.possibly_before(
                 step.id,
                 StepTime::AtEnd,
@@ -1719,7 +1849,7 @@ impl<'a> Planner<'a> {
         threat: &Threat,
         confrontations: usize,
     ) -> i32 {
-        let link = &plan.links[threat.link];
+        let link = plan.threatened_link(threat);
         let demote = link.producer != INIT_ID
             && plan.orderings.possibly_before(
                 threat.step,
@@ -1747,7 +1877,7 @@ impl<'a> Planner<'a> {
             i32::from(self.task.initial[open.condition.variable] == open.condition.value);
         if let Some(achievers) = self.achievers.get(&open.condition) {
             count = count.saturating_add(achievers.len() as i32);
-            for step in plan.steps.iter() {
+            for step in plan.steps() {
                 if plan.orderings.possibly_before(
                     step.id,
                     StepTime::AtEnd,
@@ -1776,7 +1906,7 @@ impl<'a> Planner<'a> {
         self.achievers
             .get(&open.condition)
             .is_some_and(|achievers| {
-                plan.steps.iter().any(|step| {
+                plan.steps().any(|step| {
                     plan.orderings.possibly_before(
                         step.id,
                         StepTime::AtEnd,
@@ -1820,6 +1950,8 @@ impl<'a> Planner<'a> {
         let mut relaxr = None;
         let mut lmcut = None;
         let mut lmcutr = None;
+        let mut compiled = None;
+        let mut landmarks = None;
 
         for term in params.heuristic.terms() {
             match term {
@@ -1884,11 +2016,27 @@ impl<'a> Planner<'a> {
                     rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
-                HVal::Landmarks { .. }
-                | HVal::SampleFf(_)
-                | HVal::Lplan(_)
-                | HVal::Lpsas(_)
-                | HVal::Compile(_) => {
+                HVal::ClAdd | HVal::ClFf => {
+                    let estimate = *compiled.get_or_insert_with(|| self.compiled_estimate(plan));
+                    let value = estimate.map(|e| match term {
+                        HVal::ClFf => e.ff,
+                        _ => e.add,
+                    });
+                    let h = value.map_or(f32::INFINITY, |v| params.weight * v);
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Landmarks { .. } => {
+                    // The ground reading of the lifted count: a landmark is
+                    // achieved when some step's effect produces it, or it
+                    // holds initially. The FAM-cut and ordering variants
+                    // coincide with the plain count here.
+                    let count = *landmarks.get_or_insert_with(|| self.landmark_count(plan));
+                    let h = params.weight * count as f32;
+                    rank.push(g + h);
+                    grank.push(h);
+                }
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_) => {
                     unreachable!("unsupported FDR heuristic was rejected before search")
                 }
             }
@@ -1898,10 +2046,77 @@ impl<'a> Planner<'a> {
         (rank, grank)
     }
 
+    /// The compiled relaxation's estimate for this plan; see [`crate::cl_relax`].
+    /// Each committed step becomes a zero-cost action needing its
+    /// preconditions and, for every causal link into it, the link's producer
+    /// to have run. The producers are the orderings the plan's causal
+    /// structure imposes; reading the immediate predecessors off the ordering
+    /// closure instead is quadratic in the plan, and a greedy queue that dives
+    /// into a four-hundred-step plan spent every millisecond there.
+    fn compiled_estimate(&self, plan: &PartialPlan) -> Option<crate::cl_relax::Estimate> {
+        use crate::cl_relax::CompiledStep;
+        let mut compiled = vec![CompiledStep::default(); plan.num_steps()];
+        for link in plan.links() {
+            if link.producer != INIT_ID && link.consumer != GOAL_ID {
+                let predecessors = &mut compiled[link.consumer - 1].predecessors;
+                if !predecessors.contains(&(link.producer - 1)) {
+                    predecessors.push(link.producer - 1);
+                }
+            }
+        }
+        for step in plan.steps() {
+            let operator = &self.task.operators[step.operator];
+            let entry = &mut compiled[step.id - 1];
+            entry.preconditions = self.operator_preconditions[step.operator]
+                .iter()
+                .map(|&fact| self.compiled.encode(fact))
+                .collect();
+            for (effect_index, effect) in operator.effects.iter().enumerate() {
+                if plan.effect_cannot_fire(self.task, step, effect_index) {
+                    continue;
+                }
+                let assignment = self.compiled.encode(effect.assignment());
+                if effect.conditions.is_empty() {
+                    entry.effects.push(assignment);
+                } else {
+                    let conditions = effect
+                        .conditions
+                        .iter()
+                        .map(|&fact| self.compiled.encode(fact))
+                        .collect();
+                    entry.conditional_effects.push((conditions, assignment));
+                }
+            }
+        }
+        self.compiled.evaluate(&compiled)
+    }
+
+    /// How many of the task's fact landmarks no step of the plan produces and
+    /// the initial state does not hold; see `HVal::Landmarks`.
+    fn landmark_count(&self, plan: &PartialPlan) -> usize {
+        let produced: HashSet<Fact> = plan
+            .steps()
+            .flat_map(|step| {
+                self.task.operators[step.operator]
+                    .effects
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, _)| !plan.effect_cannot_fire(self.task, step, index))
+                    .map(|(_, effect)| effect.assignment())
+            })
+            .collect();
+        self.landmarks
+            .iter()
+            .filter(|landmark| {
+                self.task.initial[landmark.variable] != landmark.value
+                    && !produced.contains(landmark)
+            })
+            .count()
+    }
+
     fn lmcut_estimate(&self, plan: &PartialPlan, reuse: bool) -> Option<f32> {
         let reusable = if reuse {
-            plan.steps
-                .iter()
+            plan.steps()
                 .flat_map(|step| {
                     self.task.operators[step.operator]
                         .effects
@@ -1915,8 +2130,7 @@ impl<'a> Planner<'a> {
             Vec::new()
         };
         let goals = plan
-            .open_conditions
-            .iter()
+            .open_conditions()
             .map(|open| open.condition)
             .collect::<Vec<_>>();
         self.lmcut
@@ -1929,7 +2143,7 @@ impl<'a> Planner<'a> {
     fn open_estimate(&self, plan: &PartialPlan, reuse: bool) -> AddEstimate {
         let values = self.relaxed_values(plan, reuse);
         let mut estimate = AddEstimate::default();
-        for open in plan.open_conditions.iter() {
+        for open in plan.open_conditions() {
             let cost = values.cost[open.condition.variable][open.condition.value];
             let work = values.work[open.condition.variable][open.condition.value];
             estimate.cost += cost;
@@ -1945,7 +2159,7 @@ impl<'a> Planner<'a> {
 
         let mut values = self.base_relaxed.clone();
         let mut changed = false;
-        for step in plan.steps.iter() {
+        for step in plan.steps() {
             for (index, effect) in self.task.operators[step.operator]
                 .effects
                 .iter()
@@ -1981,8 +2195,7 @@ impl<'a> Planner<'a> {
     /// effects is counted once, exposing shared moves and other shared support.
     fn relaxed_plan_size(&self, plan: &PartialPlan, reuse: bool) -> Option<f32> {
         let reusable = if reuse {
-            plan.steps
-                .iter()
+            plan.steps()
                 .flat_map(|step| {
                     self.task.operators[step.operator]
                         .effects
@@ -1998,8 +2211,7 @@ impl<'a> Planner<'a> {
         let mut chosen_operators = HashSet::new();
         let mut achieved = HashSet::new();
         let mut worklist = plan
-            .open_conditions
-            .iter()
+            .open_conditions()
             .map(|open| open.condition)
             .collect::<Vec<_>>();
 
@@ -2057,7 +2269,6 @@ impl<'a> Planner<'a> {
         &self,
         primary: &mut BinaryHeap<QueuedPlan>,
         mut secondary: Option<&mut BinaryHeap<QueuedPlan>>,
-        expanded_ids: &HashSet<usize>,
         params: &Parameters,
         is_lazy: bool,
         is_gbfs: bool,
@@ -2092,7 +2303,7 @@ impl<'a> Planner<'a> {
             let Some(queued) = queued else {
                 return (None, 0.0);
             };
-            if (is_dual || is_alt) && expanded_ids.contains(&queued.plan.id) {
+            if (is_dual || is_alt) && queued.plan.expanded.get() {
                 continue;
             }
             if !is_lazy || !queued.is_lazy {
@@ -2106,7 +2317,7 @@ impl<'a> Planner<'a> {
             if rank[0].is_finite() {
                 primary.push(QueuedPlan {
                     plan: queued.plan,
-                    rank,
+                    rank: rank.into(),
                     is_lazy: false,
                 });
             }
@@ -2197,7 +2408,7 @@ fn linearize_and_validate(plan: &PartialPlan, task: &Task) -> Option<Vec<usize>>
     // recursive and is ideal for relatively shallow plans, but ground search
     // can generate very deep plans
     // before its node limit and must not overflow the process stack.
-    let mut remaining = (*plan.steps).clone();
+    let mut remaining: Vec<Step> = plan.steps().cloned().collect();
     remaining.sort_by_key(|step| step.id);
     let mut steps = Vec::with_capacity(remaining.len());
     while !remaining.is_empty() {
@@ -2262,7 +2473,7 @@ fn is_ordered_before(orderings: &BinaryOrderings, before: usize, after: usize) -
 #[derive(Debug, Clone)]
 enum SelectedFlaw {
     Threat(Threat),
-    Open(usize),
+    Open(OpenCondition),
     /// A pending ordering disjunction, split into one child per disjunct.
     Disjunction(usize),
 }
@@ -2484,7 +2695,7 @@ fn push_add_rank(
 
 struct QueuedPlan {
     plan: Rc<PartialPlan>,
-    rank: Vec<f32>,
+    rank: Rank,
     is_lazy: bool,
 }
 
@@ -2504,18 +2715,7 @@ impl PartialOrd for QueuedPlan {
 
 impl Ord for QueuedPlan {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        let n = self.rank.len().max(other.rank.len());
-        for index in 0..n {
-            let left = self.rank.get(index).copied().unwrap_or(0.0);
-            let right = other.rank.get(index).copied().unwrap_or(0.0);
-            if left < right {
-                return CmpOrdering::Greater;
-            }
-            if left > right {
-                return CmpOrdering::Less;
-            }
-        }
-        CmpOrdering::Equal
+        self.rank.better_first(&other.rank)
     }
 }
 
@@ -2715,27 +2915,20 @@ mod tests {
             effect: 1,
             link: 0,
         };
-        let plan = PartialPlan {
-            steps: Rc::new(vec![
-                Step { id: 1, operator: 0 },
-                Step { id: 2, operator: 1 },
-            ]),
-            links: Rc::new(vec![CausalLink {
+        let plan = PartialPlan::assemble(
+            vec![Step { id: 1, operator: 0 }, Step { id: 2, operator: 1 }],
+            vec![CausalLink {
                 producer: 1,
                 consumer: GOAL_ID,
                 condition: Fact::new(0, 1),
                 effect: Some(0),
-            }]),
-            open_conditions: Rc::new(vec![]),
+            }],
+            vec![],
             orderings,
-            threats: Rc::new(vec![threat.clone()]),
-            suppressed: Rc::new(vec![]),
-            disjunctions: Rc::new(Vec::new()),
-            edelete: None,
-            cost: 2,
-            next_step_id: 3,
-            id: 0,
-        };
+            vec![threat],
+            2,
+            3,
+        );
         (plan, threat)
     }
 
@@ -2855,7 +3048,7 @@ mod tests {
         let task = travel_task();
         let planner = Planner::new(&task);
         let mut plan = PartialPlan::initial(&task);
-        plan.steps = Rc::new(vec![Step { id: 1, operator: 0 }]);
+        plan.push_step(Step { id: 1, operator: 0 });
 
         assert_eq!(planner.lmcut_estimate(&plan, false), Some(2.0));
         assert_eq!(planner.lmcut_estimate(&plan, true), Some(1.0));
@@ -2961,31 +3154,24 @@ mod tests {
                 2,
             )
             .unwrap();
-        let plan = PartialPlan {
-            steps: Rc::new(vec![
-                Step { id: 1, operator: 0 },
-                Step { id: 2, operator: 1 },
-            ]),
-            links: Rc::new(vec![CausalLink {
+        let plan = PartialPlan::assemble(
+            vec![Step { id: 1, operator: 0 }, Step { id: 2, operator: 1 }],
+            vec![CausalLink {
                 producer: 1,
                 consumer: GOAL_ID,
                 condition: Fact::new(0, 1),
                 effect: Some(0),
-            }]),
-            open_conditions: Rc::new(vec![]),
+            }],
+            vec![],
             orderings,
-            threats: Rc::new(vec![Threat {
+            vec![Threat {
                 step: 2,
                 effect: 0,
                 link: 0,
-            }]),
-            suppressed: Rc::new(vec![]),
-            disjunctions: Rc::new(Vec::new()),
-            edelete: None,
-            cost: 2,
-            next_step_id: 3,
-            id: 0,
-        };
+            }],
+            2,
+            3,
+        );
         let threats = plan.threats(&task);
         assert_eq!(threats, plan.rediscover_threats(&task));
         assert_eq!(threats.len(), 1);
@@ -3058,7 +3244,7 @@ mod tests {
         assert_eq!(children.len(), 1);
         let child = &children[0];
         assert_eq!(
-            *child.open_conditions,
+            child.open_conditions().cloned().collect::<Vec<_>>(),
             vec![OpenCondition {
                 consumer: 2,
                 condition: Fact::new(2, 1),
@@ -3066,7 +3252,7 @@ mod tests {
         );
         assert!(child.threats(&task).is_empty());
         assert_eq!(child.threats(&task), child.rediscover_threats(&task));
-        assert!(child.effect_cannot_fire(&task, &child.steps[1], 1));
+        assert!(child.effect_cannot_fire(&task, child.step(2).unwrap(), 1));
 
         // The suppressed assignment is no longer available as a producer:
         // reusing `run` to switch the power off drops out of the refinement
@@ -3086,7 +3272,7 @@ mod tests {
         let task = breaker_task();
         let planner = Planner::new(&task);
         let (mut plan, threat) = trapped_breaker_plan();
-        Rc::make_mut(&mut plan.open_conditions).push(OpenCondition {
+        plan.push_open(OpenCondition {
             consumer: 2,
             condition: Fact::new(2, 0),
         });
@@ -3102,7 +3288,7 @@ mod tests {
     fn a_contradicted_condition_is_never_a_threat() {
         let task = breaker_task();
         let (mut plan, _) = trapped_breaker_plan();
-        Rc::make_mut(&mut plan.open_conditions).push(OpenCondition {
+        plan.push_open(OpenCondition {
             consumer: 2,
             condition: Fact::new(2, 1),
         });
@@ -3127,24 +3313,19 @@ mod tests {
             consumer: GOAL_ID,
             condition: Fact::new(0, 1),
         };
-        let plan = PartialPlan {
-            steps: Rc::new(vec![Step { id: 1, operator: 1 }]),
-            links: Rc::new(vec![]),
-            open_conditions: Rc::new(vec![open.clone()]),
+        let plan = PartialPlan::assemble(
+            vec![Step { id: 1, operator: 1 }],
+            vec![],
+            vec![open.clone()],
             orderings,
-            threats: Rc::new(vec![]),
-            suppressed: Rc::new(vec![]),
-            disjunctions: Rc::new(Vec::new()),
-            edelete: None,
-            cost: 1,
-            next_step_id: 2,
-            id: 0,
-        };
+            vec![],
+            1,
+            2,
+        );
         let planner = Planner::new(&task);
         let child = planner
             .add_step(
                 &plan,
-                0,
                 &open,
                 &Achiever {
                     operator: 0,

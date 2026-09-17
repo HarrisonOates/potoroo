@@ -30,6 +30,9 @@ pub struct PruneOptions {
     pub recursion: bool,
     /// Non-minimality (cutset-dominance) pruning. See [`crate::minimality`].
     pub minimality: bool,
+    /// Skip achievers that introduce an interchangeable object other than the
+    /// first unused one of its class. See [`crate::symmetry`].
+    pub symmetry: bool,
 }
 
 impl PruneOptions {
@@ -42,6 +45,7 @@ impl PruneOptions {
             params: true,
             recursion: true,
             minimality: true,
+            symmetry: true,
         }
     }
 
@@ -53,6 +57,7 @@ impl PruneOptions {
             || self.params
             || self.recursion
             || self.minimality
+            || self.symmetry
     }
 
     /// Parses a comma-separated rule list: `cutset`, `edelete`, `disjunctive`,
@@ -85,10 +90,11 @@ impl PruneOptions {
                 "params" | "parameters" | "param-domains" => options.params = on,
                 "recursion" | "recursive" => options.recursion = on,
                 "minimality" | "minimal" => options.minimality = on,
+                "symmetry" | "symmetries" | "objects" => options.symmetry = on,
                 other => {
                     return Err(format!(
                         "unknown pruning rule `{other}` (expected cutset, edelete, \
-                         disjunctive, params, recursion, minimality, all or none)"
+                         disjunctive, params, recursion, minimality, symmetry, all or none)"
                     ))
                 }
             }
@@ -110,6 +116,16 @@ impl PruneOptions {
     /// Enabled rules that only ever fire on the finite-domain representation.
     /// Naming them lets `-v` say so rather than let a lifted run pay for `-p
     /// all` and quietly get nothing from three of its six rules.
+    /// Rules that need ground steps: they cannot fire on the lifted
+    /// representation, where a step's arguments are still variables.
+    pub fn ground_only(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.symmetry {
+            names.push("symmetry");
+        }
+        names
+    }
+
     pub fn finite_domain_only(self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.disjunctive {
@@ -139,6 +155,9 @@ impl PruneOptions {
         if self.minimality {
             names.push("minimality");
         }
+        if self.symmetry {
+            names.push("symmetry");
+        }
         names
     }
 }
@@ -166,7 +185,14 @@ mod tests {
         let options = PruneOptions::parse("all,no-minimality").unwrap();
         assert_eq!(
             options.names(),
-            vec!["cutset", "edelete", "disjunctive", "params", "recursion"]
+            vec![
+                "cutset",
+                "edelete",
+                "disjunctive",
+                "params",
+                "recursion",
+                "symmetry"
+            ]
         );
     }
 
