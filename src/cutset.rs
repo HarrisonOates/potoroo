@@ -296,7 +296,7 @@ mod tests {
 pub mod lifted {
     use crate::chain;
     use crate::formula::{Atom, Formula, Literal};
-    use crate::lifted_mutex::LiftedMutexes;
+    use crate::lifted_mutex::{GroupKey, LiftedMutexes};
     use crate::orderings::{BinaryOrderings, StepTime};
     use crate::plan::{Link, Plan};
     use crate::search::SearchContext;
@@ -317,12 +317,25 @@ pub mod lifted {
         crate::lifted_mutex::ground_atom(&plan.bindings, atom, step_id)
     }
 
+    /// Where a fact enters the plan from, and therefore which steps' cutsets it
+    /// belongs to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Source {
+        /// The condition of a causal link: it holds across every step the link
+        /// necessarily spans, and at the link's consumer.
+        Link(usize),
+        /// An open condition of a step: any completion must establish it there.
+        Open(usize),
+        /// An unconditional effect of a step: it holds after the step runs.
+        Effect(usize),
+    }
+
     /// Whether the rule could fire at all.
     ///
-    /// Allocation-free, and it asks the sharper question: not merely whether
-    /// the plan has links, but whether any link carries a condition some group
-    /// covers. On a domain whose groups touch none of the plan's conditions
-    /// this rejects every node without resolving a single term.
+    /// Allocation-free, and it asks the sharper question: not merely whether the
+    /// plan has links, but whether any link carries a condition some group
+    /// covers. On a domain whose groups touch none of the plan's conditions this
+    /// rejects every node without resolving a single term.
     pub fn may_apply(plan: &Plan, mutexes: &LiftedMutexes) -> bool {
         if mutexes.is_empty() || plan.num_links == 0 || plan.num_steps() == 0 {
             return false;
@@ -334,10 +347,22 @@ pub mod lifted {
     ///
     /// Call [`may_apply`] first; this assumes it passed.
     ///
-    /// Every link condition is resolved through the bindings **once**, not once
-    /// per step: the binding lookup is the expensive part, and doing it inside
-    /// the step-by-link loop made the rule cost more in time than the search it
-    /// saved.
+    /// # Why this is not the obvious loop
+    ///
+    /// Proposition 1 reads "for each step, gather the conditions spanning it and
+    /// look for a mutex", and that is how this began. It costs
+    /// `O(steps × links)` per node — on `logistics-a`, 35 million iterations
+    /// across a search, and 90% of the rule's runtime.
+    ///
+    /// The loop is inverted instead. Two facts are mutex exactly when they are
+    /// distinct members of the same *instance* of the same group, so bucketing
+    /// the plan's facts by group instance finds every conflicting pair in one
+    /// pass, without comparing anything to anything. Only then — and only for
+    /// the pairs that actually conflict, which is almost always none — does the
+    /// question of whether some step sees both of them get asked.
+    ///
+    /// So the common case costs a pass over the facts, and the spanning
+    /// computation happens per *conflict* rather than per step.
     pub fn has_inconsistent_cutset(
         ctx: &SearchContext,
         plan: &Plan,
@@ -346,74 +371,34 @@ pub mod lifted {
         // One pass over the links: keep those whose condition a group covers and
         // whose terms have all reached objects. Anything else can neither be a
         // mutex nor be compared to one.
-        let mut links: Vec<(&Link, Atom)> = Vec::new();
+        let mut links: Vec<&Link> = Vec::new();
+        let mut facts: Vec<(Atom, Source)> = Vec::new();
         for link in chain::iter(&plan.links) {
+            let index = links.len();
+            links.push(link);
             if !mutexes.covers(link.condition.atom().predicate) {
                 continue;
             }
             if let Some(atom) = ground_atom(plan, &link.condition, link.to_id) {
-                links.push((link, atom));
+                facts.push((atom, Source::Link(index)));
             }
         }
-        if links.is_empty() {
-            return false;
+        for open in chain::iter(&plan.open_conds) {
+            if let Formula::Atom(atom) = open.condition.as_ref() {
+                if !mutexes.covers(atom.predicate) {
+                    continue;
+                }
+                if let Some(atom) =
+                    crate::lifted_mutex::ground_atom(&plan.bindings, atom, open.step_id)
+                {
+                    facts.push((atom, Source::Open(open.step_id)));
+                }
+            }
         }
-
-        let mut spanning: Vec<Atom> = Vec::new();
-        let mut cutset: Vec<Atom> = Vec::new();
-
         for step in chain::iter(&plan.steps) {
             if step.action.synthetic() {
                 continue;
             }
-            spanning.clear();
-            for (link, atom) in &links {
-                if link.from_id == step.id || link.to_id == step.id {
-                    continue;
-                }
-                if necessarily_before(&plan.orderings, link.from_id, step.id)
-                    && necessarily_before(&plan.orderings, step.id, link.to_id)
-                {
-                    spanning.push(atom.clone());
-                }
-            }
-            if spanning.is_empty() {
-                continue;
-            }
-
-            // C⁻(step): everything that must hold when the step executes — the
-            // conditions spanning it, the conditions supporting it, and its own
-            // open conditions, which any completion has to establish there too.
-            cutset.clear();
-            cutset.extend_from_slice(&spanning);
-            for (link, atom) in &links {
-                if link.to_id == step.id {
-                    cutset.push(atom.clone());
-                }
-            }
-            for open in chain::iter(&plan.open_conds) {
-                if open.step_id != step.id {
-                    continue;
-                }
-                if let Formula::Atom(atom) = open.condition.as_ref() {
-                    if !mutexes.covers(atom.predicate) {
-                        continue;
-                    }
-                    if let Some(atom) =
-                        crate::lifted_mutex::ground_atom(&plan.bindings, atom, open.step_id)
-                    {
-                        cutset.push(atom);
-                    }
-                }
-            }
-            if mutexes.inconsistent(&cutset) {
-                return true;
-            }
-
-            // C⁺(step): the conditions spanning it, plus what it asserts. Only
-            // unconditional, unquantified effects are certain to fire.
-            cutset.clear();
-            cutset.extend_from_slice(&spanning);
             for effect in step.action.effects.iter() {
                 if effect.conditional() || !effect.parameters.is_empty() {
                     continue;
@@ -426,14 +411,94 @@ pub mod lifted {
                 }
                 if let Some(atom) = crate::lifted_mutex::ground_atom(&plan.bindings, added, step.id)
                 {
-                    cutset.push(atom);
+                    facts.push((atom, Source::Effect(step.id)));
                 }
             }
-            if mutexes.inconsistent(&cutset) {
-                return true;
+        }
+        if facts.len() < 2 {
+            return false;
+        }
+
+        // Bucket by group instance. Two facts in one bucket are mutex if they
+        // differ, so every conflicting pair falls out without a comparison.
+        // Sorting a flat vector beats hashing at these sizes, and the key is
+        // `Copy`, so the whole pass costs two allocations.
+        let mut tagged: Vec<(GroupKey, usize)> = Vec::with_capacity(facts.len());
+        let mut keys: Vec<GroupKey> = Vec::new();
+        for (index, (atom, _)) in facts.iter().enumerate() {
+            keys.clear();
+            mutexes.group_keys(atom, &mut keys);
+            for key in keys.drain(..) {
+                tagged.push((key, index));
             }
+        }
+        if tagged.len() < 2 {
+            return false;
+        }
+        tagged.sort_unstable();
+
+        let mut run_start = 0;
+        while run_start < tagged.len() {
+            let mut run_end = run_start + 1;
+            while run_end < tagged.len() && tagged[run_end].0 == tagged[run_start].0 {
+                run_end += 1;
+            }
+            for i in run_start..run_end {
+                for j in (i + 1)..run_end {
+                    let (left, right) = (tagged[i].1, tagged[j].1);
+                    if facts[left].0 == facts[right].0 {
+                        continue;
+                    }
+                    if shares_a_cutset(plan, &links, facts[left].1, facts[right].1) {
+                        return true;
+                    }
+                }
+            }
+            run_start = run_end;
         }
         let _ = ctx;
         false
+    }
+
+    /// Whether the link necessarily spans the step, so its condition is held
+    /// across it.
+    fn spans(plan: &Plan, link: &Link, step: usize) -> bool {
+        link.from_id != step
+            && link.to_id != step
+            && necessarily_before(&plan.orderings, link.from_id, step)
+            && necessarily_before(&plan.orderings, step, link.to_id)
+    }
+
+    /// Whether two conflicting facts both belong to the cutset of some one step.
+    ///
+    /// A link's condition reaches every step it spans and its own consumer; an
+    /// open condition and an effect reach only their own step, and they reach
+    /// *different* cutsets — `C⁻` holds what a step relies on, `C⁺` what it
+    /// asserts — so a pair drawn from both can never meet.
+    fn shares_a_cutset(plan: &Plan, links: &[&Link], left: Source, right: Source) -> bool {
+        match (left, right) {
+            (Source::Link(a), Source::Link(b)) => {
+                let (first, second) = (links[a], links[b]);
+                if first.to_id == second.to_id {
+                    return true;
+                }
+                if spans(plan, first, second.to_id) || spans(plan, second, first.to_id) {
+                    return true;
+                }
+                chain::iter(&plan.steps)
+                    .any(|step| spans(plan, first, step.id) && spans(plan, second, step.id))
+            }
+            (Source::Link(a), Source::Open(step)) | (Source::Open(step), Source::Link(a)) => {
+                links[a].to_id == step || spans(plan, links[a], step)
+            }
+            (Source::Link(a), Source::Effect(step)) | (Source::Effect(step), Source::Link(a)) => {
+                spans(plan, links[a], step)
+            }
+            (Source::Open(a), Source::Open(b)) => a == b,
+            (Source::Effect(a), Source::Effect(b)) => a == b,
+            // An open condition is what a step relies on and an effect is what
+            // it asserts; the two never share a cutset.
+            (Source::Open(_), Source::Effect(_)) | (Source::Effect(_), Source::Open(_)) => false,
+        }
     }
 }

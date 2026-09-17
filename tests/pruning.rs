@@ -723,3 +723,41 @@ fn refinement_finds_cross_predicate_groups() {
         );
     }
 }
+
+/// `logistics-a` is the case where the cutset rule does the most work per node,
+/// and the one that broke when an unsound cache was tried: a link node is shared
+/// by every plan that descends from the one that created it, *including*
+/// siblings that went on to bind the same variable differently, so nothing
+/// binding-dependent may be remembered on it. The symptom was over-pruning —
+/// the problem stopped solving at all — so pin solvability and cost, not just
+/// that something was pruned.
+#[test]
+fn lifted_cutset_does_not_over_prune_logistics() {
+    let baseline = run(
+        "examples/logistics-domain.pddl",
+        "examples/logistics-a.pddl",
+        params(PruneOptions::default(), 60_000),
+    );
+    let pruned = run(
+        "examples/logistics-domain.pddl",
+        "examples/logistics-a.pddl",
+        params(
+            PruneOptions {
+                cutset: true,
+                ..PruneOptions::default()
+            },
+            60_000,
+        ),
+    );
+    assert!(baseline.solved, "logistics-a should solve without pruning");
+    assert!(
+        pruned.solved,
+        "logistics-a stopped solving with cutset pruning — the rule is rejecting \
+         plans it should keep"
+    );
+    assert_eq!(
+        baseline.cost, pruned.cost,
+        "cutset pruning changed the plan cost on logistics-a"
+    );
+    assert!(pruned.pruned > 0, "cutset pruning fired on nothing");
+}

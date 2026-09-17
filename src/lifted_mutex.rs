@@ -80,6 +80,19 @@ impl MutexGroup {
     }
 }
 
+/// A group together with a full assignment of its invariant parameters: the
+/// identity of one *instance* of one group.
+///
+/// Two facts sharing a key are distinct members of the same instance and so are
+/// mutex, which is what lets a caller find every conflicting pair by bucketing
+/// rather than by comparing pairs. `Copy` and allocation-free, because it is
+/// built for every ground fact of every generated node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GroupKey {
+    group: u32,
+    params: [u32; LiftedMutexes::MAX_KEY_ARITY],
+}
+
 /// The lifted mutex groups of a domain and problem.
 #[derive(Debug, Default)]
 pub struct LiftedMutexes {
@@ -241,6 +254,54 @@ impl LiftedMutexes {
         false
     }
 
+    /// Largest invariant arity a [`GroupKey`] can hold. A group wider than this
+    /// yields no key, which loses a mutex and never invents one.
+    pub const MAX_KEY_ARITY: usize = 4;
+
+    /// The group instances an atom belongs to, appended to `out`.
+    ///
+    /// A key is a group together with a full assignment of its invariant
+    /// parameters. Two atoms sharing a key are in the same instance of the same
+    /// group, so if they differ they are mutex — which turns "find the mutex
+    /// pairs in this set of facts" from a quadratic scan into a bucketing.
+    ///
+    /// A match that leaves an invariant parameter unbound yields no key: the
+    /// atom belongs to the group for *every* value of that parameter, which the
+    /// bucketing cannot express. Skipping it loses a mutex and never invents
+    /// one, and [`Self::mutex`] remains the authority on any pair.
+    pub fn group_keys(&self, atom: &Atom, out: &mut Vec<GroupKey>) {
+        let Some(parts) = self.by_predicate.get(&atom.predicate) else {
+            return;
+        };
+        for &(group_index, part_index) in parts {
+            let group = &self.groups[group_index];
+            if group.arity > Self::MAX_KEY_ARITY {
+                continue;
+            }
+            let mut binding: [Option<Object>; Self::MAX_KEY_ARITY] = [None; Self::MAX_KEY_ARITY];
+            if !match_ground_fixed(&group.parts[part_index], atom, &mut binding[..group.arity]) {
+                continue;
+            }
+            let mut key = GroupKey {
+                group: group_index as u32,
+                params: [u32::MAX; Self::MAX_KEY_ARITY],
+            };
+            let mut complete = true;
+            for (slot, out_param) in binding[..group.arity].iter().zip(&mut key.params) {
+                match slot {
+                    Some(object) => *out_param = object.0,
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete && !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+
     /// Whether two literals are mutex. Only two positive literals can be: a
     /// negative one asserts a fact's absence, which no group constrains.
     pub fn literals_mutex(&self, left: &Literal, right: &Literal) -> bool {
@@ -296,6 +357,34 @@ pub fn ground_atom(
 /// `binding` is left modified on failure, so a caller that tries several parts
 /// must start each attempt from a fresh one.
 fn match_ground(part: &Part, atom: &Atom, binding: &mut [Option<Object>]) -> bool {
+    if part.predicate != atom.predicate || part.slots.len() != atom.terms.len() {
+        return false;
+    }
+    for (slot, term) in part.slots.iter().zip(&atom.terms) {
+        match slot {
+            Slot::Counted => {}
+            Slot::Const(expected) => {
+                if *term != Term::Object(*expected) {
+                    return false;
+                }
+            }
+            Slot::Param(index) => {
+                let Term::Object(object) = term else {
+                    return false;
+                };
+                match binding[*index] {
+                    Some(bound) if bound != *object => return false,
+                    Some(_) => {}
+                    None => binding[*index] = Some(*object),
+                }
+            }
+        }
+    }
+    true
+}
+
+/// [`match_ground`] over a fixed-size binding slice.
+fn match_ground_fixed(part: &Part, atom: &Atom, binding: &mut [Option<Object>]) -> bool {
     if part.predicate != atom.predicate || part.slots.len() != atom.terms.len() {
         return false;
     }
