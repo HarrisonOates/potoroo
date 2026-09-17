@@ -1,6 +1,7 @@
 //! Planning parameters and defaults.
 
 use crate::heuristics::{FlawSelectionOrder, Heuristic};
+use crate::pruning::PruneOptions;
 
 /// Search algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,9 @@ pub struct Parameters {
     /// Whether to collect per-evaluation `h_eval_ms` timing.
     /// `h_evals` is counted regardless.
     pub time_h_evals: bool,
+    /// Opt-in pruning rules from the POCL literature. All off by default; see
+    /// [`PruneOptions`].
+    pub prune: PruneOptions,
 }
 
 impl Default for Parameters {
@@ -77,6 +81,7 @@ impl Default for Parameters {
             search_limits: vec![usize::MAX],
             ground_actions: false,
             time_h_evals: false,
+            prune: PruneOptions::default(),
         }
     }
 }

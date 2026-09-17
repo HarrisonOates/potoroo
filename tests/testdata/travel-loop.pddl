@@ -1,0 +1,5 @@
+(define (problem travel-loop)
+  (:domain travel)
+  (:objects a b - loc)
+  (:init (at a) (road a b) (road b a))
+  (:goal (and (at b) (rested))))

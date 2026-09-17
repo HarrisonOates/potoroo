@@ -84,6 +84,12 @@ pub struct SearchContext<'a> {
     pub(crate) h_eval_nanos: Cell<u128>,
     /// Children discarded by relaxed-reachability pruning at generation time.
     pub(crate) pruned: Cell<usize>,
+    /// Operator parameter domains, built on first use when `-p params` is on.
+    /// See [`crate::param_domains`].
+    param_domains: RefCell<Option<Rc<crate::param_domains::ParameterDomains>>>,
+    /// The domain's operator graph and its SCCs, built on first use when
+    /// `-p recursion` is on. See [`crate::opgraph`].
+    operator_graph: RefCell<Option<Rc<crate::opgraph::OperatorGraph>>>,
 }
 
 impl<'a> StepVarTypes for SearchContext<'a> {
@@ -154,6 +160,8 @@ impl<'a> SearchContext<'a> {
             h_evals: Cell::new(0),
             h_eval_nanos: Cell::new(0),
             pruned: Cell::new(0),
+            param_domains: RefCell::new(None),
+            operator_graph: RefCell::new(None),
         };
         ctx.step_var_types
             .borrow_mut()
@@ -169,7 +177,7 @@ impl<'a> SearchContext<'a> {
     /// reachability-based grounder when available, falling back to naive
     /// Cartesian instantiation otherwise.
     fn build_achievers(&mut self) {
-        let actions: Vec<Rc<StepAction>> = if self.params.ground_actions {
+        let mut actions: Vec<Rc<StepAction>> = if self.params.ground_actions {
             self.fd_reachable_ground_actions()
         } else {
             self.domain
@@ -178,6 +186,21 @@ impl<'a> SearchContext<'a> {
                 .map(|a| Rc::new(schema_to_action(a)))
                 .collect()
         };
+        // With `-p params`, drop action instances whose arguments lie outside
+        // their parameter domains before they ever become achievers. In ground
+        // mode this removes them from every open condition's candidate set at
+        // once, for a single up-front cost; in lifted mode it removes whole
+        // schemas that have no viable instance at all.
+        if self.params.prune.params {
+            let domains = self.param_domains();
+            actions.retain(|action| {
+                if action.arguments.is_empty() {
+                    domains.schema_viable(&action.name)
+                } else {
+                    domains.permits_arguments(&action.name, &action.arguments)
+                }
+            });
+        }
         for action in &actions {
             for (idx, effect) in action.effects.iter().enumerate() {
                 let pred = effect.literal.atom().predicate.0;
@@ -410,6 +433,25 @@ impl<'a> SearchContext<'a> {
             *self.planning_graph.borrow_mut() = Some(Rc::new(pg));
         }
         self.planning_graph.borrow().clone().unwrap()
+    }
+
+    /// Operator parameter domains, computed once per search.
+    pub fn param_domains(&self) -> Rc<crate::param_domains::ParameterDomains> {
+        if self.param_domains.borrow().is_none() {
+            let domains =
+                crate::param_domains::ParameterDomains::compute(self.domain, self.problem);
+            *self.param_domains.borrow_mut() = Some(Rc::new(domains));
+        }
+        self.param_domains.borrow().clone().unwrap()
+    }
+
+    /// The domain's operator graph, computed once per search.
+    pub fn operator_graph(&self) -> Rc<crate::opgraph::OperatorGraph> {
+        if self.operator_graph.borrow().is_none() {
+            let graph = crate::opgraph::OperatorGraph::build(self.domain);
+            *self.operator_graph.borrow_mut() = Some(Rc::new(graph));
+        }
+        self.operator_graph.borrow().clone().unwrap()
     }
 
     /// Effective cost of inserting an action under the selected cost model.
@@ -795,6 +837,56 @@ fn pop_next(
     }
 }
 
+/// Whether an opt-in pruning rule discards this refinement.
+///
+/// The rules are checked cheapest first, so an expensive one only runs on plans
+/// the cheap ones kept. Each is sound on its own terms; see `crate::pruning`.
+fn discarded_by_pruning(ctx: &SearchContext, plan: &Plan) -> bool {
+    let options = ctx.params.prune;
+    if options.params && violates_parameter_domains(ctx, plan) {
+        return true;
+    }
+    if options.minimality && crate::minimality::prunable(plan) {
+        return true;
+    }
+    if options.recursion && crate::opgraph::prunable(ctx, plan) {
+        return true;
+    }
+    false
+}
+
+/// Whether any step of the plan binds a parameter to an object outside the
+/// constants that can reach it (Gerevini & Schubert 1996).
+///
+/// Every step is checked, not only the newest: a binding added anywhere in the
+/// plan — by a link, or by a separation — can be what first pins an older
+/// step's parameter to an impossible object.
+fn violates_parameter_domains(ctx: &SearchContext, plan: &Plan) -> bool {
+    let domains = ctx.param_domains();
+    for step in chain::iter(&plan.steps) {
+        let action = &step.action;
+        if action.synthetic() {
+            continue;
+        }
+        // A ground step carries its arguments directly.
+        if !action.arguments.is_empty() {
+            if !domains.permits_arguments(&action.name, &action.arguments) {
+                return true;
+            }
+            continue;
+        }
+        for (position, variable) in action.parameters.iter().enumerate() {
+            if let Term::Object(object) = plan.bindings.binding(Term::Variable(*variable), step.id)
+            {
+                if !domains.permits(&action.name, position, object) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Whether some open condition introduced by `child`'s newly added step is
 /// relaxed-unreachable under `child`'s bindings. Such a child can never be
 /// completed: this is the same ∞-value that would make an eager rank discard
@@ -883,6 +975,7 @@ fn plan_impl(
     // refinement's *new* open conditions for relaxed reachability at generation
     // time instead. Eager modes already get this from the ∞-rank discard.
     let prune_unreachable = is_lazy && ctx.params.heuristic.needs_planning_graph();
+    let prune_options = ctx.params.prune;
 
     // One pending-plan queue and generated-plan counter per flaw order.
     let mut queues: Vec<BinaryHeap<QueuedPlan>> =
@@ -967,6 +1060,14 @@ fn plan_impl(
                 // Siblings share step ids, so claim the map before this child's
                 // variables are typed by anything below.
                 ctx.register_newest_step(&new_plan, plan.num_steps);
+
+                // Opt-in literature pruning rules (`-p`). Each discards a plan
+                // it has proved unrefinable or provably non-minimal; all are
+                // off unless asked for. See `crate::pruning`.
+                if prune_options.any() && discarded_by_pruning(ctx, &new_plan) {
+                    ctx.pruned.set(ctx.pruned.get() + 1);
+                    continue;
+                }
 
                 // ALT: GBFS-ordered rank from the shared evaluation, consumed
                 // by the secondary-queue push below.

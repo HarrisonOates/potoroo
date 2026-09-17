@@ -374,6 +374,11 @@ fn print_search_configuration(cli: &Cli) {
         limits,
     );
 
+    let prune = cli.params.prune.names();
+    if !prune.is_empty() {
+        eprintln!("Pruning: {}", prune.join(","));
+    }
+
     if cli.fdr_pocl
         || cli.params.ground_actions
         || cli.heuristic_name.to_ascii_uppercase().contains("COMPILE")
@@ -539,6 +544,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 search_limits.push(parse_limit(&v)?);
             }
+            "p" => {
+                let v = required_value!();
+                params.prune = potoroo::pruning::PruneOptions::parse(&v)?;
+            }
             "r" => return Err("-r (random open conditions) is not yet supported".to_string()),
             "S" => {
                 let _ = required_value!(); // seed; only relevant with -r
@@ -623,6 +632,7 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "heuristic" => "h",
         "help" => "H",
         "limit" => "l",
+        "prune" => "p",
         "random-open-conditions" => "r",
         "seed" => "S",
         "search-algorithm" => "s",
@@ -680,6 +690,8 @@ fn print_help() {
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
+         \x20 -p, --prune=RULES          opt-in pruning: cutset, params, recursion,\n\
+         \x20                            minimality, all, none (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20 -v, --verbose[=N]          live search telemetry (repeat for more frequent updates)\n\
          \x20 -w, --weight=W             heuristic weight (default 1)\n\

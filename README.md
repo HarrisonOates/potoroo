@@ -267,6 +267,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
 | `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
+| `-p` | `--prune` | RULES | Opt-in pruning rules (see [Pruning rules](#pruning-rules)) | none |
 | `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
 | `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
 | `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
@@ -379,6 +380,50 @@ Custom orders can be written in the flaw-selection DSL:
 
 ---
 
+## Pruning rules
+
+VHPOP discards a partial plan only when its ordering constraints cycle or its
+binding constraints become unsatisfiable, and Potoroo inherited that. Four
+further rules from the plan-space literature are implemented and selected with
+`-p`, as a comma-separated list; `all` enables everything and a leading `no-`
+turns one off, so `-p all,no-minimality` is the three cheap rules.
+
+| Rule | Source | Representation | What it discards |
+|---|---|---|---|
+| `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | `--fdr-pocl` | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. |
+| `params` | Gerevini & Schubert, JAIR 5 (1996), §4 | lifted and ground | An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph. |
+| `recursion` | Smith & Peot, AIPS-96, Thms. 1 and 4 | lifted and ground | A plan whose remaining open conditions are all suspended inside a regression loop, so every completion is non-minimal. |
+| `minimality` | Kambhampati, IJCAI-95, Strategy 2 | lifted and ground | A plan with steps `s′ ≺ s″` where everything `s″` might rely on is already guaranteed at `s′`, making the steps between them removable. |
+
+```bash
+# Cutset pruning over the finite-domain representation
+potoroo --fdr-pocl -p cutset -h LMCUT domain.pddl problem.pddl
+
+# Everything, on the default lifted search
+potoroo -p all domain.pddl problem.pddl
+```
+
+`-v` reports the active rules, and the `pruned` counter in the telemetry line
+and in `POTOROO_STATS_JSON` counts the plans they discard.
+
+### Why they are off by default
+
+Every rule is solution-preserving: each discards only plans it has proved
+unrefinable, or proved to have none but non-minimal completions. None of them
+changes the set of plans the planner *can* return.
+
+They do change which plan a given search returns and how many nodes it visits.
+Under an admissible heuristic (`LMCUT`, `LPLAN`) A\* remains cost-optimal and
+the cost is unchanged; under an inadmissible one (`ADD`, the default) the
+returned plan can differ, exactly as it would under any other change to the
+node set. Since every measurement published from this planner was taken without
+them, enabling one is a deliberate act rather than a silent default.
+
+`tests/pruning.rs` pins both halves of that claim: the rules leave the plans
+found on the example suite unchanged, and each rule is shown to actually fire.
+
+---
+
 ## Acknowledgements
 
 Potoroo builds on the following work:
@@ -388,6 +433,10 @@ Potoroo builds on the following work:
 - **Causal-link compilation** — Pascal Bercher, Tobias Geier, and Susanne Biundo, *Using State-Based Planning Heuristics for Partial-Order Causal-Link Planning*, KI 2013.
 - **Sample-FF** — Pascal Bercher, Tobias Geier, Florian Richter, and Susanne Biundo, *On Delete Relaxation in Partial-Order Causal-Link Planning*, ICTAI 2013.
 - **Fast Downward** — Malte Helmert, *The Fast Downward Planning System*, JAIR 2006.
+- **Cutset pruning, mutex-extended threats** — XuanLong Nguyen and Subbarao Kambhampati, *Reviving Partial Order Planning*, IJCAI 2001.
+- **Operator parameter domains** — Alfonso Gerevini and Lenhart Schubert, *Accelerating Partial-Order Planners: Some Techniques for Effective Search Control and Pruning*, JAIR 1996.
+- **Recursion suspension** — David E. Smith and Mark A. Peot, *Suspending Recursion in Causal-link Planning*, AIPS 1996.
+- **Minimality-based pruning** — Subbarao Kambhampati, *Admissible Pruning Strategies based on plan minimality for Plan-Space Planning*, IJCAI 1995.
 - **Position paper & heuristic survey** — Scott Howsam, Harrison Oates, and Pascal Bercher, *Reviving Partial Order Causal Link (POCL) Planning: Is It Possible? Is It Worth It?*, HSDIP 2026. ([PDF](https://icaps26.icaps-conference.org/files/workshops/hsdip/ICAPS_HSDIP_2026_paper_8.pdf))
 
 ---

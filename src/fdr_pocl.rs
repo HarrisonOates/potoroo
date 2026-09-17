@@ -667,6 +667,21 @@ impl<'a> Planner<'a> {
         let is_dual = alg == SearchAlgorithm::LazyGbfsDual;
         let is_alt = alg == SearchAlgorithm::Alt;
 
+        // Cutset mutex pruning (`-p cutset`): Fast Downward's SAS+ variables and
+        // declared mutex groups supply the mutexes this rule needs, so the
+        // finite-domain representation gets it for free. See `crate::cutset`.
+        let cutset_mutexes = params
+            .prune
+            .cutset
+            .then(|| crate::cutset::FactMutexes::new(self.task));
+        if let Some(mutexes) = &cutset_mutexes {
+            // The goal step's pre-cutset is the task goals, and no link can span
+            // the goal, so it is plan-independent: check it once.
+            if crate::cutset::goals_inconsistent(self.task, mutexes) {
+                return (Outcome::NoSolution, SearchStats::default());
+            }
+        }
+
         let initial = Rc::new(PartialPlan::initial(self.task));
         let mut queues: Vec<BinaryHeap<QueuedPlan>> =
             (0..n_orders).map(|_| BinaryHeap::new()).collect();
@@ -748,6 +763,12 @@ impl<'a> Planner<'a> {
                 let children = self.refinements(&plan, &params.flaw_orders[current_order]);
                 let order_index = current_order;
                 for mut child in children {
+                    if let Some(mutexes) = &cutset_mutexes {
+                        if crate::cutset::has_inconsistent_cutset(&child, self.task, mutexes) {
+                            stats.pruned += 1;
+                            continue;
+                        }
+                    }
                     child.id = stats.nodes_generated;
                     let child = Rc::new(child);
                     let mut alt_gbfs_rank = None;
