@@ -308,6 +308,50 @@ These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is
 | `RELAX` | Delete-relaxed plan cost (FF-style joint extraction): `committed-cost + weight × cost(π_relax)` |
 | `RELAXR` | RELAX with reuse (only new operators in the extracted relaxed plan) |
 
+### Lifted landmark heuristic
+
+Not a delete relaxation, and it needs no grounding.
+
+| Name | Description |
+|------|-------------|
+| `LM` | Count of the task's **lifted landmarks** that no step of the partial plan achieves. |
+
+A *lifted landmark* is a partially grounded predicate `P(u₁, …, u_k)` some
+ground instance of which must hold in every plan (Wichlacz, Höller & Hoffmann,
+IJCAI 2022, Def. 1). `in(o, ·)` says the package must at some point be inside
+*something* — one compact statement standing for the disjunction over every
+vehicle. Extraction backchains from the goal over **necessary subgoals**: take
+every schema that adds the subgoal, partially ground each just enough to produce
+it, and intersect their preconditions by predicate, pinning only the arguments
+every candidate agrees on.
+
+The plan-space reading of LAMA's landmark count is direct: where a state has
+"accepted" a landmark, a partial plan *contains a step that produces it*, and
+what remains is work still to do.
+
+It is not better than `ADD` in general — and that is not the point. It is
+**different**, and the difference shows up as coverage:
+
+| | `ADD` | `RELAX` | `LM` | `ADD/LM` |
+|---|---|---|---|---|
+| `fixit` | — | — | **solves, 5151 nodes, cost 19** | — |
+| `test-ferry` | 254 | 130 | 367 | **109** |
+| `gripper-4` | **231** | — | 3099 | 311 |
+| `gripper-6` | **835** | 12444 | — | — |
+
+`fixit` is solved by nothing else in this planner. `test-ferry` shows the other
+half of complementarity: as a tiebreaker behind `ADD`, landmarks more than halve
+the search `ADD` needs alone. Where `ADD` is already strong, `LM` on its own is
+weaker — so compose rather than substitute.
+
+This is the line the HSDIP position paper points at. Its finding is that
+conceptually different delete-relaxation approaches fail for POCL in the same
+way, and that "beyond delete-relaxation lies a largely unexplored design space";
+Oates & Bercher (ICAPS-26) then show relaxation is hard in the lifted POCL
+setting specifically. A landmark heuristic is neither.
+
+Literal representations only; `--fdr-pocl` rejects it.
+
 ### Lplan LP heuristic
 
 Requires ground actions (`-g`). An **admissible** lower bound on the total number of steps needed to complete the plan, based on Bylander's (1997) LP relaxation applied to the causal-link compilation of the current partial plan.

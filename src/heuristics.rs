@@ -31,6 +31,10 @@ pub(crate) enum HVal {
     /// action; `RelaxR` reuses existing plan steps (counts only new actions).
     Relax,
     RelaxR,
+    /// Lifted landmark count: how many of the task's lifted landmarks no step
+    /// of the partial plan achieves. Not a delete relaxation, and it needs no
+    /// grounding. See [`crate::landmarks`].
+    Landmarks,
     /// Native LM-cut over the FDR POCL open-condition relaxation. `LmCut`
     /// starts from the problem initial state; `LmCutR` also treats effects of
     /// committed steps as initially available. FDR POCL search only.
@@ -129,6 +133,7 @@ impl Heuristic {
                 "BUC" => HVal::Buc,
                 "S+OC" => HVal::SPlusOc,
                 "UCPOP" => HVal::Ucpop,
+                "LM" | "LANDMARKS" => HVal::Landmarks,
                 "ADD" => {
                     needs_pg = true;
                     HVal::Add
@@ -386,6 +391,11 @@ impl Heuristic {
                             grank.push(f32::INFINITY);
                         }
                     }
+                }
+                HVal::Landmarks => {
+                    let v = search_ctx.landmarks().outstanding(plan) as f32;
+                    rank.push(g + weight * v);
+                    grank.push(weight * v);
                 }
                 HVal::LmCut | HVal::LmCutR => {
                     unreachable!("native LMCUT/LMCUTR requires FDR POCL search")
