@@ -61,10 +61,42 @@ pub struct OpenCondition {
     pub condition: Fact,
 }
 
+/// A threat resolution posted as a constraint instead of split into two plans.
+///
+/// Nguyen & Kambhampati, IJCAI-01, §4.1:
+///
+/// > A problem with this premature splitting is that a single failing plan gets
+/// > unnecessarily multiplied into many descendant plans poisoning the search
+/// > queue significantly. A much better idea is to resolve the unsafe link by
+/// > posting a disjunctive ordering constraint that captures both the promotion
+/// > and demotion possibilities, and incrementally simplify these constraints by
+/// > propagation techniques.
+///
+/// The disjunction is `(promote.0 ≺ promote.1) ∨ (demote.0 ≺ demote.1)`. It is
+/// discharged by [`PartialPlan::propagate_disjunctions`] as soon as either
+/// disjunct becomes entailed (satisfied) or impossible (the other is enforced),
+/// and split into the search space only when nothing else is left to refine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderingDisjunction {
+    /// The threat this discharges, keyed as `(link, step, effect)`.
+    pub threat: (usize, usize, usize),
+    /// Promotion: the threatening step follows the link's consumer.
+    pub promote: (usize, usize),
+    /// Demotion: the threatening step precedes the link's producer.
+    pub demote: (usize, usize),
+}
+
+/// A threat whose source is the step's *precondition* rather than one of its
+/// effects: the step requires a fact mutex with the protected one, so it cannot
+/// execute inside the interval at all. Only e-deletion produces these.
+pub const NO_EFFECT: usize = usize::MAX;
+
 /// An assignment that can occur inside a causal link's protected interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Threat {
     pub step: usize,
+    /// Index of the clobbering effect, or [`NO_EFFECT`] for a precondition-based
+    /// e-deletion threat.
     pub effect: usize,
     pub link: usize,
 }
@@ -149,6 +181,15 @@ pub struct PartialPlan {
     suppressed: Rc<Vec<(usize, usize)>>,
     /// Accumulated cost of committed operators.
     pub cost: usize,
+    /// Threats resolved by posting a disjunctive ordering rather than by
+    /// branching, still awaiting propagation or a split. Empty unless
+    /// `-p disjunctive` is on.
+    disjunctions: Rc<Vec<OrderingDisjunction>>,
+    /// Mutex table enabling e-deletion, shared by every plan in the search.
+    /// `None` leaves threat detection at the classical "assigns the protected
+    /// variable another value" test. See [`crate::cutset::FactMutexes`] and
+    /// `Planner::with_pruning`.
+    edelete: Option<Rc<crate::cutset::FactMutexes>>,
     next_step_id: usize,
     id: usize,
 }
@@ -172,6 +213,8 @@ impl PartialPlan {
             threats: Rc::new(Vec::new()),
             suppressed: Rc::new(Vec::new()),
             cost: 0,
+            disjunctions: Rc::new(Vec::new()),
+            edelete: None,
             next_step_id: 1,
             id: 0,
         }
@@ -201,12 +244,25 @@ impl PartialPlan {
                 for (effect_index, effect) in
                     task.operators[step.operator].effects.iter().enumerate()
                 {
-                    if effect_clobbers(effect.variable, effect.post, link.condition)
+                    if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
                         && !self.effect_cannot_fire(task, step, effect_index)
                     {
                         threats.push(Threat {
                             step: step.id,
                             effect: effect_index,
+                            link: link_index,
+                        });
+                    }
+                }
+                if let Some(mutexes) = self.edelete.as_deref() {
+                    if precondition_e_deletes(
+                        &task.operators[step.operator],
+                        link.condition,
+                        mutexes,
+                    ) {
+                        threats.push(Threat {
+                            step: step.id,
+                            effect: NO_EFFECT,
                             link: link_index,
                         });
                     }
@@ -266,6 +322,121 @@ impl PartialPlan {
         }
     }
 
+    /// Whether a threat already has a disjunction standing for it, so flaw
+    /// selection must leave it alone.
+    fn threat_covered(&self, threat: &Threat) -> bool {
+        !self.disjunctions.is_empty()
+            && self
+                .disjunctions
+                .iter()
+                .any(|disjunction| disjunction.threat == threat_key(threat))
+    }
+
+    pub(crate) fn pending_disjunctions(&self) -> usize {
+        self.disjunctions.len()
+    }
+
+    /// Propagates the pending disjunctions to a fixpoint.
+    ///
+    /// The three rules are RePOP's, minus the two that `BinaryOrderings`
+    /// already enforces for itself (transitivity, and rejecting a cycle):
+    ///
+    /// * a disjunct that is **entailed** satisfies the disjunction — drop it;
+    /// * a disjunct that is **impossible** leaves the other one forced — add it
+    ///   (unit propagation) and drop the disjunction;
+    /// * **both** impossible means the plan has no completion.
+    ///
+    /// Returns `false` when the plan is inconsistent and must be discarded.
+    fn propagate_disjunctions(&mut self) -> bool {
+        if self.disjunctions.is_empty() {
+            return true;
+        }
+        loop {
+            let mut forced: Option<(usize, usize)> = None;
+            let mut discharged: Option<usize> = None;
+            for (index, disjunction) in self.disjunctions.iter().enumerate() {
+                let promote = self.ordering_status(disjunction.promote);
+                let demote = self.ordering_status(disjunction.demote);
+                match (promote, demote) {
+                    (OrderingStatus::Entailed, _) | (_, OrderingStatus::Entailed) => {
+                        discharged = Some(index);
+                    }
+                    (OrderingStatus::Impossible, OrderingStatus::Impossible) => return false,
+                    (OrderingStatus::Impossible, _) => {
+                        forced = Some(disjunction.demote);
+                        discharged = Some(index);
+                    }
+                    (_, OrderingStatus::Impossible) => {
+                        forced = Some(disjunction.promote);
+                        discharged = Some(index);
+                    }
+                    _ => continue,
+                }
+                break;
+            }
+            let Some(index) = discharged else {
+                return true;
+            };
+            let disjunctions = Rc::make_mut(&mut self.disjunctions);
+            disjunctions.remove(index);
+            if let Some((before, after)) = forced {
+                let Some(orderings) = self.orderings.refine(Ordering::new(
+                    before,
+                    StepTime::AtEnd,
+                    after,
+                    StepTime::AtEnd,
+                )) else {
+                    return false;
+                };
+                self.orderings = orderings;
+            }
+        }
+    }
+
+    /// Where an ordering stands against the constraints already in the plan.
+    fn ordering_status(&self, (before, after): (usize, usize)) -> OrderingStatus {
+        if before == after || before == GOAL_ID || after == INIT_ID {
+            return OrderingStatus::Impossible;
+        }
+        if is_ordered_before(&self.orderings, before, after) {
+            return OrderingStatus::Entailed;
+        }
+        if is_ordered_before(&self.orderings, after, before) {
+            return OrderingStatus::Impossible;
+        }
+        OrderingStatus::Undetermined
+    }
+
+    /// Drops disjunctions standing for threats that are no longer active. The
+    /// constraint was only ever posted to disarm that threat, so keeping it
+    /// would over-constrain the plan.
+    fn retain_live_disjunctions(&mut self, task: &Task) {
+        if self.disjunctions.is_empty() {
+            return;
+        }
+        let live: Vec<OrderingDisjunction> = self
+            .disjunctions
+            .iter()
+            .filter(|disjunction| {
+                self.threats
+                    .iter()
+                    .any(|threat| threat_key(threat) == disjunction.threat)
+                    && self.threat_active(
+                        task,
+                        &Threat {
+                            link: disjunction.threat.0,
+                            step: disjunction.threat.1,
+                            effect: disjunction.threat.2,
+                        },
+                    )
+            })
+            .cloned()
+            .collect();
+        if live.len() != self.disjunctions.len() {
+            self.disjunctions = Rc::new(live);
+        }
+    }
+
     fn can_be_inside(&self, step_id: usize, link: &CausalLink) -> bool {
         self.orderings
             .possibly_before(link.producer, StepTime::AtEnd, step_id, StepTime::AtEnd)
@@ -293,12 +464,41 @@ impl PartialPlan {
         let Some(step) = self.step(threat.step) else {
             return false;
         };
+        if threat.effect == NO_EFFECT {
+            // A precondition-based e-deletion threat: it holds for as long as
+            // the step can sit inside the interval, since a step's own
+            // preconditions are not conditional on anything.
+            let Some(mutexes) = self.edelete.as_deref() else {
+                return false;
+            };
+            return self.can_be_inside(step.id, link)
+                && precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes);
+        }
         let Some(effect) = task.operators[step.operator].effects.get(threat.effect) else {
             return false;
         };
         self.can_be_inside(step.id, link)
-            && effect_clobbers(effect.variable, effect.post, link.condition)
+            && effect_e_deletes(effect, link.condition, self.edelete.as_deref())
             && !self.effect_cannot_fire(task, step, threat.effect)
+    }
+
+    /// Re-establishes the plan's cached invariants after a refinement: drop
+    /// threats that are no longer live, drop the disjunctions standing for them,
+    /// and propagate the rest. Returns `false` when propagation proves the plan
+    /// inconsistent, in which case the caller must discard it.
+    fn settle(&mut self, task: &Task) -> bool {
+        self.retain_active_threats(task);
+        if self.disjunctions.is_empty() {
+            return true;
+        }
+        self.retain_live_disjunctions(task);
+        if !self.propagate_disjunctions() {
+            return false;
+        }
+        // Propagation can add orderings, which can in turn retire threats.
+        self.retain_active_threats(task);
+        self.retain_live_disjunctions(task);
+        true
     }
 
     fn retain_active_threats(&mut self, task: &Task) {
@@ -330,12 +530,21 @@ impl PartialPlan {
                 continue;
             }
             for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_clobbers(effect.variable, effect.post, link.condition)
+                if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
                     && !self.effect_cannot_fire(task, step, effect_index)
                 {
                     additions.push(Threat {
                         step: step.id,
                         effect: effect_index,
+                        link: link_index,
+                    });
+                }
+            }
+            if let Some(mutexes) = self.edelete.as_deref() {
+                if precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes) {
+                    additions.push(Threat {
+                        step: step.id,
+                        effect: NO_EFFECT,
                         link: link_index,
                     });
                 }
@@ -360,12 +569,21 @@ impl PartialPlan {
                 continue;
             }
             for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_clobbers(effect.variable, effect.post, link.condition)
+                if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
                     && !self.effect_cannot_fire(task, step, effect_index)
                 {
                     additions.push(Threat {
                         step: step.id,
                         effect: effect_index,
+                        link: link_index,
+                    });
+                }
+            }
+            if let Some(mutexes) = self.edelete.as_deref() {
+                if precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes) {
+                    additions.push(Threat {
+                        step: step.id,
+                        effect: NO_EFFECT,
                         link: link_index,
                     });
                 }
@@ -436,6 +654,10 @@ pub struct SearchStats {
     pub max_steps: usize,
     pub max_open_conditions: usize,
     pub max_threats: usize,
+    /// Peak number of ordering disjunctions held on a single plan. Zero unless
+    /// `-p disjunctive` is on; a nonzero value is the evidence that threat
+    /// resolution is being deferred rather than branched on.
+    pub max_disjunctions: usize,
     pub max_queued: usize,
     h_eval_nanos: u128,
 }
@@ -493,7 +715,7 @@ fn solve_impl(
     params: &Parameters,
     progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> Result<(Outcome, SearchStats), Error> {
-    let planner = Planner::with_action_cost(task, params.action_cost);
+    let planner = Planner::with_action_cost(task, params.action_cost).with_pruning(params.prune);
     planner.validate_params(params)?;
     Ok(planner.solve(params, progress))
 }
@@ -514,6 +736,11 @@ struct Planner<'a> {
     base_relaxed: RelaxedValues,
     lmcut: Result<FdrLmCut, LmCutBuildError>,
     action_cost: ActionCost,
+    /// Shared mutex table for e-deletion, installed on the initial plan.
+    edelete: Option<Rc<crate::cutset::FactMutexes>>,
+    /// Whether threats are resolved by posting a disjunction instead of by
+    /// splitting the plan.
+    disjunctive: bool,
 }
 
 impl<'a> Planner<'a> {
@@ -590,6 +817,8 @@ impl<'a> Planner<'a> {
             base_relaxed,
             lmcut,
             action_cost,
+            edelete: None,
+            disjunctive: false,
         }
     }
 
@@ -645,6 +874,16 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
+    /// Installs the mutex table e-deletion needs. Kept separate from
+    /// construction so the cost is paid only when `-p edelete` asks for it.
+    fn with_pruning(mut self, prune: crate::pruning::PruneOptions) -> Self {
+        if prune.edelete {
+            self.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(self.task)));
+        }
+        self.disjunctive = prune.disjunctive;
+        self
+    }
+
     fn solve(
         &self,
         params: &Parameters,
@@ -682,7 +921,9 @@ impl<'a> Planner<'a> {
             }
         }
 
-        let initial = Rc::new(PartialPlan::initial(self.task));
+        let mut initial_plan = PartialPlan::initial(self.task);
+        initial_plan.edelete = self.edelete.clone();
+        let initial = Rc::new(initial_plan);
         let mut queues: Vec<BinaryHeap<QueuedPlan>> =
             (0..n_orders).map(|_| BinaryHeap::new()).collect();
         let mut secondary_queues: Vec<BinaryHeap<QueuedPlan>> = if is_dual || is_alt {
@@ -715,6 +956,13 @@ impl<'a> Planner<'a> {
             let mut next_f_limit = inf;
             while let Some(plan) = current_plan.clone() {
                 if plan.complete(self.task) {
+                    // A pending disjunction always keeps its threat in the
+                    // threat list, so a complete plan can never carry one.
+                    debug_assert_eq!(
+                        plan.pending_disjunctions(),
+                        0,
+                        "a complete plan still holds an undischarged ordering disjunction"
+                    );
                     if let Some(operators) = linearize_and_validate(&plan, self.task) {
                         return (
                             Outcome::Solved(Solution {
@@ -749,6 +997,7 @@ impl<'a> Planner<'a> {
                 stats.max_open_conditions =
                     stats.max_open_conditions.max(plan.open_conditions.len());
                 stats.max_threats = stats.max_threats.max(plan.threats.len());
+                stats.max_disjunctions = stats.max_disjunctions.max(plan.pending_disjunctions());
                 if is_dual || is_alt {
                     expanded_ids.insert(plan.id);
                 }
@@ -1036,7 +1285,9 @@ impl<'a> Planner<'a> {
                 condition: effect_condition,
             });
         }
-        child.retain_active_threats(self.task);
+        if !child.settle(self.task) {
+            return None;
+        }
         child.add_link_threats(self.task, link_index);
         Some(child)
     }
@@ -1096,7 +1347,9 @@ impl<'a> Planner<'a> {
                 condition,
             });
         }
-        child.retain_active_threats(self.task);
+        if !child.settle(self.task) {
+            return None;
+        }
         child.add_link_threats(self.task, link_index);
         child.add_step_threats(self.task, new_id);
         Some(child)
@@ -1108,6 +1361,12 @@ impl<'a> Planner<'a> {
     /// step is already committed against are skipped, since those children would
     /// be immediately inconsistent.
     fn confrontations(&self, plan: &PartialPlan, threat: &Threat) -> Vec<Fact> {
+        // A precondition-based e-deletion threat has no effect to disarm: the
+        // step requires the conflicting fact whenever it runs, so promotion and
+        // demotion are its only resolvers.
+        if threat.effect == NO_EFFECT {
+            return Vec::new();
+        }
         let Some(step) = plan.step(threat.step) else {
             return Vec::new();
         };
@@ -1153,8 +1412,20 @@ impl<'a> Planner<'a> {
                     condition: alternative,
                 });
             }
-            child.retain_active_threats(self.task);
-            children.push(child);
+            if child.settle(self.task) {
+                children.push(child);
+            }
+        }
+
+        // With `-p disjunctive`, promotion and demotion are posted as one
+        // constraint on a single child instead of splitting the plan in two.
+        // Propagation then discharges it as soon as either disjunct becomes
+        // entailed or impossible, so most threats never cost a branch at all.
+        if self.disjunctive {
+            if let Some(child) = self.post_disjunction(plan, threat) {
+                children.push(child);
+            }
+            return children;
         }
 
         // Promotion: threatening step after the consumer. No step can follow the
@@ -1170,8 +1441,9 @@ impl<'a> Planner<'a> {
             )) {
                 let mut child = plan.clone();
                 child.orderings = orderings;
-                child.retain_active_threats(self.task);
-                children.push(child);
+                if child.settle(self.task) {
+                    children.push(child);
+                }
             }
         }
 
@@ -1186,7 +1458,69 @@ impl<'a> Planner<'a> {
             )) {
                 let mut child = plan.clone();
                 child.orderings = orderings;
-                child.retain_active_threats(self.task);
+                if child.settle(self.task) {
+                    children.push(child);
+                }
+            }
+        }
+        children
+    }
+
+    /// The single child carrying `(consumer ≺ step) ∨ (step ≺ producer)`.
+    ///
+    /// Unit propagation happens at posting time too: a disjunct the orderings
+    /// already refute leaves the other forced, so the constraint is discharged
+    /// straight into an ordering rather than stored. `None` means neither
+    /// disjunct is possible and the threat cannot be resolved this way.
+    fn post_disjunction(&self, plan: &PartialPlan, threat: &Threat) -> Option<PartialPlan> {
+        let link = &plan.links[threat.link];
+        // The goal follows everything and the initial state precedes it, so
+        // those two cases rule the corresponding disjunct out up front.
+        let promote = (link.consumer != GOAL_ID).then_some((link.consumer, threat.step));
+        let demote = (link.producer != INIT_ID).then_some((threat.step, link.producer));
+
+        let mut child = plan.clone();
+        match (promote, demote) {
+            (Some(promote), Some(demote)) => {
+                let disjunctions = Rc::make_mut(&mut child.disjunctions);
+                disjunctions.push(OrderingDisjunction {
+                    threat: threat_key(threat),
+                    promote,
+                    demote,
+                });
+            }
+            (Some((before, after)), None) | (None, Some((before, after))) => {
+                child.orderings = child.orderings.refine(Ordering::new(
+                    before,
+                    StepTime::AtEnd,
+                    after,
+                    StepTime::AtEnd,
+                ))?;
+            }
+            (None, None) => return None,
+        }
+        child.settle(self.task).then_some(child)
+    }
+
+    /// Splits a disjunction that propagation could not discharge: one child per
+    /// disjunct. Reached only once nothing else in the plan is refinable.
+    fn split_disjunction(&self, plan: &PartialPlan, index: usize) -> Vec<PartialPlan> {
+        let disjunction = plan.disjunctions[index].clone();
+        let mut children = Vec::new();
+        for (before, after) in [disjunction.promote, disjunction.demote] {
+            let mut child = plan.clone();
+            let disjunctions = Rc::make_mut(&mut child.disjunctions);
+            disjunctions.remove(index);
+            let Some(orderings) = child.orderings.refine(Ordering::new(
+                before,
+                StepTime::AtEnd,
+                after,
+                StepTime::AtEnd,
+            )) else {
+                continue;
+            };
+            child.orderings = orderings;
+            if child.settle(self.task) {
                 children.push(child);
             }
         }
@@ -1201,6 +1535,7 @@ impl<'a> Planner<'a> {
         let refinements = match self.select_flaw(plan, order) {
             SelectedFlaw::Threat(threat) => self.resolve_threat(plan, &threat),
             SelectedFlaw::Open(index) => self.resolve_open(plan, index),
+            SelectedFlaw::Disjunction(index) => self.split_disjunction(plan, index),
         };
 
         #[cfg(test)]
@@ -1232,6 +1567,11 @@ impl<'a> Planner<'a> {
             .then(|| self.relaxed_values(plan, criterion.reuse));
             if criterion.non_separable || criterion.separable {
                 for (index, threat) in threats.iter().enumerate() {
+                    // A threat already standing behind a posted disjunction is
+                    // not a flaw to branch on: the constraint is doing the work.
+                    if plan.threat_covered(threat) {
+                        continue;
+                    }
                     // A ground threat has no unifier to separate, so
                     // confrontability is all that remains of VHPOP's separation
                     // refinement and is what `{s}` selects here.
@@ -1290,6 +1630,12 @@ impl<'a> Planner<'a> {
             if let Some(candidate) = choose_candidate(candidates, criterion.order) {
                 return candidate.flaw;
             }
+        }
+
+        // Every remaining threat stands behind a disjunction that propagation
+        // could not discharge. Split the oldest one.
+        if !plan.disjunctions.is_empty() {
+            return SelectedFlaw::Disjunction(0);
         }
 
         panic!("finite-domain flaw order did not select an outstanding flaw")
@@ -1727,6 +2073,73 @@ fn effect_clobbers(variable: usize, post: usize, protected: Fact) -> bool {
     variable == protected.variable && post != protected.value
 }
 
+/// Whether an effect clobbers `protected`, extended by **e-deletion** when a
+/// mutex table is supplied.
+///
+/// Nguyen & Kambhampati (IJCAI-01) generalise the classical threat test through
+/// reachability: `aₖ` conflicts with a link on `p` when `Eff(aₖ) ∪ {p}` contains
+/// a mutex, not only when `aₖ` deletes `p`. Vidal & Geffner (AAAI-04) state the
+/// same rule action-wise as *e-deletion*.
+///
+/// Over one SAS⁺ variable the generalisation collapses to the classical test, so
+/// what this adds is the cross-variable case: an assignment the translator has
+/// proved cannot hold beside `protected`. Only an **unconditional** assignment
+/// counts — a conditional one might not fire, and claiming a threat that cannot
+/// happen would let threat resolution over-constrain a refinable plan.
+fn effect_e_deletes(
+    effect: &crate::fdr::Effect,
+    protected: Fact,
+    mutexes: Option<&crate::cutset::FactMutexes>,
+) -> bool {
+    if effect_clobbers(effect.variable, effect.post, protected) {
+        return true;
+    }
+    match mutexes {
+        Some(mutexes) => {
+            effect.conditions.is_empty() && mutexes.mutex(effect.assignment(), protected)
+        }
+        None => false,
+    }
+}
+
+/// Whether an operator's *precondition* e-deletes `protected`: it requires a
+/// fact that cannot hold beside the protected one, and does not re-establish it.
+///
+/// This is CPT's third e-deletion case, and in a finite-domain task it is the
+/// productive one — it needs no cross-variable invariant, only the exactly-one
+/// semantics a SAS⁺ variable already has. A step requiring `location(truck) =
+/// lyon` cannot run inside an interval protecting `location(truck) = paris`,
+/// even though it assigns nothing.
+///
+/// The "does not re-establish `protected`" guard is kept from the published
+/// rule. A step that requires a mutex fact already breaks the protection when it
+/// *starts*, so the guard is not needed for soundness here, but it keeps the
+/// implementation literally the published one and only ever suppresses threats.
+fn precondition_e_deletes(
+    operator: &crate::fdr::Operator,
+    protected: Fact,
+    mutexes: &crate::cutset::FactMutexes,
+) -> bool {
+    let reestablishes = operator
+        .effects
+        .iter()
+        .any(|effect| effect.conditions.is_empty() && effect.assignment() == protected);
+    if reestablishes {
+        return false;
+    }
+    operator
+        .prevail
+        .iter()
+        .copied()
+        .chain(
+            operator
+                .effects
+                .iter()
+                .filter_map(|effect| effect.pre.map(|pre| Fact::new(effect.variable, pre))),
+        )
+        .any(|required| mutexes.mutex(required, protected))
+}
+
 fn threat_key(threat: &Threat) -> (usize, usize, usize) {
     (threat.link, threat.step, threat.effect)
 }
@@ -1789,6 +2202,14 @@ fn linearize_and_validate(plan: &PartialPlan, task: &Task) -> Option<Vec<usize>>
         .then_some(operators)
 }
 
+/// Whether an ordering already holds, cannot hold, or is still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderingStatus {
+    Entailed,
+    Impossible,
+    Undetermined,
+}
+
 fn is_ordered_before(orderings: &BinaryOrderings, before: usize, after: usize) -> bool {
     before != after && !orderings.possibly_before(after, StepTime::AtEnd, before, StepTime::AtStart)
 }
@@ -1797,6 +2218,8 @@ fn is_ordered_before(orderings: &BinaryOrderings, before: usize, after: usize) -
 enum SelectedFlaw {
     Threat(Threat),
     Open(usize),
+    /// A pending ordering disjunction, split into one child per disjunct.
+    Disjunction(usize),
 }
 
 struct FlawCandidate {
@@ -2262,6 +2685,8 @@ mod tests {
             orderings,
             threats: Rc::new(vec![threat.clone()]),
             suppressed: Rc::new(vec![]),
+            disjunctions: Rc::new(Vec::new()),
+            edelete: None,
             cost: 2,
             next_step_id: 3,
             id: 0,
@@ -2510,6 +2935,8 @@ mod tests {
                 link: 0,
             }]),
             suppressed: Rc::new(vec![]),
+            disjunctions: Rc::new(Vec::new()),
+            edelete: None,
             cost: 2,
             next_step_id: 3,
             id: 0,
@@ -2662,6 +3089,8 @@ mod tests {
             orderings,
             threats: Rc::new(vec![]),
             suppressed: Rc::new(vec![]),
+            disjunctions: Rc::new(Vec::new()),
+            edelete: None,
             cost: 1,
             next_step_id: 2,
             id: 0,

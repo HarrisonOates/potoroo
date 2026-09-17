@@ -191,7 +191,8 @@ fn run() -> Result<ExitCode, String> {
                     "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":true,\
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
-                     \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{}}}",
+                     \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
+                     \"max_disjunctions\":{},\"max_queued\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
@@ -206,6 +207,7 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_steps,
                     stats.max_open_conditions,
                     stats.max_threats,
+                    stats.max_disjunctions,
                     stats.max_queued,
                 );
             }

@@ -391,20 +391,59 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 | Rule | Source | Representation | What it discards |
 |---|---|---|---|
 | `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | `--fdr-pocl` | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. |
+| `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | `--fdr-pocl` | Extends threats from "assigns the protected variable another value" to "cannot hold beside the protected fact". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. |
+| `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §4 | lifted and ground | An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph. |
 | `recursion` | Smith & Peot, AIPS-96, Thms. 1 and 4 | lifted and ground | A plan whose remaining open conditions are all suspended inside a regression loop, so every completion is non-minimal. |
 | `minimality` | Kambhampati, IJCAI-95, Strategy 2 | lifted and ground | A plan with steps `s′ ≺ s″` where everything `s″` might rely on is already guaranteed at `s′`, making the steps between them removable. |
 
 ```bash
-# Cutset pruning over the finite-domain representation
-potoroo --fdr-pocl -p cutset -h LMCUT domain.pddl problem.pddl
+# The three finite-domain rules, which are also the three cheapest
+potoroo --fdr-pocl -p cutset,edelete,disjunctive -h LMCUT domain.pddl problem.pddl
 
 # Everything, on the default lifted search
 potoroo -p all domain.pddl problem.pddl
+
+# Everything except the two expensive rules
+potoroo -p all,no-recursion,no-minimality domain.pddl problem.pddl
 ```
 
 `-v` reports the active rules, and the `pruned` counter in the telemetry line
-and in `POTOROO_STATS_JSON` counts the plans they discard.
+and in `POTOROO_STATS_JSON` counts the plans they discard. `max_disjunctions` in
+the finite-domain JSON reports the peak number of deferred threat resolutions,
+and is zero unless `disjunctive` is on.
+
+### Runtime cost
+
+Measured at a fixed generated-node budget, so every configuration does the same
+amount of search and the difference is the rule's own price. Median of seven
+runs; `us/node` is per generated node.
+
+| Rule | `hanoi-3` | `fixit` | `logistics-a` | `gripper-6` |
+|---|---|---|---|---|
+| **baseline** (lifted, `ADD`) | 2.1 us/node | 1.6 us/node | 5.0 us/node | — |
+| `params` | +24% | +50% | +30% | — |
+| `recursion` | +114% | +138% | +76% | — |
+| `minimality` | +76% | +350% | +128% | — |
+| all three | +219% | +531% | +210% | — |
+| **baseline** (`--fdr-pocl`, `LMCUT`) | 7.5 us/node | — | 120 us/node | 12.0 us/node |
+| `cutset` | +13% | — | −0.2% | +10% |
+| `edelete` | +4% | — | −1.7% | +5% |
+| `disjunctive` | 0% | — | −1.3% | 0% |
+| all three | +17% | — | −0.9% | +19% |
+
+The three finite-domain rules are close to free: they share one mutex table built
+at setup and test a handful of facts per step, and where the heuristic dominates
+(`logistics-a`, at 120 us/node under `LMCUT`) they are inside the noise. `params`
+partly pays for itself by skipping the heuristic evaluation on every instance it
+rejects — 17% fewer `h` evaluations on `logistics-a`.
+
+`recursion` and `minimality` are the expensive pair, because both walk the plan's
+causal-link structure on every generated node. They were 4-7x worse still before
+being rewritten around a per-plan link index with dense step slots (`recursion`
+on `logistics-a`: 68 us/node, now 8.8); what is left is the work the rules
+actually are. Enable them where a domain loops or where plans grow redundant
+tails, not by reflex.
 
 ### Why they are off by default
 

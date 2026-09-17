@@ -17,7 +17,7 @@ use crate::domain::Domain;
 use crate::flaws::OpenCondition;
 use crate::formula::{Formula, Literal};
 use crate::orderings::StepTime;
-use crate::plan::{Link, Plan, GOAL_ID};
+use crate::plan::{Link, Plan, GOAL_ID, INIT_ID};
 use crate::predicates::Predicate;
 use crate::search::SearchContext;
 
@@ -261,61 +261,78 @@ pub struct Recursion {
     pub region: HashSet<usize>,
 }
 
-/// Forward causal-link adjacency of a plan: `from_id -> [(to_id, condition)]`.
-fn link_adjacency(plan: &Plan) -> HashMap<usize, Vec<Link>> {
-    let mut adjacency: HashMap<usize, Vec<Link>> = HashMap::new();
-    for link in chain::iter(&plan.links) {
-        adjacency
-            .entry(link.from_id)
-            .or_default()
-            .push(link.clone());
-    }
-    adjacency
+/// Causal-link adjacency shared by the recursion tests for one plan.
+/// Dense step IDs allow vector adjacency and bitmap reachability sets.
+struct LinkIndex {
+    /// Outgoing links per slot.
+    forward: Vec<Vec<Link>>,
+    /// Producer slots per consumer slot.
+    backward: Vec<Vec<usize>>,
+    /// Slots from which the goal is reachable along causal links.
+    to_goal: Vec<bool>,
+    /// Slot the goal step occupies.
+    goal_slot: usize,
 }
 
-/// Whether the goal is reachable from `start` along causal links without
-/// crossing a link whose condition equals `cut`.
-fn goal_reachable_avoiding(
-    adjacency: &HashMap<usize, Vec<Link>>,
-    start: usize,
-    cut: &Literal,
-) -> bool {
-    let mut seen: HashSet<usize> = HashSet::from([start]);
-    let mut stack = vec![start];
-    while let Some(node) = stack.pop() {
-        if node == GOAL_ID {
-            return true;
-        }
-        let Some(out) = adjacency.get(&node) else {
-            continue;
-        };
-        for link in out {
-            if link.condition.as_ref() == cut {
+impl LinkIndex {
+    fn build(plan: &Plan) -> Self {
+        let goal_slot = plan.num_steps() + 1;
+        let size = goal_slot + 1;
+        let mut forward: Vec<Vec<Link>> = vec![Vec::new(); size];
+        let mut backward: Vec<Vec<usize>> = vec![Vec::new(); size];
+        for link in chain::iter(&plan.links) {
+            let from = slot(link.from_id, goal_slot);
+            let to = slot(link.to_id, goal_slot);
+            if from >= size || to >= size {
                 continue;
             }
-            if seen.insert(link.to_id) {
-                stack.push(link.to_id);
-            }
+            forward[from].push(link.clone());
+            backward[to].push(from);
+        }
+        let to_goal = reachable_backward(&backward, [goal_slot]);
+        LinkIndex {
+            forward,
+            backward,
+            to_goal,
+            goal_slot,
         }
     }
-    false
+
+    fn slot(&self, id: usize) -> usize {
+        slot(id, self.goal_slot)
+    }
+
+    fn out(&self, slot: usize) -> &[Link] {
+        self.forward.get(slot).map_or(&[], Vec::as_slice)
+    }
 }
 
-/// Steps from which the goal is reachable along causal links.
-fn reaches_goal(plan: &Plan) -> HashSet<usize> {
-    // Reverse traversal from the goal step.
-    let mut incoming: HashMap<usize, Vec<usize>> = HashMap::new();
-    for link in chain::iter(&plan.links) {
-        incoming.entry(link.to_id).or_default().push(link.from_id);
+/// Maps a step id onto its dense slot. The goal sits just past the real steps.
+fn slot(id: usize, goal_slot: usize) -> usize {
+    if id == GOAL_ID {
+        goal_slot
+    } else {
+        id
     }
-    let mut seen: HashSet<usize> = HashSet::from([GOAL_ID]);
-    let mut stack = vec![GOAL_ID];
+}
+
+/// Everything reachable by walking `backward` from the given seeds.
+fn reachable_backward<I: IntoIterator<Item = usize>>(
+    backward: &[Vec<usize>],
+    seeds: I,
+) -> Vec<bool> {
+    let mut seen = vec![false; backward.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for seed in seeds {
+        if seed < seen.len() && !seen[seed] {
+            seen[seed] = true;
+            stack.push(seed);
+        }
+    }
     while let Some(node) = stack.pop() {
-        let Some(sources) = incoming.get(&node) else {
-            continue;
-        };
-        for &source in sources {
-            if seen.insert(source) {
+        for &source in &backward[node] {
+            if !seen[source] {
+                seen[source] = true;
                 stack.push(source);
             }
         }
@@ -323,25 +340,77 @@ fn reaches_goal(plan: &Plan) -> HashSet<usize> {
     seen
 }
 
+/// Everything reachable by walking `forward` from `start`.
+fn reachable_forward(index: &LinkIndex, start: usize) -> Vec<bool> {
+    let mut seen = vec![false; index.forward.len()];
+    if start >= seen.len() {
+        return seen;
+    }
+    seen[start] = true;
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        for link in index.out(node) {
+            let to = index.slot(link.to_id);
+            if to < seen.len() && !seen[to] {
+                seen[to] = true;
+                stack.push(to);
+            }
+        }
+    }
+    seen
+}
+
+/// Whether the goal is reachable from `start` along causal links without
+/// crossing a link whose condition equals `cut`.
+fn goal_reachable_avoiding(index: &LinkIndex, start: usize, cut: &Literal) -> bool {
+    let start = index.slot(start);
+    let mut seen = vec![false; index.forward.len()];
+    if start >= seen.len() {
+        return false;
+    }
+    seen[start] = true;
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        if node == index.goal_slot {
+            return true;
+        }
+        for link in index.out(node) {
+            if link.condition.as_ref() == cut {
+                continue;
+            }
+            let to = index.slot(link.to_id);
+            if to < seen.len() && !seen[to] {
+                seen[to] = true;
+                stack.push(to);
+            }
+        }
+    }
+    false
+}
+
 /// Identifies the recursion an open condition sits in, if it is exactly
 /// recursive — Definition 1.
 pub fn recursion_of(plan: &Plan, open_cond: &OpenCondition) -> Option<Recursion> {
+    recursion_in(plan, &LinkIndex::build(plan), open_cond)
+}
+
+fn recursion_in(plan: &Plan, index: &LinkIndex, open_cond: &OpenCondition) -> Option<Recursion> {
     let condition = open_cond.literal()?;
-    let adjacency = link_adjacency(plan);
-    let to_goal = reaches_goal(plan);
 
     // Condition 1: every causal-link path from the open condition's step to the
     // goal crosses a link labelled with the same condition. Equivalently, the
     // goal is unreachable once those links are cut — and at least one such link
     // actually lies on a path to the goal.
-    if goal_reachable_avoiding(&adjacency, open_cond.step_id, &condition) {
+    if goal_reachable_avoiding(index, open_cond.step_id, &condition) {
         return None;
     }
+    let forward = reachable_forward(index, index.slot(open_cond.step_id));
     let root_links: Vec<Link> = chain::iter(&plan.links)
         .filter(|link| {
+            let producer = index.slot(link.from_id);
             link.condition.as_ref() == &condition
-                && to_goal.contains(&link.from_id)
-                && reachable_from(&adjacency, open_cond.step_id, link.from_id)
+                && index.to_goal.get(producer).copied().unwrap_or(false)
+                && forward.get(producer).copied().unwrap_or(false)
         })
         .cloned()
         .collect();
@@ -373,87 +442,23 @@ pub fn recursion_of(plan: &Plan, open_cond: &OpenCondition) -> Option<Recursion>
     }
 
     // The loop region: everything on a causal-link path from the open
-    // condition's step up to a root-link producer.
-    let producers: HashSet<usize> = root_links.iter().map(|link| link.from_id).collect();
-    let mut region: HashSet<usize> = HashSet::new();
-    collect_region(&adjacency, open_cond.step_id, &producers, &mut region);
+    // condition's step up to a root-link producer. Two set operations rather
+    // than a reachability query per candidate step.
+    let reaches_producer = reachable_backward(
+        &index.backward,
+        root_links.iter().map(|link| index.slot(link.from_id)),
+    );
+    let region: HashSet<usize> = chain::iter(&plan.steps)
+        .map(|step| step.id)
+        .chain([INIT_ID, GOAL_ID])
+        .filter(|&id| {
+            let s = index.slot(id);
+            forward.get(s).copied().unwrap_or(false)
+                && reaches_producer.get(s).copied().unwrap_or(false)
+        })
+        .collect();
 
     Some(Recursion { root_links, region })
-}
-
-fn reachable_from(adjacency: &HashMap<usize, Vec<Link>>, start: usize, target: usize) -> bool {
-    if start == target {
-        return true;
-    }
-    let mut seen: HashSet<usize> = HashSet::from([start]);
-    let mut stack = vec![start];
-    while let Some(node) = stack.pop() {
-        let Some(out) = adjacency.get(&node) else {
-            continue;
-        };
-        for link in out {
-            if link.to_id == target {
-                return true;
-            }
-            if seen.insert(link.to_id) {
-                stack.push(link.to_id);
-            }
-        }
-    }
-    false
-}
-
-/// Every step on a causal-link path from `start` to one of `producers`.
-fn collect_region(
-    adjacency: &HashMap<usize, Vec<Link>>,
-    start: usize,
-    producers: &HashSet<usize>,
-    region: &mut HashSet<usize>,
-) {
-    let mut stack = vec![start];
-    let mut seen: HashSet<usize> = HashSet::from([start]);
-    while let Some(node) = stack.pop() {
-        if reachable_to_any(adjacency, node, producers) {
-            region.insert(node);
-        }
-        if producers.contains(&node) {
-            continue;
-        }
-        let Some(out) = adjacency.get(&node) else {
-            continue;
-        };
-        for link in out {
-            if seen.insert(link.to_id) {
-                stack.push(link.to_id);
-            }
-        }
-    }
-}
-
-fn reachable_to_any(
-    adjacency: &HashMap<usize, Vec<Link>>,
-    start: usize,
-    targets: &HashSet<usize>,
-) -> bool {
-    if targets.contains(&start) {
-        return true;
-    }
-    let mut seen: HashSet<usize> = HashSet::from([start]);
-    let mut stack = vec![start];
-    while let Some(node) = stack.pop() {
-        let Some(out) = adjacency.get(&node) else {
-            continue;
-        };
-        for link in out {
-            if targets.contains(&link.to_id) {
-                return true;
-            }
-            if seen.insert(link.to_id) {
-                stack.push(link.to_id);
-            }
-        }
-    }
-    false
 }
 
 /// Whether some step in the plan is a *loop threat* for a recursion —
@@ -464,12 +469,7 @@ fn reachable_to_any(
 /// a plan that had to be kept. Any step with an effect that may clobber the
 /// condition and that is not already ordered after the whole loop therefore
 /// counts.
-fn has_loop_threat(
-    ctx: &SearchContext,
-    plan: &Plan,
-    condition: &Literal,
-    recursion: &Recursion,
-) -> bool {
+fn has_loop_threat(plan: &Plan, condition: &Literal, recursion: &Recursion) -> bool {
     for step in chain::iter(&plan.steps) {
         if recursion.region.contains(&step.id) {
             continue;
@@ -490,7 +490,6 @@ fn has_loop_threat(
                 .possibly_before(step.id, StepTime::AtEnd, link.to_id, StepTime::AtStart)
         });
         if !after_everything {
-            let _ = ctx;
             return true;
         }
     }
@@ -522,16 +521,24 @@ pub fn suspension_of(
     plan: &Plan,
     open_cond: &OpenCondition,
 ) -> Option<Recursion> {
+    suspension_in(ctx, plan, &LinkIndex::build(plan), open_cond)
+}
+
+fn suspension_in(
+    ctx: &SearchContext,
+    plan: &Plan,
+    index: &LinkIndex,
+    open_cond: &OpenCondition,
+) -> Option<Recursion> {
     let condition = open_cond.literal()?;
-    let graph = ctx.operator_graph();
-    if !graph.may_recurse(&condition) {
+    if !ctx.operator_graph().may_recurse(&condition) {
         return None;
     }
-    let recursion = recursion_of(plan, open_cond)?;
+    let recursion = recursion_in(plan, index, open_cond)?;
     if links_out_of_region(plan, &recursion) {
         return None;
     }
-    if has_loop_threat(ctx, plan, &condition, &recursion) {
+    if has_loop_threat(plan, &condition, &recursion) {
         return None;
     }
     Some(recursion)
@@ -539,29 +546,35 @@ pub fn suspension_of(
 
 /// Whether an open condition is a *loop predecessor* of a recursion —
 /// Definition 2: every causal-link path from it to the goal crosses a root link.
-fn is_loop_predecessor(plan: &Plan, open_cond: &OpenCondition, recursion: &Recursion) -> bool {
-    let adjacency = link_adjacency(plan);
+fn is_loop_predecessor(
+    index: &LinkIndex,
+    open_cond: &OpenCondition,
+    recursion: &Recursion,
+) -> bool {
     let roots: HashSet<(usize, usize)> = recursion
         .root_links
         .iter()
         .map(|link| (link.from_id, link.to_id))
         .collect();
-    // Reachability from the open condition's step avoiding the root links.
-    let mut seen: HashSet<usize> = HashSet::from([open_cond.step_id]);
-    let mut stack = vec![open_cond.step_id];
+    let start = index.slot(open_cond.step_id);
+    let mut seen = vec![false; index.forward.len()];
+    if start >= seen.len() {
+        return true;
+    }
+    seen[start] = true;
+    let mut stack = vec![start];
     while let Some(node) = stack.pop() {
-        if node == GOAL_ID {
+        if node == index.goal_slot {
             return false;
         }
-        let Some(out) = adjacency.get(&node) else {
-            continue;
-        };
-        for link in out {
+        for link in index.out(node) {
             if roots.contains(&(link.from_id, link.to_id)) {
                 continue;
             }
-            if seen.insert(link.to_id) {
-                stack.push(link.to_id);
+            let to = index.slot(link.to_id);
+            if to < seen.len() && !seen[to] {
+                seen[to] = true;
+                stack.push(to);
             }
         }
     }
@@ -570,11 +583,26 @@ fn is_loop_predecessor(plan: &Plan, open_cond: &OpenCondition, recursion: &Recur
 
 /// Whether the plan can be discarded by Theorem 1 or Theorem 4.
 pub fn prunable(ctx: &SearchContext, plan: &Plan) -> bool {
-    // Both theorems need a suspended open condition to anchor the recursion,
-    // and Theorem 1 additionally needs every threat resolved.
-    let Some((anchor, recursion)) = chain::iter(&plan.open_conds)
-        .find_map(|oc| suspension_of(ctx, plan, oc).map(|recursion| (oc.clone(), recursion)))
-    else {
+    // Theorem 2's filter, applied before anything is allocated: a recursion
+    // needs a causal-link path to regress through, and an open condition whose
+    // predicate node lies on no cycle can never be recursive. Most plans in
+    // most domains stop here.
+    if plan.num_links == 0 || plan.num_open_conds() == 0 {
+        return false;
+    }
+    let graph = ctx.operator_graph();
+    let any_candidate = chain::iter(&plan.open_conds).any(|oc| {
+        oc.literal()
+            .is_some_and(|literal| graph.may_recurse(&literal))
+    });
+    if !any_candidate {
+        return false;
+    }
+
+    let index = LinkIndex::build(plan);
+    let Some((anchor, recursion)) = chain::iter(&plan.open_conds).find_map(|oc| {
+        suspension_in(ctx, plan, &index, oc).map(|recursion| (oc.clone(), recursion))
+    }) else {
         return false;
     };
 
@@ -583,8 +611,8 @@ pub fn prunable(ctx: &SearchContext, plan: &Plan) -> bool {
     if plan.num_unsafes() == 0 {
         let all_suspended = chain::iter(&plan.open_conds).all(|oc| {
             oc == &anchor
-                || is_loop_predecessor(plan, oc, &recursion)
-                || is_suspended(ctx, plan, oc)
+                || is_loop_predecessor(&index, oc, &recursion)
+                || suspension_in(ctx, plan, &index, oc).is_some()
         });
         if all_suspended {
             return true;

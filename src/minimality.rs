@@ -57,10 +57,15 @@ fn pp_cutset(plan: &Plan, step: usize) -> Vec<Rc<Literal>> {
 }
 
 /// Whether `outer` contains every condition of `inner`, by syntactic equality.
+///
+/// Link conditions are shared `Rc`s, so the pointer check settles most pairs
+/// without touching the atom's term vector.
 fn dominates(outer: &[Rc<Literal>], inner: &[Rc<Literal>]) -> bool {
-    inner
-        .iter()
-        .all(|needed| outer.iter().any(|have| have.as_ref() == needed.as_ref()))
+    inner.iter().all(|needed| {
+        outer
+            .iter()
+            .any(|have| Rc::ptr_eq(have, needed) || have.as_ref() == needed.as_ref())
+    })
 }
 
 /// Whether some step lies strictly between `before` and `after`.
@@ -80,6 +85,10 @@ fn all_open_conditions_precede(plan: &Plan, step: usize, orderings: &BinaryOrder
 }
 
 /// Whether the plan is provably non-minimal and may be discarded.
+///
+/// The np-cutsets are computed once per candidate step rather than once per
+/// pair: the inner loop reruns for every `s″`, and rebuilding a step's
+/// necessarily-spanning set each time was most of the rule's cost.
 pub fn prunable(plan: &Plan) -> bool {
     // Nothing to remove without at least three real steps (two anchors and
     // something between them).
@@ -87,12 +96,12 @@ pub fn prunable(plan: &Plan) -> bool {
         return false;
     }
 
+    let steps: Vec<usize> = chain::iter(&plan.steps).map(|step| step.id).collect();
+    let np: Vec<Vec<Rc<Literal>>> = steps.iter().map(|&step| np_cutset(plan, step)).collect();
+
     // Candidate `s″`: a real step, or the goal step. The initial step is never
     // a candidate — nothing precedes it.
-    let mut candidates: Vec<usize> = chain::iter(&plan.steps).map(|step| step.id).collect();
-    candidates.push(GOAL_ID);
-
-    for &second in &candidates {
+    for &second in steps.iter().chain(std::iter::once(&GOAL_ID)) {
         if !all_open_conditions_precede(plan, second, &plan.orderings) {
             continue;
         }
@@ -102,17 +111,22 @@ pub fn prunable(plan: &Plan) -> bool {
             // the rule fire on plans it has learned nothing about. Decline.
             continue;
         }
-        for first in chain::iter(&plan.steps) {
-            if first.id == second || first.id == INIT_ID {
+        for (position, &first) in steps.iter().enumerate() {
+            if first == second || first == INIT_ID {
                 continue;
             }
-            if !necessarily_before(&plan.orderings, first.id, second) {
+            // Containment is impossible below this size, and the check is a
+            // single comparison against the quadratic scan it guards.
+            if np[position].len() < inner.len() {
                 continue;
             }
-            if !step_strictly_between(plan, first.id, second) {
+            if !necessarily_before(&plan.orderings, first, second) {
                 continue;
             }
-            if dominates(&np_cutset(plan, first.id), &inner) {
+            if !step_strictly_between(plan, first, second) {
+                continue;
+            }
+            if dominates(&np[position], &inner) {
                 return true;
             }
         }

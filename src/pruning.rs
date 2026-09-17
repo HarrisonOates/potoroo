@@ -9,6 +9,14 @@ pub struct PruneOptions {
     /// Cutset mutex pruning: a partial plan whose pre- or post-cutset contains
     /// a mutex pair has no executable completion. See [`crate::cutset`].
     pub cutset: bool,
+    /// e-deletion: extend threats from "deletes the protected fact" to "cannot
+    /// hold beside it", using the same mutexes as `cutset`. See
+    /// [`crate::fdr_pocl`].
+    pub edelete: bool,
+    /// Resolve threats by posting a disjunctive ordering constraint and
+    /// propagating, instead of splitting the plan into a promotion child and a
+    /// demotion child. See [`crate::fdr_pocl`].
+    pub disjunctive: bool,
     /// Operator parameter domains: reject action instances whose arguments lie
     /// outside the constants that can reach that parameter. See
     /// [`crate::param_domains`].
@@ -25,6 +33,8 @@ impl PruneOptions {
     pub fn all() -> Self {
         PruneOptions {
             cutset: true,
+            edelete: true,
+            disjunctive: true,
             params: true,
             recursion: true,
             minimality: true,
@@ -33,12 +43,18 @@ impl PruneOptions {
 
     /// Whether any rule is enabled — lets callers skip per-node setup entirely.
     pub fn any(self) -> bool {
-        self.cutset || self.params || self.recursion || self.minimality
+        self.cutset
+            || self.edelete
+            || self.disjunctive
+            || self.params
+            || self.recursion
+            || self.minimality
     }
 
-    /// Parses a comma-separated rule list: `cutset`, `params`, `recursion`,
-    /// `minimality`, `all`, or `none`. Names are case-insensitive and a leading
-    /// `no-` turns a rule off, so `all,no-minimality` is the three cheap rules.
+    /// Parses a comma-separated rule list: `cutset`, `edelete`, `disjunctive`,
+    /// `params`, `recursion`, `minimality`, `all`, or `none`. Names are
+    /// case-insensitive and a leading `no-` turns a rule off, so
+    /// `all,no-recursion,no-minimality` keeps only the cheap rules.
     pub fn parse(spec: &str) -> Result<Self, String> {
         let mut options = PruneOptions::default();
         for raw in spec.split(',') {
@@ -60,13 +76,15 @@ impl PruneOptions {
                 }
                 "none" => options = PruneOptions::default(),
                 "cutset" => options.cutset = on,
+                "edelete" | "e-deletion" | "edeletion" => options.edelete = on,
+                "disjunctive" | "disjunctions" => options.disjunctive = on,
                 "params" | "parameters" | "param-domains" => options.params = on,
                 "recursion" | "recursive" => options.recursion = on,
                 "minimality" | "minimal" => options.minimality = on,
                 other => {
                     return Err(format!(
-                        "unknown pruning rule `{other}` \
-                         (expected cutset, params, recursion, minimality, all or none)"
+                        "unknown pruning rule `{other}` (expected cutset, edelete, \
+                         disjunctive, params, recursion, minimality, all or none)"
                     ))
                 }
             }
@@ -79,6 +97,12 @@ impl PruneOptions {
         let mut names = Vec::new();
         if self.cutset {
             names.push("cutset");
+        }
+        if self.edelete {
+            names.push("edelete");
+        }
+        if self.disjunctive {
+            names.push("disjunctive");
         }
         if self.params {
             names.push("params");
@@ -114,7 +138,10 @@ mod tests {
     #[test]
     fn all_then_subtract() {
         let options = PruneOptions::parse("all,no-minimality").unwrap();
-        assert_eq!(options.names(), vec!["cutset", "params", "recursion"]);
+        assert_eq!(
+            options.names(),
+            vec!["cutset", "edelete", "disjunctive", "params", "recursion"]
+        );
     }
 
     #[test]

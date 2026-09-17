@@ -275,3 +275,174 @@ fn mutually_exclusive_goals_are_rejected_without_search() {
     let mutexes = FactMutexes::new(&task);
     assert!(goals_inconsistent(&task, &mutexes));
 }
+
+/// e-deletion's productive case in a finite-domain task needs no cross-variable
+/// invariant: a step that *requires* `v = 1` cannot run inside an interval
+/// protecting `v = 0`, even though it assigns nothing to `v`. The classical
+/// threat test — "assigns the protected variable another value" — misses it
+/// entirely.
+#[test]
+fn e_deletion_sees_a_threat_the_classical_test_misses() {
+    use potoroo::fdr::{Effect, Fact, Operator, Task, Variable};
+    use potoroo::fdr_pocl::{solve_with_params, Outcome as FdrOutcome};
+
+    // v0: a switch, values {off, on}. v1: the goal flag, values {no, yes}.
+    // `use_off` needs v0 = off and sets the flag; `peek_on` needs v0 = on and
+    // sets a second flag, touching v0 not at all.
+    let task = Task {
+        variables: vec![
+            Variable {
+                name: "v0".to_string(),
+                values: vec!["off".to_string(), "on".to_string()],
+            },
+            Variable {
+                name: "v1".to_string(),
+                values: vec!["no".to_string(), "yes".to_string()],
+            },
+            Variable {
+                name: "v2".to_string(),
+                values: vec!["no".to_string(), "yes".to_string()],
+            },
+        ],
+        mutex_groups: vec![],
+        initial: vec![0, 0, 0],
+        goals: vec![Fact::new(1, 1), Fact::new(2, 1)],
+        operators: vec![
+            Operator {
+                name: "use_off".to_string(),
+                prevail: vec![Fact::new(0, 0)],
+                effects: vec![Effect {
+                    conditions: vec![],
+                    variable: 1,
+                    pre: None,
+                    post: 1,
+                }],
+                cost: 1,
+            },
+            Operator {
+                name: "peek_on".to_string(),
+                prevail: vec![Fact::new(0, 1)],
+                effects: vec![Effect {
+                    conditions: vec![],
+                    variable: 2,
+                    pre: None,
+                    post: 1,
+                }],
+                cost: 1,
+            },
+            Operator {
+                name: "flip_on".to_string(),
+                prevail: vec![],
+                effects: vec![Effect {
+                    conditions: vec![],
+                    variable: 0,
+                    pre: Some(0),
+                    post: 1,
+                }],
+                cost: 1,
+            },
+        ],
+        axioms: vec![],
+    };
+
+    let configuration = |prune: PruneOptions| Parameters {
+        heuristic: Heuristic::parse("LMCUT").expect("LMCUT is a valid heuristic"),
+        search_limits: vec![20_000],
+        prune,
+        ..Parameters::default()
+    };
+
+    let (baseline, baseline_stats) =
+        solve_with_params(&task, &configuration(PruneOptions::default()))
+            .expect("baseline parameters are supported");
+    let (with_edelete, edelete_stats) = solve_with_params(
+        &task,
+        &configuration(PruneOptions {
+            edelete: true,
+            ..PruneOptions::default()
+        }),
+    )
+    .expect("e-deletion parameters are supported");
+
+    match (baseline, with_edelete) {
+        (FdrOutcome::Solved(a), FdrOutcome::Solved(b)) => {
+            assert_eq!(
+                a.plan.cost(),
+                b.plan.cost(),
+                "e-deletion changed the optimal cost"
+            );
+        }
+        (a, b) => panic!("expected both runs to solve, got {a:?} and {b:?}"),
+    }
+    // `peek_on` requiring v0 = on is a threat to the link protecting v0 = off
+    // for `use_off`, and only e-deletion reports it.
+    assert!(
+        edelete_stats.max_threats > baseline_stats.max_threats,
+        "e-deletion found no extra threats: {} vs {}",
+        edelete_stats.max_threats,
+        baseline_stats.max_threats
+    );
+}
+
+/// Disjunctive threat resolution must leave the optimal plan alone, and must
+/// actually defer some threats rather than quietly unit-propagating every one.
+#[test]
+fn disjunctive_orderings_preserve_optimal_plans_and_defer_threats() {
+    if !fd_available() {
+        eprintln!("skipping: Fast Downward translator not available");
+        return;
+    }
+    use potoroo::fdr_pocl::{solve_with_params, translate, Outcome as FdrOutcome};
+
+    let domain_src = fs::read_to_string("examples/gripper-domain.pddl").expect("read domain");
+    let problem_src = fs::read_to_string("examples/gripper-4.pddl").expect("read problem");
+    let domain = match read_pddl(&domain_src).expect("parse domain") {
+        ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
+        _ => panic!("expected a domain"),
+    };
+    let problem = match read_pddl(&problem_src).expect("parse problem") {
+        ParsedUnit::Problem(p) => lower_problem(&p, &domain).expect("lower problem"),
+        _ => panic!("expected a problem"),
+    };
+    let translate_params = Parameters::default();
+    let ctx = SearchContext::new(&domain, &problem, &translate_params);
+    let task = translate(&ctx).expect("translate to SAS+");
+
+    let configuration = |prune: PruneOptions| Parameters {
+        heuristic: Heuristic::parse("LMCUT").expect("LMCUT is a valid heuristic"),
+        search_limits: vec![40_000],
+        prune,
+        ..Parameters::default()
+    };
+
+    let (baseline, baseline_stats) =
+        solve_with_params(&task, &configuration(PruneOptions::default()))
+            .expect("baseline parameters are supported");
+    let (disjunctive, disjunctive_stats) = solve_with_params(
+        &task,
+        &configuration(PruneOptions {
+            disjunctive: true,
+            ..PruneOptions::default()
+        }),
+    )
+    .expect("disjunctive parameters are supported");
+
+    assert_eq!(
+        baseline_stats.max_disjunctions, 0,
+        "the baseline must post no disjunctions"
+    );
+    assert!(
+        disjunctive_stats.max_disjunctions > 0,
+        "every threat unit-propagated; no disjunction was ever held"
+    );
+    match (baseline, disjunctive) {
+        (FdrOutcome::Solved(a), FdrOutcome::Solved(b)) => {
+            assert_eq!(
+                a.plan.cost(),
+                b.plan.cost(),
+                "disjunctive threat resolution changed the optimal cost"
+            );
+        }
+        (a, b) => panic!("expected both runs to solve, got {a:?} and {b:?}"),
+    }
+}
