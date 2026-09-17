@@ -92,6 +92,9 @@ pub struct SearchContext<'a> {
     operator_graph: RefCell<Option<Rc<crate::opgraph::OperatorGraph>>>,
     /// The task's lifted landmarks, extracted on first use by `-h LM`.
     landmarks: RefCell<Option<Rc<crate::landmarks::LiftedLandmarks>>>,
+    /// Landmarks extracted with the FAM cuts as well, cached apart because the
+    /// two extractions produce different landmark sets.
+    landmarks_fam: RefCell<Option<Rc<crate::landmarks::LiftedLandmarks>>>,
     /// Lifted mutex groups, synthesised on first use when `-p cutset` is on.
     /// See [`crate::lifted_mutex`].
     lifted_mutexes: RefCell<Option<Rc<crate::lifted_mutex::LiftedMutexes>>>,
@@ -169,6 +172,7 @@ impl<'a> SearchContext<'a> {
             operator_graph: RefCell::new(None),
             lifted_mutexes: RefCell::new(None),
             landmarks: RefCell::new(None),
+            landmarks_fam: RefCell::new(None),
         };
         ctx.step_var_types
             .borrow_mut()
@@ -452,13 +456,29 @@ impl<'a> SearchContext<'a> {
         self.param_domains.borrow().clone().unwrap()
     }
 
-    /// The task's lifted landmarks, extracted once per search.
-    pub fn landmarks(&self) -> Rc<crate::landmarks::LiftedLandmarks> {
-        if self.landmarks.borrow().is_none() {
-            let extracted = crate::landmarks::LiftedLandmarks::extract(self.domain, self.problem);
-            *self.landmarks.borrow_mut() = Some(Rc::new(extracted));
+    /// The task's lifted landmarks, extracted once per search. `fam` also cuts
+    /// the mutex groups' transition graphs, which needs those groups and so
+    /// costs a synthesis on top of the backchaining.
+    pub fn landmarks(&self, fam: bool) -> Rc<crate::landmarks::LiftedLandmarks> {
+        let cache = if fam {
+            &self.landmarks_fam
+        } else {
+            &self.landmarks
+        };
+        if cache.borrow().is_none() {
+            let extracted = if fam {
+                let mutexes = self.lifted_mutexes();
+                crate::landmarks::LiftedLandmarks::extract_with_mutexes(
+                    self.domain,
+                    self.problem,
+                    &mutexes,
+                )
+            } else {
+                crate::landmarks::LiftedLandmarks::extract(self.domain, self.problem)
+            };
+            *cache.borrow_mut() = Some(Rc::new(extracted));
         }
-        self.landmarks.borrow().clone().unwrap()
+        cache.borrow().clone().unwrap()
     }
 
     /// The domain's lifted mutex groups, synthesised once per search.

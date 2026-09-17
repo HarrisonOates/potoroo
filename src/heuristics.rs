@@ -34,7 +34,16 @@ pub(crate) enum HVal {
     /// Lifted landmark count: how many of the task's lifted landmarks no step
     /// of the partial plan achieves. Not a delete relaxation, and it needs no
     /// grounding. See [`crate::landmarks`].
-    Landmarks,
+    ///
+    /// `fam` adds the FAM-cut landmarks ([`crate::fam_cut`]) to the ones
+    /// backchaining over necessary subgoals finds; `orderings` counts a
+    /// landmark whose predecessor is still outstanding even when the plan
+    /// already achieves some instance of it. The four combinations are the
+    /// paper's `h^LNS`, `h^LNS→`, `h^LFAM` and `h^LFAM→`.
+    Landmarks {
+        fam: bool,
+        orderings: bool,
+    },
     /// Native LM-cut over the FDR POCL open-condition relaxation. `LmCut`
     /// starts from the problem initial state; `LmCutR` also treats effects of
     /// committed steps as initially available. FDR POCL search only.
@@ -133,7 +142,22 @@ impl Heuristic {
                 "BUC" => HVal::Buc,
                 "S+OC" => HVal::SPlusOc,
                 "UCPOP" => HVal::Ucpop,
-                "LM" | "LANDMARKS" => HVal::Landmarks,
+                "LM" | "LANDMARKS" => HVal::Landmarks {
+                    fam: false,
+                    orderings: false,
+                },
+                "LMO" => HVal::Landmarks {
+                    fam: false,
+                    orderings: true,
+                },
+                "LMF" => HVal::Landmarks {
+                    fam: true,
+                    orderings: false,
+                },
+                "LMFO" => HVal::Landmarks {
+                    fam: true,
+                    orderings: true,
+                },
                 "ADD" => {
                     needs_pg = true;
                     HVal::Add
@@ -392,8 +416,8 @@ impl Heuristic {
                         }
                     }
                 }
-                HVal::Landmarks => {
-                    let v = search_ctx.landmarks().outstanding(plan) as f32;
+                HVal::Landmarks { fam, orderings } => {
+                    let v = search_ctx.landmarks(fam).count(plan, orderings) as f32;
                     rank.push(g + weight * v);
                     grank.push(weight * v);
                 }

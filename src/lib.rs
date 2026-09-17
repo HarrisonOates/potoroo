@@ -19,6 +19,7 @@ pub mod domain;
 pub mod effect;
 pub mod expressions;
 pub mod external;
+pub mod fam_cut;
 pub mod fasthash;
 pub mod fdr;
 pub mod fdr_pocl;

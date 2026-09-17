@@ -7,12 +7,15 @@
 //! Only unconditional, unquantified positive effects establish landmarks;
 //! multiple occurrences must agree at every retained argument position.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
 use crate::domain::Domain;
+use crate::fam_cut::{self, ActionInstance, DisjunctiveActionLandmark};
 use crate::formula::{Atom, Formula, Literal};
+use crate::lifted_mutex::LiftedMutexes;
 use crate::predicates::Predicate;
 use crate::problem::Problem;
 use crate::terms::{Object, Term, Variable};
@@ -74,6 +77,15 @@ impl PartialAtom {
 #[derive(Debug, Default)]
 pub struct LiftedLandmarks {
     landmarks: Vec<PartialAtom>,
+    /// `(before, after)` index pairs into `landmarks`: `before` →D `after`, the
+    /// direct ordering backchaining hands out as a side effect (§3.3).
+    orderings: Vec<(usize, usize)>,
+    /// Disjunctive action landmarks from the FAM cuts, empty unless extraction
+    /// was given the mutex groups.
+    actions: Vec<DisjunctiveActionLandmark>,
+    /// `(before, after)` index pairs into `actions`: the weaker → ordering
+    /// between successive cuts of one group instance.
+    action_orderings: Vec<(usize, usize)>,
 }
 
 impl LiftedLandmarks {
@@ -81,23 +93,53 @@ impl LiftedLandmarks {
         &self.landmarks
     }
 
+    /// The disjunctive action landmarks, one entry per cut.
+    pub fn actions(&self) -> &[DisjunctiveActionLandmark] {
+        &self.actions
+    }
+
+    /// The →D orderings between fact landmarks, as index pairs.
+    pub fn orderings(&self) -> &[(usize, usize)] {
+        &self.orderings
+    }
+
     pub fn len(&self) -> usize {
         self.landmarks.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.landmarks.is_empty()
+        self.landmarks.is_empty() && self.actions.is_empty()
     }
 
-    /// Backchains from the goal to a fixpoint.
+    /// Backchains from the goal to a fixpoint over necessary subgoals alone.
     pub fn extract(domain: &Domain, problem: &Problem) -> Self {
-        let mut seeds = Vec::new();
-        collect_entailed_atoms(&problem.goal, &mut seeds);
+        Self::extract_with(domain, problem, None)
+    }
 
-        let mut found: Vec<PartialAtom> = Vec::new();
-        let mut seen: HashSet<PartialAtom> = HashSet::new();
-        let mut frontier: Vec<PartialAtom> = Vec::new();
-        for atom in seeds {
+    /// Backchains as [`Self::extract`] does, and additionally cuts the
+    /// transition graph of every landmark's mutex group ([`crate::fam_cut`]).
+    pub fn extract_with_mutexes(
+        domain: &Domain,
+        problem: &Problem,
+        mutexes: &LiftedMutexes,
+    ) -> Self {
+        Self::extract_with(domain, problem, Some(mutexes))
+    }
+
+    /// The two extraction methods run together, because each feeds the other:
+    /// backchaining turns a fact landmark into more fact landmarks, and a FAM
+    /// cut turns one into a disjunctive action landmark whose shared
+    /// preconditions are fact landmarks again. The paper runs this to a
+    /// fixpoint; the round and size budgets stop it earlier on tasks where it
+    /// would not converge cheaply.
+    fn extract_with(domain: &Domain, problem: &Problem, mutexes: Option<&LiftedMutexes>) -> Self {
+        let mut goals = Vec::new();
+        collect_entailed_atoms(&problem.goal, &mut goals);
+
+        let mut out = LiftedLandmarks::default();
+        let mut seen: HashMap<PartialAtom, usize> = HashMap::new();
+        let mut frontier: Vec<usize> = Vec::new();
+        for atom in goals {
             let landmark = PartialAtom {
                 predicate: atom.predicate,
                 args: atom
@@ -109,34 +151,83 @@ impl LiftedLandmarks {
                     })
                     .collect(),
             };
-            if seen.insert(landmark.clone()) {
-                found.push(landmark.clone());
-                frontier.push(landmark);
+            if let Entry::Vacant(slot) = seen.entry(landmark.clone()) {
+                slot.insert(out.landmarks.len());
+                out.landmarks.push(landmark);
+                frontier.push(out.landmarks.len() - 1);
             }
         }
 
         let schemas: Vec<SchemaFacts> = domain.actions.iter().map(SchemaFacts::new).collect();
 
         for _ in 0..MAX_ROUNDS {
-            if frontier.is_empty() || found.len() >= MAX_LANDMARKS {
+            if frontier.is_empty() || out.landmarks.len() >= MAX_LANDMARKS {
                 break;
             }
             let mut next = Vec::new();
-            for subgoal in &frontier {
-                for candidate in necessary_subgoals(subgoal, &schemas) {
-                    if found.len() >= MAX_LANDMARKS {
-                        break;
+            for index in frontier {
+                let subgoal = out.landmarks[index].clone();
+
+                // Backchaining: every new subgoal is ordered directly before
+                // the landmark it was extracted from.
+                for candidate in necessary_subgoals(&subgoal, &schemas) {
+                    if let Some(found) = out.admit(candidate, &mut seen, &mut next) {
+                        out.orderings.push((found, index));
                     }
-                    if seen.insert(candidate.clone()) {
-                        found.push(candidate.clone());
-                        next.push(candidate);
+                }
+
+                let Some(mutexes) = mutexes else { continue };
+                if out.actions.len() >= MAX_LANDMARKS {
+                    continue;
+                }
+                // FAM cuts: the cuts come back goal-end first, so consecutive
+                // pairs are ordered later-cut after earlier-cut.
+                let mut previous: Option<usize> = None;
+                for cut in fam_cut::cuts(domain, problem, mutexes, &subgoal) {
+                    for candidate in shared_preconditions(domain, &schemas, &cut) {
+                        out.admit(candidate, &mut seen, &mut next);
                     }
+                    let here = match out.actions.iter().position(|known| *known == cut) {
+                        Some(known) => known,
+                        None => {
+                            out.actions.push(cut);
+                            out.actions.len() - 1
+                        }
+                    };
+                    if let Some(earlier) = previous {
+                        // `here` is the earlier cut in plan order: the cut
+                        // sequence walks backwards from the goal.
+                        out.action_orderings.push((here, earlier));
+                    }
+                    previous = Some(here);
                 }
             }
             frontier = next;
         }
 
-        LiftedLandmarks { landmarks: found }
+        out
+    }
+
+    /// Records a new landmark, returning its index when it was not already
+    /// known. Dropping a landmark at the budget weakens the heuristic and never
+    /// makes it claim more.
+    fn admit(
+        &mut self,
+        candidate: PartialAtom,
+        seen: &mut HashMap<PartialAtom, usize>,
+        next: &mut Vec<usize>,
+    ) -> Option<usize> {
+        if let Some(known) = seen.get(&candidate) {
+            return Some(*known);
+        }
+        if self.landmarks.len() >= MAX_LANDMARKS {
+            return None;
+        }
+        let index = self.landmarks.len();
+        seen.insert(candidate.clone(), index);
+        self.landmarks.push(candidate);
+        next.push(index);
+        Some(index)
     }
 }
 
@@ -155,10 +246,36 @@ impl LiftedLandmarks {
     /// counts. The estimate is therefore a lower bound on the landmarks a
     /// completion must still achieve, never an over-count.
     pub fn outstanding(&self, plan: &crate::plan::Plan) -> usize {
-        self.landmarks
+        self.count(plan, false)
+    }
+
+    /// The landmark count, optionally sharpened by the ordering relations.
+    ///
+    /// Without orderings this is the plain count of landmarks — fact landmarks
+    /// and FAM cuts alike — that nothing in the plan achieves.
+    ///
+    /// With orderings it applies §3.3's rule. A lifted landmark is a
+    /// disjunction, so a plan may well contain a step producing *some* instance
+    /// of `P` without producing the instance the goal needs. When `Q` →D `P`
+    /// and nothing achieves `Q`, the instance of `P` that the plan will
+    /// eventually use has not been produced either, so `P` still counts. The
+    /// same propagation runs over the weaker → between successive cuts.
+    pub fn count(&self, plan: &crate::plan::Plan, orderings: bool) -> usize {
+        let mut facts: Vec<bool> = self
+            .landmarks
             .iter()
-            .filter(|landmark| !self.achieved(landmark, plan))
-            .count()
+            .map(|landmark| !self.achieved(landmark, plan))
+            .collect();
+        let mut actions: Vec<bool> = self
+            .actions
+            .iter()
+            .map(|landmark| !achieved_action(landmark, plan))
+            .collect();
+        if orderings {
+            propagate(&self.orderings, &mut facts);
+            propagate(&self.action_orderings, &mut actions);
+        }
+        facts.iter().filter(|open| **open).count() + actions.iter().filter(|open| **open).count()
     }
 
     fn achieved(&self, landmark: &PartialAtom, plan: &crate::plan::Plan) -> bool {
@@ -179,6 +296,96 @@ impl LiftedLandmarks {
         }
         false
     }
+}
+
+/// Carries "still outstanding" forward along an ordering: when the earlier
+/// landmark is open, so is the later one.
+fn propagate(orderings: &[(usize, usize)], open: &mut [bool]) {
+    for _ in 0..orderings.len() {
+        let mut changed = false;
+        for &(before, after) in orderings {
+            if open[before] && !open[after] {
+                open[after] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Whether some step of the plan could be one of a disjunctive action
+/// landmark's alternatives.
+///
+/// Optimistic in the same way as [`PartialAtom::could_match`]: a step whose
+/// argument is still unbound might yet be bound to what the landmark wants, so
+/// it counts as achieving it.
+fn achieved_action(landmark: &DisjunctiveActionLandmark, plan: &crate::plan::Plan) -> bool {
+    crate::chain::iter(&plan.steps).any(|step| {
+        landmark
+            .alternatives
+            .iter()
+            .any(|alternative| matches_step(alternative, step, plan))
+    })
+}
+
+fn matches_step(
+    alternative: &ActionInstance,
+    step: &crate::plan::Step,
+    plan: &crate::plan::Plan,
+) -> bool {
+    if step.action.name != alternative.name {
+        return false;
+    }
+    let ground = &step.action.arguments;
+    let lifted = &step.action.parameters;
+    alternative
+        .args
+        .iter()
+        .enumerate()
+        .all(|(position, wanted)| {
+            let Some(wanted) = wanted else { return true };
+            if let Some(object) = ground.get(position) {
+                return object == wanted;
+            }
+            match lifted.get(position) {
+                Some(variable) => match plan.bindings.binding(Term::Variable(*variable), step.id) {
+                    Term::Object(object) => object == *wanted,
+                    Term::Variable(_) => true,
+                },
+                None => true,
+            }
+        })
+}
+
+/// The fact landmarks a disjunctive action landmark yields: predicates every
+/// alternative requires, pinned wherever the alternatives agree. The same
+/// intersection backchaining uses, over a set of actions the cut chose rather
+/// than over the actions that could add a subgoal.
+fn shared_preconditions(
+    domain: &Domain,
+    schemas: &[SchemaFacts],
+    cut: &DisjunctiveActionLandmark,
+) -> Vec<PartialAtom> {
+    let candidates: Vec<Vec<Atom>> = cut
+        .alternatives
+        .iter()
+        .map(|alternative| {
+            let binding: Vec<(Variable, Object)> = domain.actions[alternative.schema]
+                .parameters
+                .iter()
+                .zip(&alternative.args)
+                .filter_map(|(variable, object)| object.map(|object| (*variable, object)))
+                .collect();
+            schemas[alternative.schema]
+                .required
+                .iter()
+                .map(|atom| apply(atom, &binding))
+                .collect()
+        })
+        .collect();
+    intersect(&candidates)
 }
 
 /// One schema, reduced to what backchaining reads.
@@ -231,7 +438,20 @@ fn necessary_subgoals(subgoal: &PartialAtom, schemas: &[SchemaFacts]) -> Vec<Par
     if candidates.is_empty() {
         return Vec::new();
     }
+    intersect(&candidates)
+}
 
+/// The partially ground atoms a set of requirement lists all share: a predicate
+/// every list mentions, with an object at each position on which every
+/// occurrence in every list agrees.
+///
+/// This is what keeps a lifted landmark sound where the candidates disagree —
+/// disagreement widens the landmark into the disjunction over that position
+/// rather than committing to one candidate's choice.
+fn intersect(candidates: &[Vec<Atom>]) -> Vec<PartialAtom> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     // Predicates every candidate requires.
     let mut shared: Vec<Predicate> = candidates[0]
         .iter()
@@ -251,7 +471,7 @@ fn necessary_subgoals(subgoal: &PartialAtom, schemas: &[SchemaFacts]) -> Vec<Par
         .into_iter()
         .filter_map(|predicate| {
             let mut args: Option<Vec<Option<Object>>> = None;
-            for required in &candidates {
+            for required in candidates {
                 for atom in required.iter().filter(|atom| atom.predicate == predicate) {
                     let here: Vec<Option<Object>> = atom
                         .terms

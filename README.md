@@ -315,15 +315,51 @@ Not a delete relaxation, and it needs no grounding.
 | Name | Description |
 |------|-------------|
 | `LM` | Count of the task's **lifted landmarks** that no step of the partial plan achieves. |
+| `LMO` | `LM`, with the landmark **ordering** relations applied to the count. |
+| `LMF` | `LM`, plus the **FAM-cut** landmarks. |
+| `LMFO` | Both. |
 
 A *lifted landmark* is a partially grounded predicate `P(u₁, …, u_k)` some
 ground instance of which must hold in every plan (Wichlacz, Höller & Hoffmann,
 IJCAI 2022, Def. 1). `in(o, ·)` says the package must at some point be inside
 *something* — one compact statement standing for the disjunction over every
-vehicle. Extraction backchains from the goal over **necessary subgoals**: take
-every schema that adds the subgoal, partially ground each just enough to produce
-it, and intersect their preconditions by predicate, pinning only the arguments
-every candidate agrees on.
+vehicle.
+
+Two extraction methods run together, each feeding the other.
+
+**Necessary subgoals** (§3.1) backchain from the goal: take every schema that
+adds the subgoal, partially ground each just enough to produce it, and intersect
+their preconditions by predicate, pinning only the arguments every candidate
+agrees on.
+
+**FAM cuts** (§3.2) use the lifted mutex groups instead. A group with its
+invariant parameters pinned is a variable: at most one of its atoms holds at a
+time. Take a known fact landmark, find that variable's value in the initial
+state, and build the graph of transitions between the two — the actions that
+both delete and add an atom of the group. Every set of edges whose removal
+disconnects the initial value from the landmark is a **disjunctive action
+landmark**: every plan runs one of those actions. Intersecting *their*
+preconditions yields fact landmarks again, and the process repeats.
+
+What the cuts buy is precision backchaining cannot reach, because it reasons one
+predicate at a time and never sees where a value started:
+
+| | necessary subgoals | with FAM cuts |
+|---|---|---|
+| `test-ferry` | `at-ferry(·)`, `at(c1, ·)`, … | `board(c1, a)`, `debark(c1, ·)`, `sail(a, ·)` |
+| `gripper-4` | `carry(·, ·)`, `at(ball1, ·)`, … | `pick(ball1, rooma, ·)`, `drop(ball1, ·, ·)` |
+| `fixit` | … | `loosen(nuts, hub)`, `undo(nuts, hub)`, `remove-wheel(wheel1, hub)` |
+
+`board(c1, a)` pins the location: car `c1` must board *at `a`*, which is where
+it starts. No intersection of preconditions can say that.
+
+The **orderings** come out of both methods as a side effect (§3.3): `→D`
+between a necessary subgoal and the landmark it was extracted from, and the
+weaker `→` between successive cuts of one group instance. A lifted landmark is
+a disjunction, so a plan may contain a step producing *some* instance of `P`
+without producing the one the goal needs; when `Q` →D `P` and nothing achieves
+`Q`, the instance of `P` the plan will use has not been produced either, so `P`
+still counts.
 
 The plan-space reading of LAMA's landmark count is direct: where a state has
 "accepted" a landmark, a partial plan *contains a step that produces it*, and
@@ -343,6 +379,16 @@ It is not better than `ADD` in general — and that is not the point. It is
 half of complementarity: as a tiebreaker behind `ADD`, landmarks more than halve
 the search `ADD` needs alone. Where `ADD` is already strong, `LM` on its own is
 weaker — so compose rather than substitute.
+
+One caveat on the cuts. They are as precise as the domain's typing lets them be:
+in an untyped domain such as `logistics-strips`, `at(?x, ?l)` ranges over
+packages, trucks and planes alike, so the graph admits `fly(package1, …)` as a
+transition and the cut degenerates to "some `unload` or `fly` or `drive`". The
+alternatives are sound, just weak. Static-predicate filtering would fix it and
+is not implemented.
+
+`scripts/lm_sweep.sh` runs a coverage sweep of these configurations over a
+benchmark corpus; see [Landmark sweep](#landmark-sweep).
 
 This is the line the HSDIP position paper points at. Its finding is that
 conceptually different delete-relaxation approaches fail for POCL in the same
@@ -693,6 +739,31 @@ them, enabling one is a deliberate act rather than a silent default.
 
 `tests/pruning.rs` pins both halves of that claim: the rules leave the plans
 found on the example suite unchanged, and each rule is shown to actually fire.
+
+## Landmark sweep
+
+`scripts/lm_sweep.sh` compares planner configurations for **coverage** over a
+benchmark corpus, one directory per domain family — [downward-benchmarks] by
+default:
+
+```
+scripts/lm_sweep.sh -b ../downward-benchmarks \
+                    -c ADD,RELAX,LM,LMO,LMF,LMFO,ADD/LMF \
+                    -t 20 -n 3 -j 6 -m 2560 -o sweep-results.csv
+```
+
+It takes the `-n` smallest problems of each family, runs every configuration on
+each under a wall timeout (`-t`) and an address-space cap (`-m` MB, so a run
+that blows up is recorded as unsolved instead of taking the machine with it),
+and writes one CSV row per `(family, problem, configuration)` with coverage,
+plan cost, nodes generated and wall time. `scripts/lm_sweep.py` tabulates it:
+coverage per configuration, the families where the configurations disagree, and
+what each configuration uniquely solves.
+
+The nine example problems under `examples/` are not a coverage claim; this is
+what to run before making one.
+
+[downward-benchmarks]: https://github.com/aibasel/downward-benchmarks
 
 ---
 

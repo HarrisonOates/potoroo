@@ -30,7 +30,7 @@ const MAX_CANDIDATES: usize = 4_000;
 
 /// What one argument position of a part holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Slot {
+pub(crate) enum Slot {
     /// An invariant parameter, shared across the group's parts.
     Param(usize),
     /// A fixed object.
@@ -46,6 +46,16 @@ pub struct Part {
     slots: Vec<Slot>,
 }
 
+impl Part {
+    pub(crate) fn predicate(&self) -> Predicate {
+        self.predicate
+    }
+
+    pub(crate) fn slots(&self) -> &[Slot] {
+        &self.slots
+    }
+}
+
 /// A set of lifted atoms of which at most one holds, per assignment of the
 /// invariant parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +65,16 @@ pub struct MutexGroup {
 }
 
 impl MutexGroup {
+    /// How many invariant parameters the group is indexed by.
+    pub(crate) fn arity(&self) -> usize {
+        self.arity
+    }
+
+    /// The group's lifted atoms.
+    pub(crate) fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
     /// Number of lifted atoms in the group.
     pub fn len(&self) -> usize {
         self.parts.len()

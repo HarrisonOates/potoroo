@@ -870,7 +870,7 @@ impl<'a> Planner<'a> {
                         return Err(Error::Unsupported(error.to_string()));
                     }
                 }
-                HVal::Landmarks
+                HVal::Landmarks { .. }
                 | HVal::SampleFf(_)
                 | HVal::Lplan(_)
                 | HVal::Lpsas(_)
@@ -1884,7 +1884,7 @@ impl<'a> Planner<'a> {
                     rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
-                HVal::Landmarks
+                HVal::Landmarks { .. }
                 | HVal::SampleFf(_)
                 | HVal::Lplan(_)
                 | HVal::Lpsas(_)
