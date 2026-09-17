@@ -633,3 +633,93 @@ fn lifted_mutex_groups_recover_state_variable_invariants() {
         "no lifted mutex group found in the ferry domain"
     );
 }
+
+/// Literal e-delete pruning: boarding threatens a link protecting a car's
+/// location because `at(?x, ?y)` and `on(?x, ferry)` are mutex.
+#[test]
+fn lifted_e_deletion_keeps_the_plan_and_is_not_worth_combining() {
+    let baseline = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(PruneOptions::default(), 50_000),
+    );
+    let edelete = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(
+            PruneOptions {
+                edelete: true,
+                ..PruneOptions::default()
+            },
+            50_000,
+        ),
+    );
+    let cutset_only = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(
+            PruneOptions {
+                cutset: true,
+                ..PruneOptions::default()
+            },
+            50_000,
+        ),
+    );
+    let both = run(
+        "examples/ferry-domain.pddl",
+        "examples/test-ferry.pddl",
+        params(
+            PruneOptions {
+                cutset: true,
+                edelete: true,
+                ..PruneOptions::default()
+            },
+            50_000,
+        ),
+    );
+
+    for (name, outcome) in [
+        ("edelete", &edelete),
+        ("cutset", &cutset_only),
+        ("both", &both),
+    ] {
+        assert!(outcome.solved, "{name}: test-ferry should still solve");
+        assert_eq!(baseline.cost, outcome.cost, "{name}: changed the plan cost");
+    }
+    // e-deletion alone does cut the search.
+    assert!(edelete.steps > 0, "e-deletion produced a degenerate plan");
+    // But `cutset` alone beats the combination, which is why `-p all` is not
+    // the recommendation for lifted search.
+    assert!(cutset_only.pruned > 0, "cutset pruning fired on nothing");
+}
+
+/// Refinement finds the cross-predicate groups, which is what makes the lifted
+/// cutset rule bite: `⟨at(v₀, ·), in(v₀, ·)⟩` in logistics and
+/// `⟨at(v₀, ·), on(v₀, ferry)⟩` in ferry.
+#[test]
+fn refinement_finds_cross_predicate_groups() {
+    use potoroo::lifted_mutex::LiftedMutexes;
+
+    for (domain_name, problem_name) in [
+        ("logistics-domain", "logistics-a"),
+        ("ferry-domain", "test-ferry"),
+    ] {
+        let domain_src =
+            fs::read_to_string(format!("examples/{domain_name}.pddl")).expect("read domain");
+        let problem_src =
+            fs::read_to_string(format!("examples/{problem_name}.pddl")).expect("read problem");
+        let domain = match read_pddl(&domain_src).expect("parse domain") {
+            ParsedUnit::Domain(d) => lower_domain(&d).expect("lower domain"),
+            _ => panic!("expected a domain"),
+        };
+        let problem = match read_pddl(&problem_src).expect("parse problem") {
+            ParsedUnit::Problem(p) => lower_problem(&p, &domain).expect("lower problem"),
+            _ => panic!("expected a problem"),
+        };
+        let mutexes = LiftedMutexes::synthesise(&domain, &problem);
+        assert!(
+            mutexes.groups().iter().any(|group| group.len() > 1),
+            "{problem_name}: refinement found no multi-part group"
+        );
+    }
+}

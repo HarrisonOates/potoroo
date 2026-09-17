@@ -10,110 +10,210 @@
 //! preconditions. Candidate and group-size limits safely weaken pruning
 //! by omitting groups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
 use crate::domain::Domain;
-use crate::effect::Effect;
 use crate::formula::{Atom, Formula, Literal};
 use crate::predicates::Predicate;
 use crate::problem::Problem;
-use crate::terms::Term;
+use crate::terms::{Object, Term};
 
-/// A predicate with one counted argument position: for each assignment of the
-/// other positions, at most one instance holds in any reachable state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LiftedMutexGroup {
-    pub predicate: Predicate,
-    pub counted: usize,
+/// Most parts one group may grow to. Three covers the published invariants
+/// (`at`/`in`, `at`/`on`); beyond that the candidate space grows faster than
+/// the groups justify.
+const MAX_PARTS: usize = 3;
+
+/// Most candidates the refinement loop will test, over the whole synthesis.
+const MAX_CANDIDATES: usize = 4_000;
+
+/// What one argument position of a part holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Slot {
+    /// An invariant parameter, shared across the group's parts.
+    Param(usize),
+    /// A fixed object.
+    Const(Object),
+    /// Unconstrained: a position the group counts over.
+    Counted,
+}
+
+/// One lifted atom of a group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Part {
+    predicate: Predicate,
+    slots: Vec<Slot>,
+}
+
+/// A set of lifted atoms of which at most one holds, per assignment of the
+/// invariant parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutexGroup {
+    arity: usize,
+    parts: Vec<Part>,
+}
+
+impl MutexGroup {
+    /// Number of lifted atoms in the group.
+    pub fn len(&self) -> usize {
+        self.parts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    /// The predicates the group covers, sorted, for tests and reporting.
+    pub fn predicates(&self) -> Vec<Predicate> {
+        let mut seen: Vec<Predicate> = self.parts.iter().map(|part| part.predicate).collect();
+        seen.sort_by_key(|predicate| predicate.0);
+        seen.dedup();
+        seen
+    }
+
+    /// A canonical key for deduplicating candidates.
+    fn key(&self) -> (usize, Vec<Part>) {
+        let mut parts = self.parts.clone();
+        parts.sort();
+        (self.arity, parts)
+    }
 }
 
 /// The lifted mutex groups of a domain and problem.
 #[derive(Debug, Default)]
 pub struct LiftedMutexes {
-    /// Counted positions per predicate. A predicate with no valid candidate is
-    /// absent, so the common case is one lookup that misses.
-    by_predicate: HashMap<Predicate, Vec<usize>>,
-    groups: Vec<LiftedMutexGroup>,
+    groups: Vec<MutexGroup>,
+    /// `(group index, part index)` pairs per predicate, so a query only looks at
+    /// groups that could cover the atom.
+    by_predicate: HashMap<Predicate, Vec<(usize, usize)>>,
 }
 
 impl LiftedMutexes {
-    /// Synthesises every single-predicate group the schemas and initial state
-    /// admit.
+    /// Synthesises the groups the schemas and initial state admit.
     pub fn synthesise(domain: &Domain, problem: &Problem) -> Self {
-        let mut groups = Vec::new();
-        let mut by_predicate: HashMap<Predicate, Vec<usize>> = HashMap::new();
+        let schemas: Vec<SchemaFacts> = domain.actions.iter().map(SchemaFacts::new).collect();
 
+        let mut queue: VecDeque<MutexGroup> = VecDeque::new();
+        let mut seen: HashSet<(usize, Vec<Part>)> = HashSet::new();
         for index in 0..domain.predicates.len() {
             let predicate = Predicate(index as u32);
             let arity = domain.predicates.parameters(predicate).len();
             for counted in 0..arity {
-                let candidate = LiftedMutexGroup { predicate, counted };
-                if !initially_true(candidate, problem) {
-                    continue;
+                let mut slots = Vec::with_capacity(arity);
+                let mut next_param = 0;
+                for position in 0..arity {
+                    if position == counted {
+                        slots.push(Slot::Counted);
+                    } else {
+                        slots.push(Slot::Param(next_param));
+                        next_param += 1;
+                    }
                 }
-                if !domain
-                    .actions
-                    .iter()
-                    .all(|schema| preserved_by(candidate, schema))
-                {
-                    continue;
+                let candidate = MutexGroup {
+                    arity: next_param,
+                    parts: vec![Part { predicate, slots }],
+                };
+                if seen.insert(candidate.key()) {
+                    queue.push_back(candidate);
                 }
-                groups.push(candidate);
-                by_predicate.entry(predicate).or_default().push(counted);
+            }
+        }
+
+        let mut groups: Vec<MutexGroup> = Vec::new();
+        let mut tested = 0usize;
+        while let Some(candidate) = queue.pop_front() {
+            tested += 1;
+            if tested > MAX_CANDIDATES {
+                break;
+            }
+            if !initially_true(&candidate, problem) {
+                continue;
+            }
+            match balance(&candidate, &schemas) {
+                Balance::Preserved => groups.push(candidate),
+                Balance::Rejected => {}
+                Balance::Unbalanced { refinements } => {
+                    if candidate.parts.len() >= MAX_PARTS {
+                        continue;
+                    }
+                    for part in refinements {
+                        if candidate.parts.contains(&part) {
+                            continue;
+                        }
+                        let mut refined = candidate.clone();
+                        refined.parts.push(part);
+                        if seen.insert(refined.key()) {
+                            queue.push_back(refined);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Smallest first: a query that succeeds tends to succeed on the
+        // cheapest group.
+        groups.sort_by_key(MutexGroup::len);
+
+        let mut by_predicate: HashMap<Predicate, Vec<(usize, usize)>> = HashMap::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            for (part_index, part) in group.parts.iter().enumerate() {
+                by_predicate
+                    .entry(part.predicate)
+                    .or_default()
+                    .push((group_index, part_index));
             }
         }
 
         LiftedMutexes {
-            by_predicate,
             groups,
+            by_predicate,
         }
     }
 
     /// Every group found, for tests and reporting.
-    pub fn groups(&self) -> &[LiftedMutexGroup] {
+    pub fn groups(&self) -> &[MutexGroup] {
         &self.groups
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
     }
 
     /// Whether two atoms can never hold in the same reachable state.
     ///
-    /// Both must be ground at every position the comparison reads; a term still
+    /// Both must be ground where the comparison reads them; a term still
     /// carrying a variable makes the answer "not known to be mutex", which is
     /// the safe direction.
     pub fn mutex(&self, left: &Atom, right: &Atom) -> bool {
-        if left.predicate != right.predicate || left.terms.len() != right.terms.len() {
+        if left == right {
             return false;
         }
-        let Some(counted_positions) = self.by_predicate.get(&left.predicate) else {
+        let (Some(left_parts), Some(right_parts)) = (
+            self.by_predicate.get(&left.predicate),
+            self.by_predicate.get(&right.predicate),
+        ) else {
             return false;
         };
-        counted_positions.iter().any(|&counted| {
-            // Differ where the group counts...
-            let differs = match (left.terms.get(counted), right.terms.get(counted)) {
-                (Some(Term::Object(a)), Some(Term::Object(b))) => a != b,
-                _ => false,
-            };
-            if !differs {
-                return false;
+        for &(group_index, left_part) in left_parts {
+            for &(other_group, right_part) in right_parts {
+                if other_group != group_index {
+                    continue;
+                }
+                let group = &self.groups[group_index];
+                let mut binding: Vec<Option<Object>> = vec![None; group.arity];
+                if match_ground(&group.parts[left_part], left, &mut binding)
+                    && match_ground(&group.parts[right_part], right, &mut binding)
+                {
+                    return true;
+                }
             }
-            // ...and agree everywhere it does not.
-            left.terms
-                .iter()
-                .zip(&right.terms)
-                .enumerate()
-                .all(|(position, (a, b))| {
-                    if position == counted {
-                        return true;
-                    }
-                    matches!((a, b), (Term::Object(x), Term::Object(y)) if x == y)
-                })
-        })
+        }
+        false
     }
 
     /// Whether two literals are mutex. Only two positive literals can be: a
-    /// negative one is a statement about a fact's absence, which no group
-    /// constrains.
+    /// negative one asserts a fact's absence, which no group constrains.
     pub fn literals_mutex(&self, left: &Literal, right: &Literal) -> bool {
         match (left, right) {
             (Literal::Atom(a), Literal::Atom(b)) => self.mutex(a, b),
@@ -136,104 +236,261 @@ impl LiftedMutexes {
         }
         false
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
-    }
 }
 
-/// Whether at most one instance per fixed-argument tuple holds initially.
-fn initially_true(candidate: LiftedMutexGroup, problem: &Problem) -> bool {
-    let instances: Vec<&Atom> = problem
-        .init_order
-        .iter()
-        .filter(|atom| atom.predicate == candidate.predicate)
-        .collect();
-    for (i, left) in instances.iter().enumerate() {
-        for right in &instances[i + 1..] {
-            if left.terms.len() != right.terms.len() {
-                continue;
+/// Resolves an atom's terms through a plan's binding constraints, returning it
+/// only once every term has reached an object.
+///
+/// A lifted mutex group compares objects, so an atom still carrying a variable
+/// cannot be asked about — the answer is "not known to be mutex", which is the
+/// safe direction for every caller.
+pub fn ground_atom(
+    bindings: &crate::bindings::Bindings,
+    atom: &Atom,
+    step_id: usize,
+) -> Option<Atom> {
+    let mut terms = Vec::with_capacity(atom.terms.len());
+    for &term in &atom.terms {
+        match bindings.binding(term, step_id) {
+            Term::Object(object) => terms.push(Term::Object(object)),
+            Term::Variable(_) => return None,
+        }
+    }
+    Some(Atom {
+        predicate: atom.predicate,
+        terms,
+    })
+}
+
+/// Matches a ground atom against a part, extending `binding`.
+///
+/// `binding` is left modified on failure, so a caller that tries several parts
+/// must start each attempt from a fresh one.
+fn match_ground(part: &Part, atom: &Atom, binding: &mut [Option<Object>]) -> bool {
+    if part.predicate != atom.predicate || part.slots.len() != atom.terms.len() {
+        return false;
+    }
+    for (slot, term) in part.slots.iter().zip(&atom.terms) {
+        match slot {
+            Slot::Counted => {}
+            Slot::Const(expected) => {
+                if *term != Term::Object(*expected) {
+                    return false;
+                }
             }
-            let same_fixed = left
-                .terms
-                .iter()
-                .zip(&right.terms)
-                .enumerate()
-                .all(|(position, (a, b))| position == candidate.counted || a == b);
-            let differs = left.terms.get(candidate.counted) != right.terms.get(candidate.counted);
-            if same_fixed && differs {
-                return false;
+            Slot::Param(index) => {
+                let Term::Object(object) = term else {
+                    return false;
+                };
+                match binding[*index] {
+                    Some(bound) if bound != *object => return false,
+                    Some(_) => {}
+                    None => binding[*index] = Some(*object),
+                }
             }
         }
     }
     true
 }
 
-/// Whether a schema preserves the candidate — the fact-alternating check.
-fn preserved_by(candidate: LiftedMutexGroup, schema: &ActionSchema) -> bool {
-    let touching: Vec<&Rc<Effect>> = schema
-        .effects
-        .iter()
-        .filter(|effect| effect.literal.atom().predicate == candidate.predicate)
-        .collect();
-    if touching.is_empty() {
-        return true;
-    }
-    // A conditional or quantified effect on the predicate may fire without its
-    // partner, or fire many times. Decline rather than reason about it.
-    if touching
-        .iter()
-        .any(|effect| effect.conditional() || !effect.parameters.is_empty())
-    {
+/// Matches a schema's atom — whose terms may be variables — against a part,
+/// extending the lifted assignment `sigma`.
+fn match_lifted(part: &Part, atom: &Atom, sigma: &mut [Option<Term>]) -> bool {
+    if part.predicate != atom.predicate || part.slots.len() != atom.terms.len() {
         return false;
     }
-
-    let adds: Vec<&Atom> = touching
-        .iter()
-        .filter_map(|effect| match &effect.literal {
-            Literal::Atom(atom) => Some(atom),
-            Literal::Negation(_) => None,
-        })
-        .collect();
-    if adds.is_empty() {
-        // Deletes only: the count can fall but never rise.
-        return true;
+    for (slot, term) in part.slots.iter().zip(&atom.terms) {
+        match slot {
+            Slot::Counted => {}
+            Slot::Const(expected) => {
+                if *term != Term::Object(*expected) {
+                    return false;
+                }
+            }
+            Slot::Param(index) => match sigma[*index] {
+                Some(bound) if bound != *term => return false,
+                Some(_) => {}
+                None => sigma[*index] = Some(*term),
+            },
+        }
     }
-    if adds.len() > 1 {
-        // Two adds might land in the same group under some binding.
-        return false;
-    }
-    let added = adds[0];
-
-    let deletes: Vec<&Atom> = touching
-        .iter()
-        .filter_map(|effect| match &effect.literal {
-            Literal::Negation(atom) => Some(atom),
-            Literal::Atom(_) => None,
-        })
-        .collect();
-
-    let mut entailed = Vec::new();
-    collect_entailed_atoms(&schema.precondition, &mut entailed);
-
-    deletes.iter().any(|deleted| {
-        same_fixed_arguments(candidate, added, deleted)
-            && entailed.iter().any(|required| {
-                required.predicate == deleted.predicate && required.terms == deleted.terms
-            })
-    })
+    true
 }
 
-/// Whether two atoms carry syntactically identical terms at every fixed
-/// position of the group, so they always belong to the same instance of it.
-fn same_fixed_arguments(candidate: LiftedMutexGroup, added: &Atom, deleted: &Atom) -> bool {
-    added.terms.len() == deleted.terms.len()
-        && added
-            .terms
+/// Whether at most one atom of the group holds initially, for every assignment.
+fn initially_true(group: &MutexGroup, problem: &Problem) -> bool {
+    let relevant: Vec<&Atom> = problem
+        .init_order
+        .iter()
+        .filter(|atom| {
+            group
+                .parts
+                .iter()
+                .any(|part| part.predicate == atom.predicate)
+        })
+        .collect();
+    for (i, left) in relevant.iter().enumerate() {
+        for right in &relevant[i + 1..] {
+            if left == right {
+                continue;
+            }
+            for left_part in &group.parts {
+                for right_part in &group.parts {
+                    let mut binding: Vec<Option<Object>> = vec![None; group.arity];
+                    if match_ground(left_part, left, &mut binding)
+                        && match_ground(right_part, right, &mut binding)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The outcome of testing a candidate against every schema.
+enum Balance {
+    /// Every schema preserves the group.
+    Preserved,
+    /// Some schema rules the candidate out outright; refining cannot help.
+    Rejected,
+    /// A schema adds into the group with nothing to pair against. Each listed
+    /// part would account for that add if the group contained it.
+    Unbalanced { refinements: Vec<Part> },
+}
+
+/// The pieces of a schema the balance check reads, extracted once.
+struct SchemaFacts {
+    /// Unconditional, unquantified positive effect atoms.
+    adds: Vec<Atom>,
+    /// Unconditional, unquantified negative effect atoms.
+    deletes: Vec<Atom>,
+    /// Predicates touched by a conditional or quantified effect, either polarity.
+    uncertain: HashSet<Predicate>,
+    /// Positive atoms the precondition entails.
+    required: Vec<Atom>,
+}
+
+impl SchemaFacts {
+    fn new(schema: &ActionSchema) -> Self {
+        let mut adds = Vec::new();
+        let mut deletes = Vec::new();
+        let mut uncertain = HashSet::new();
+        for effect in &schema.effects {
+            let atom = effect.literal.atom().clone();
+            if effect.conditional() || !effect.parameters.is_empty() {
+                uncertain.insert(atom.predicate);
+                continue;
+            }
+            match &effect.literal {
+                Literal::Atom(_) => adds.push(atom),
+                Literal::Negation(_) => deletes.push(atom),
+            }
+        }
+        let mut required = Vec::new();
+        collect_entailed_atoms(&schema.precondition, &mut required);
+        SchemaFacts {
+            adds,
+            deletes,
+            uncertain,
+            required,
+        }
+    }
+}
+
+fn balance(group: &MutexGroup, schemas: &[SchemaFacts]) -> Balance {
+    let mut refinements: Vec<Part> = Vec::new();
+    let mut unbalanced = false;
+
+    for schema in schemas {
+        if group
+            .parts
             .iter()
-            .zip(&deleted.terms)
-            .enumerate()
-            .all(|(position, (a, b))| position == candidate.counted || a == b)
+            .any(|part| schema.uncertain.contains(&part.predicate))
+        {
+            return Balance::Rejected;
+        }
+
+        // The ways this schema adds into the group, and the assignment each
+        // lands under.
+        let mut entering: Vec<Vec<Option<Term>>> = Vec::new();
+        for added in &schema.adds {
+            for part in &group.parts {
+                let mut sigma: Vec<Option<Term>> = vec![None; group.arity];
+                if match_lifted(part, added, &mut sigma) {
+                    entering.push(sigma);
+                }
+            }
+        }
+        if entering.is_empty() {
+            continue;
+        }
+        if entering.len() > 1 {
+            // Two ways into the group at once. Rather than prove they land
+            // under different assignments, decline.
+            return Balance::Rejected;
+        }
+        let sigma = &entering[0];
+        if sigma.iter().any(Option::is_none) {
+            // The atom enters the group for every value of some parameter; no
+            // single delete balances that.
+            return Balance::Rejected;
+        }
+
+        // A delete from the group under the same assignment, which the schema
+        // also required.
+        let paired = schema.deletes.iter().any(|deleted| {
+            if !schema.required.contains(deleted) {
+                return false;
+            }
+            group.parts.iter().any(|part| {
+                let mut check = sigma.clone();
+                match_lifted(part, deleted, &mut check) && check == *sigma
+            })
+        });
+        if paired {
+            continue;
+        }
+
+        unbalanced = true;
+        for deleted in &schema.deletes {
+            if !schema.required.contains(deleted) {
+                continue;
+            }
+            refinements.push(derive_part(deleted, sigma));
+        }
+    }
+
+    if unbalanced {
+        Balance::Unbalanced { refinements }
+    } else {
+        Balance::Preserved
+    }
+}
+
+/// Builds the part that would let `deleted` account for an add under `sigma`.
+///
+/// A term the assignment binds becomes that invariant parameter, an object
+/// becomes a constant, and anything else is counted.
+fn derive_part(deleted: &Atom, sigma: &[Option<Term>]) -> Part {
+    let slots = deleted
+        .terms
+        .iter()
+        .map(|term| {
+            if let Some(index) = sigma.iter().position(|bound| bound.as_ref() == Some(term)) {
+                Slot::Param(index)
+            } else if let Term::Object(object) = term {
+                Slot::Const(*object)
+            } else {
+                Slot::Counted
+            }
+        })
+        .collect();
+    Part {
+        predicate: deleted.predicate,
+        slots,
+    }
 }
 
 /// Collects the positive atoms a precondition entails: the top-level
@@ -275,6 +532,12 @@ mod tests {
             Fixture { domain, problem }
         }
 
+        fn from_files(domain_path: &str, problem_path: &str) -> Self {
+            let domain_src = std::fs::read_to_string(domain_path).expect("read domain");
+            let problem_src = std::fs::read_to_string(problem_path).expect("read problem");
+            Fixture::new(&domain_src, &problem_src)
+        }
+
         fn mutexes(&self) -> LiftedMutexes {
             LiftedMutexes::synthesise(&self.domain, &self.problem)
         }
@@ -288,15 +551,28 @@ mod tests {
             )
         }
 
+        fn predicate(&self, name: &str) -> Predicate {
+            self.domain
+                .predicates
+                .find_predicate(name)
+                .unwrap_or_else(|| panic!("predicate `{name}` is declared"))
+        }
+
         fn atom(&self, predicate: &str, args: &[&str]) -> Atom {
             Atom {
-                predicate: self
-                    .domain
-                    .predicates
-                    .find_predicate(predicate)
-                    .unwrap_or_else(|| panic!("predicate `{predicate}` is declared")),
+                predicate: self.predicate(predicate),
                 terms: args.iter().map(|name| self.object(name)).collect(),
             }
+        }
+
+        /// Whether some multi-part group covers exactly these predicates.
+        fn has_group_over(&self, names: &[&str]) -> bool {
+            let mut want: Vec<Predicate> = names.iter().map(|n| self.predicate(n)).collect();
+            want.sort_by_key(|predicate| predicate.0);
+            self.mutexes()
+                .groups()
+                .iter()
+                .any(|group| group.len() > 1 && group.predicates() == want)
         }
     }
 
@@ -321,12 +597,12 @@ mod tests {
       (:goal (at truck c)))
     "#;
 
+    // -- the single-part case ----------------------------------------------
+
     #[test]
     fn a_vehicle_is_at_one_location() {
         let fixture = Fixture::new(TRAVEL_DOMAIN, TRAVEL_PROBLEM);
         let mutexes = fixture.mutexes();
-        // `drive` deletes (at ?v ?from), which is a precondition, and adds
-        // (at ?v ?to) with the same vehicle: the group is preserved.
         assert!(mutexes.mutex(
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["truck", "b"])
@@ -341,7 +617,6 @@ mod tests {
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["van", "b"])
         ));
-        // Same atom twice is not a mutex either.
         assert!(!mutexes.mutex(
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["truck", "a"])
@@ -349,25 +624,9 @@ mod tests {
     }
 
     #[test]
-    fn counting_the_vehicle_is_rejected_by_the_initial_state() {
-        let fixture = Fixture::new(TRAVEL_DOMAIN, TRAVEL_PROBLEM);
-        let mutexes = fixture.mutexes();
-        // Counting position 0 would claim one vehicle per location, which the
-        // initial state does not refute here — but `drive` adds (at ?v ?to)
-        // while deleting (at ?v ?from), whose *fixed* position under that
-        // reading is ?to vs ?from. They are different terms, so the candidate
-        // is rejected, and two vehicles may share a location.
-        assert!(!mutexes.mutex(
-            &fixture.atom("at", &["truck", "a"]),
-            &fixture.atom("at", &["van", "a"])
-        ));
-    }
-
-    #[test]
     fn a_monotone_predicate_yields_no_group() {
         let fixture = Fixture::new(TRAVEL_DOMAIN, TRAVEL_PROBLEM);
         let mutexes = fixture.mutexes();
-        // `visited` is only ever added, so nothing bounds how many hold.
         assert!(!mutexes.mutex(
             &fixture.atom("visited", &["a"]),
             &fixture.atom("visited", &["b"])
@@ -376,8 +635,6 @@ mod tests {
 
     #[test]
     fn an_unpaired_delete_rejects_the_candidate() {
-        // `teleport` adds (at ?v ?to) without deleting anything, so two
-        // locations could hold at once and the group must be refused.
         let domain_src = r#"
         (define (domain leaky)
           (:requirements :strips :typing)
@@ -396,8 +653,7 @@ mod tests {
           (:goal (at truck b)))
         "#;
         let fixture = Fixture::new(domain_src, problem_src);
-        let mutexes = fixture.mutexes();
-        assert!(!mutexes.mutex(
+        assert!(!fixture.mutexes().mutex(
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["truck", "b"])
         ));
@@ -405,8 +661,6 @@ mod tests {
 
     #[test]
     fn a_delete_that_is_not_a_precondition_rejects_the_candidate() {
-        // `jump` deletes (at ?v ?from) but never required it, so it can add a
-        // second location while the first survives.
         let domain_src = r#"
         (define (domain leaky2)
           (:requirements :strips :typing)
@@ -425,8 +679,7 @@ mod tests {
           (:goal (at truck b)))
         "#;
         let fixture = Fixture::new(domain_src, problem_src);
-        let mutexes = fixture.mutexes();
-        assert!(!mutexes.mutex(
+        assert!(!fixture.mutexes().mutex(
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["truck", "b"])
         ));
@@ -442,17 +695,12 @@ mod tests {
           (:goal (at truck b)))
         "#;
         let fixture = Fixture::new(TRAVEL_DOMAIN, problem_src);
-        let mutexes = fixture.mutexes();
-        assert!(!mutexes.mutex(
+        assert!(!fixture.mutexes().mutex(
             &fixture.atom("at", &["truck", "a"]),
             &fixture.atom("at", &["truck", "b"])
         ));
     }
 
-    /// A static predicate with a single initial instance is a genuine invariant
-    /// — nothing ever adds a second — and the synthesis finds it. Sound, and
-    /// occasionally useful: it makes a plan that needs two different roads out
-    /// of the same location provably unrefinable.
     #[test]
     fn a_static_predicate_can_carry_a_group() {
         let problem_src = r#"
@@ -463,10 +711,61 @@ mod tests {
           (:goal (at truck b)))
         "#;
         let fixture = Fixture::new(TRAVEL_DOMAIN, problem_src);
-        let mutexes = fixture.mutexes();
-        assert!(mutexes.mutex(
+        assert!(fixture.mutexes().mutex(
             &fixture.atom("road", &["a", "b"]),
             &fixture.atom("road", &["a", "c"])
+        ));
+    }
+
+    // -- refinement, the multi-part case ------------------------------------
+
+    /// The flagship. `load-truck` adds `in(?o, ?truck)` and unbalances the
+    /// single-part `in` candidate; refinement grows it into
+    /// `⟨at(v₀, ·), in(v₀, ·)⟩` from the `at(?o, ?loc)` that `load-truck`
+    /// deletes and required.
+    #[test]
+    fn a_package_is_at_a_place_or_in_a_vehicle_but_not_both() {
+        let fixture = Fixture::from_files(
+            "examples/logistics-domain.pddl",
+            "examples/logistics-a.pddl",
+        );
+        assert!(
+            fixture.has_group_over(&["at", "in"]),
+            "no at/in group; found {:?}",
+            fixture
+                .mutexes()
+                .groups()
+                .iter()
+                .map(|group| (group.len(), group.predicates()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Ferry's version of the same shape, and the one with a constant in it:
+    /// `debark` adds `at(?x, ?y)` and deletes `on(?x, ferry)`, so the derived
+    /// part pins the second position to the `ferry` constant.
+    #[test]
+    fn a_car_is_ashore_or_aboard_the_ferry() {
+        let fixture = Fixture::from_files("examples/ferry-domain.pddl", "examples/test-ferry.pddl");
+        assert!(
+            fixture.has_group_over(&["at", "on"]),
+            "no at/on group; found {:?}",
+            fixture
+                .mutexes()
+                .groups()
+                .iter()
+                .map(|group| (group.len(), group.predicates()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn refinement_never_pairs_a_monotone_predicate() {
+        let fixture = Fixture::new(TRAVEL_DOMAIN, TRAVEL_PROBLEM);
+        // `visited` is only ever added, so no group may contain it beside `at`.
+        assert!(!fixture.mutexes().mutex(
+            &fixture.atom("at", &["truck", "a"]),
+            &fixture.atom("visited", &["b"])
         ));
     }
 }

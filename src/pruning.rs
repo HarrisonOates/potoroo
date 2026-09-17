@@ -14,7 +14,8 @@ pub struct PruneOptions {
     pub cutset: bool,
     /// e-deletion: extend threats from "deletes the protected fact" to "cannot
     /// hold beside it", using the same mutexes as `cutset`. See
-    /// [`crate::fdr_pocl`].
+    /// [`crate::fdr_pocl`] for the finite-domain reading and
+    /// [`crate::plan::effect_e_deletes`] for the literal one.
     pub edelete: bool,
     /// Resolve threats by posting a disjunctive ordering constraint and
     /// propagating, instead of splitting the plan into a promotion child and a
@@ -111,9 +112,6 @@ impl PruneOptions {
     /// all` and quietly get nothing from three of its six rules.
     pub fn finite_domain_only(self) -> Vec<&'static str> {
         let mut names = Vec::new();
-        if self.edelete {
-            names.push("edelete");
-        }
         if self.disjunctive {
             names.push("disjunctive");
         }

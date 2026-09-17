@@ -391,7 +391,7 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 | Rule | Source | Representation | What it discards |
 |---|---|---|---|
 | `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | every representation | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. Finite-domain search takes its mutexes from the translator; lifted and ground search synthesise **lifted mutex groups** from the schemas (see below). |
-| `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | `--fdr-pocl` | Extends threats from "assigns the protected variable another value" to "cannot hold beside the protected fact". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. |
+| `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | every representation | Extends threats from "deletes the protected fact" to "cannot hold beside it". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. Sound and it fires, but see the note below before enabling it. |
 | `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
 | `recursion` | Smith & Peot, AIPS-96, Thms. 1 and 4 | every representation | A plan whose remaining open conditions are all suspended inside a regression loop, so every completion is non-minimal. |
@@ -471,30 +471,62 @@ assignment of the other positions at most one instance holds in any reachable
 state. `⟨at(?v, ?l), counted = 1⟩` says a vehicle is at one location, which is
 exactly the invariant a SAS+ variable encodes.
 
-A candidate survives if at most one instance per fixed-argument tuple holds
-initially, and if every schema that adds an instance also deletes one from the
-same group *and* required that deleted atom as a precondition — the
-fact-alternating condition. Conditional effects, quantified effects, two adds on
-one predicate, and a delete that only maybe matches the add all reject the
-candidate, because a mutex claimed wrongly would let the rule discard a
-refinable plan.
+A group may have **several parts**, which is what makes two *different*
+predicates mutex: `⟨at(v₀, ·), in(v₀, ·)⟩` says a package is at a location or in
+a vehicle and never both, and `⟨at(v₀, ·), on(v₀, ferry)⟩` says a car is ashore
+or aboard.
 
-This is the single-predicate case of Fišer's lifted fact-alternating mutex
-groups (AAAI 2020), and the same shape as the invariant candidates in Helmert's
-finite-domain translation (AIJ 2009). Multi-predicate groups — `{at(?p, ?l),
-in(?p, ?v)}`, a package at a location or in a vehicle but never both — need
-candidate refinement rather than one pass, and are not implemented.
+A candidate survives if at most one of its atoms holds initially per assignment,
+and if every schema that adds an atom into the group also deletes one from it
+under the *same* assignment *and* required that deleted atom as a precondition —
+the fact-alternating condition. A schema that unbalances a candidate does not
+discard it: each atom the schema deletes and required derives a **new part**, and
+the enlarged candidate is re-tested from scratch. That is how `⟨in(v₀, ·)⟩`,
+which `load-truck` unbalances by adding `in(?o, ?truck)`, grows the part
+`at(v₀, ·)` from the `at(?o, ?loc)` that `load-truck` deletes.
+
+Conditional effects, quantified effects, two adds into one group, an add whose
+assignment leaves a parameter unbound, and a delete that only maybe matches the
+add all reject the candidate, because a mutex claimed wrongly would let the rule
+discard a refinable plan. Refinement is bounded at three parts.
+
+This is Fišer's lifted fact-alternating mutex groups (AAAI 2020) in the shape of
+Helmert's invariant synthesis (AIJ 2009).
 
 It is the one rule that makes lifted search do less work rather than reject what
 the heuristic was rejecting anyway. Under `-g -h LPLAN`, which is genuinely
 cost-optimal:
 
-| | generated | cost |
+| generated nodes | default | `-p cutset` |
 |---|---|---|
-| `test-ferry`, default | 720 | 7 |
-| `test-ferry`, `-p cutset` | **344** | 7 |
-| `sussman-anomaly`, default | 43 | 3 |
-| `sussman-anomaly`, `-p cutset` | **37** | 3 |
+| `test-ferry` (lifted) | 254 | **74** |
+| `logistics-a` (lifted) | 13081 | **10458** |
+| `gripper-4` (lifted) | 231 | **203** |
+| `test-ferry` (`-g -h LPLAN`) | 720 | **344** |
+| `sussman-anomaly` (`-g -h LPLAN`) | 43 | **37** |
+
+Costs are unchanged in every row. Multi-part groups are most of that: with
+single-predicate groups alone, `test-ferry` stopped at 190 and `logistics-a` did
+not move at all.
+
+### A note on `edelete` outside `--fdr-pocl`
+
+e-deletion works on the literal representation too — an effect asserting
+something a group rules out beside the protected fact is a threat, even though
+it deletes nothing named in the link. It is sound and it fires. It also does not
+pay, and combining it with `cutset` is worse than `cutset` alone:
+
+| `test-ferry`, generated | |
+|---|---|
+| default | 254 |
+| `-p edelete` | 125 |
+| `-p cutset` | **74** |
+| `-p cutset,edelete` | 91 |
+
+The extra threats cost more branching than the early ordering commitments save,
+and forcing orderings sooner moves plans out of the state where `cutset` would
+have rejected them outright. The same shape shows up under `--fdr-pocl`. Enable
+it to study it, not to go faster.
 
 ### Does the rest of it pay, in lifted mode?
 
@@ -518,7 +550,7 @@ evaluation, and the check costs more than the evaluation does.
 | `-p all` | 13081 | 317 |
 
 So the honest recommendation for lifted and ground search is `-p cutset` and
-nothing else. The finite-domain rules are a different story — `cutset` cuts visited
+nothing else — not `-p all`. The finite-domain rules are a different story — `cutset` cuts visited
 nodes on `gripper-4` from 184 to 170 and on `sussman-anomaly` from 13 to 12
 under admissible `LMCUT`, because it discards plans on structural grounds the
 heuristic cannot see.

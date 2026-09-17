@@ -300,32 +300,21 @@ pub mod lifted {
     use crate::orderings::{BinaryOrderings, StepTime};
     use crate::plan::Plan;
     use crate::search::SearchContext;
-    use crate::terms::Term;
 
     fn necessarily_before(orderings: &BinaryOrderings, before: usize, after: usize) -> bool {
         before != after
             && !orderings.possibly_after(before, StepTime::AtEnd, after, StepTime::AtStart)
     }
 
-    /// Resolves a literal's terms through the bindings, keeping it only if it is
-    /// positive and every term has reached an object.
+    /// Resolves a literal through the bindings, keeping it only if it is
+    /// positive and fully ground.
     fn ground_atom(plan: &Plan, literal: &Literal, step_id: usize) -> Option<Atom> {
         let Literal::Atom(atom) = literal else {
             // A negative condition says a fact is absent, which no lifted mutex
             // group constrains.
             return None;
         };
-        let mut terms = Vec::with_capacity(atom.terms.len());
-        for &term in &atom.terms {
-            match plan.bindings.binding(term, step_id) {
-                Term::Object(object) => terms.push(Term::Object(object)),
-                Term::Variable(_) => return None,
-            }
-        }
-        Some(Atom {
-            predicate: atom.predicate,
-            terms,
-        })
+        crate::lifted_mutex::ground_atom(&plan.bindings, atom, step_id)
     }
 
     /// Whether the rule could fire at all. Allocation-free.

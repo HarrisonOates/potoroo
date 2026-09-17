@@ -334,7 +334,7 @@ impl Plan {
     fn handle_unsafe(&self, ctx: &SearchContext, plans: &mut Vec<Rc<Plan>>, unsafe_: &Unsafe) {
         let link = &unsafe_.link;
         let mut unifier: Vec<Binding> = Vec::new();
-        let affected = self.orderings.possibly_not_after(
+        let placement_admits = self.orderings.possibly_not_after(
             link.from_id,
             link.effect_time,
             unsafe_.step_id,
@@ -344,14 +344,16 @@ impl Plan {
             link.condition_time.end_time(),
             unsafe_.step_id,
             StepTime::AtEnd,
-        ) && self.bindings.affects_mgu(
-            &ctx.type_ctx(),
-            &mut unifier,
-            &unsafe_.effect.literal,
-            unsafe_.step_id,
-            &link.condition,
-            link.to_id,
         );
+        let affected = placement_admits
+            && self.bindings.affects_mgu(
+                &ctx.type_ctx(),
+                &mut unifier,
+                &unsafe_.effect.literal,
+                unsafe_.step_id,
+                &link.condition,
+                link.to_id,
+            );
         // With `-p params`, a threat whose unifier the parameter domains rule out
         // is not a flaw: dropping it here saves the two or three children that
         // resolving it would have cost.
@@ -361,6 +363,16 @@ impl Plan {
 
         if affected {
             self.separate(ctx, plans, unsafe_, &unifier);
+            self.promote(ctx, plans, unsafe_);
+            self.demote(ctx, plans, unsafe_);
+        } else if placement_admits
+            && effect_e_deletes(ctx, &self.bindings, &unsafe_.effect, unsafe_.step_id, link)
+        {
+            // An e-deletion threat has no unifier to separate: the two atoms
+            // are already ground and a mutex group rules them out together, so
+            // the only resolvers are ordering ones. If neither is consistent
+            // the conflict is unavoidable and the plan has no children, which
+            // is the correct outcome.
             self.promote(ctx, plans, unsafe_);
             self.demote(ctx, plans, unsafe_);
         } else {
@@ -1139,6 +1151,29 @@ impl Plan {
                 &link.condition,
                 link.to_id,
             );
+        let e_deleting = !affected
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+            && self
+                .orderings
+                .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
+            && effect_e_deletes(ctx, &self.bindings, &unsafe_.effect, unsafe_.step_id, link);
+        if e_deleting {
+            // No separation, but promotion and demotion still apply, so the
+            // flaw order must not read this as an irremediable zero.
+            let mut r = 0;
+            if *promotable < 0 {
+                *promotable = self.promotable(unsafe_);
+            }
+            r += *promotable;
+            if *demotable < 0 {
+                *demotable = self.demotable(unsafe_);
+            }
+            r += *demotable;
+            *refinements = r;
+            return r <= limit;
+        }
         if affected {
             let mut r = 0;
             if *separable < 0 {
@@ -1495,6 +1530,53 @@ fn binding_of(
     }
 }
 
+/// Whether an effect **e-deletes** a link's condition: it asserts something the
+/// lifted mutex groups say cannot hold beside the protected fact.
+///
+/// Nguyen & Kambhampati (IJCAI-01, Def. 3) widen a threat from "deletes `p`" to
+/// "cannot hold beside `p`". On the literal representation the widening needs
+/// two things the classical test does not: mutexes, which
+/// [`crate::lifted_mutex`] supplies without grounding, and both atoms resolved
+/// to objects through the binding constraints. A condition still carrying a
+/// variable yields `false` — no threat claimed, which is the safe direction,
+/// since a threat claimed wrongly could force an ordering that loses a plan.
+///
+/// Only an **unconditional, unquantified positive** effect counts. A
+/// conditional add may never fire, and a `forall` add is not one atom.
+///
+/// The precondition case of e-deletion — a step whose *precondition* is mutex
+/// with the protected fact — is not a threat here, because there is no effect
+/// to hang an [`Unsafe`] on. `-p cutset` catches those once the orderings put
+/// the step inside the interval; see [`crate::cutset::lifted`].
+pub(crate) fn effect_e_deletes(
+    ctx: &SearchContext,
+    bindings: &Bindings,
+    effect: &Effect,
+    step_id: usize,
+    link: &Link,
+) -> bool {
+    if !ctx.params.prune.edelete || effect.conditional() || !effect.parameters.is_empty() {
+        return false;
+    }
+    let Literal::Atom(added) = &effect.literal else {
+        return false;
+    };
+    let Literal::Atom(protected) = link.condition.as_ref() else {
+        return false;
+    };
+    let mutexes = ctx.lifted_mutexes();
+    if mutexes.is_empty() {
+        return false;
+    }
+    let (Some(added), Some(protected)) = (
+        crate::lifted_mutex::ground_atom(bindings, added, step_id),
+        crate::lifted_mutex::ground_atom(bindings, protected, link.to_id),
+    ) else {
+        return false;
+    };
+    mutexes.mutex(&added, &protected)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn link_threats(
     ctx: &SearchContext,
@@ -1527,19 +1609,22 @@ pub fn link_threats(
                 // Cheapest test first: it reads the effect literal alone, and
                 // rules out most effects before the second `Rc` hop into the
                 // link condition and the unification below.
-                if !e.literal.may_affect(&link.condition) {
+                let classical = e.literal.may_affect(&link.condition);
+                if !classical && !effect_e_deletes(ctx, bindings, e, s.id, link) {
                     continue;
                 }
                 if e.link_condition.contradiction() {
                     continue;
                 }
-                if bindings.affects(
-                    &ctx.type_ctx(),
-                    &e.literal,
-                    s.id,
-                    &link.condition,
-                    link.to_id,
-                ) {
+                if !classical
+                    || bindings.affects(
+                        &ctx.type_ctx(),
+                        &e.literal,
+                        s.id,
+                        &link.condition,
+                        link.to_id,
+                    )
+                {
                     *unsafes = chain::cons(
                         Unsafe {
                             link: link.clone(),
@@ -1582,13 +1667,16 @@ pub fn step_threats(
             }
             for e in step.action.effects.iter() {
                 // See `link_threats`.
-                if !e.literal.may_affect(&l.condition) {
+                let classical = e.literal.may_affect(&l.condition);
+                if !classical && !effect_e_deletes(ctx, bindings, e, step.id, l) {
                     continue;
                 }
                 if e.link_condition.contradiction() {
                     continue;
                 }
-                if bindings.affects(&ctx.type_ctx(), &e.literal, step.id, &l.condition, l.to_id) {
+                if !classical
+                    || bindings.affects(&ctx.type_ctx(), &e.literal, step.id, &l.condition, l.to_id)
+                {
                     *unsafes = chain::cons(
                         Unsafe {
                             link: l.clone(),
