@@ -29,6 +29,20 @@ fn stat(stderr: &str, field: &str) -> i64 {
     rest[..end].parse().expect("a numeric STATS field")
 }
 
+/// The `generated N` count from a `Stage n/m finished:` line.
+fn stage_generated(stderr: &str, prefix: &str) -> i64 {
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{stderr}"));
+    line.rsplit_once("generated ")
+        .expect("a stage line reports its generated nodes")
+        .1
+        .trim()
+        .parse()
+        .expect("a numeric node count")
+}
+
 /// The baseline this whole task must not move: the default configuration on
 /// `sussman-anomaly`, measured with the binary as it stood before the time
 /// limit and the portfolio were added.
@@ -193,6 +207,44 @@ fn an_exhausted_search_space_ends_the_portfolio() {
     assert!(
         !stderr.contains("Stage 2/2 started"),
         "an exact verdict should not be re-searched:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_stage_hands_its_memory_back_to_the_one_after_it() {
+    // The regression this pins: dropping a stage's queues returns them to the
+    // allocator, not to the kernel, so without an explicit release the second
+    // stage reads the first stage's peak as its own resident set and stops
+    // having expanded nothing. Thirty megabytes is well under what the first
+    // stage reaches on `gripper-20` and well over the process baseline, so the
+    // first stage must hit the bound and the second must survive it.
+    let output = run(&[
+        "-v",
+        "--stage-mem-mb",
+        "30",
+        "--stage",
+        "ADD",
+        "--stage",
+        "ADD",
+        "examples/gripper-domain.pddl",
+        "examples/gripper-20.pddl",
+    ]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("Stage 1/2 finished: time limit reached"),
+        "the first stage should have hit the memory bound:\n{stderr}"
+    );
+    assert!(stderr.contains("Stage 2/2 started: ADD"), "{stderr}");
+
+    // Both stages run the same configuration under the same bound, so the
+    // second should get as far as the first; anything near a single node means
+    // it was stopped by its predecessor's memory rather than by its own.
+    let generated = stage_generated(&stderr, "Stage 2/2 finished:");
+    assert!(
+        generated > 1000,
+        "the second stage expanded almost nothing, so the memory was never \
+         handed back: it generated {generated}\n{stderr}"
     );
 }
 

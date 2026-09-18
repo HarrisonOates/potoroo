@@ -107,24 +107,28 @@ run_one() {
     *) printf '%s,%s,%s,0,0,0,0,badconfig,0,0\n' "$family" "$name" "$config"; return ;;
   esac
   [ -n "$search" ] && args+=(-s "$search")
-  if [ "$portfolio" -eq 1 ]; then
-    IFS=';' read -r -a pieces <<< "$heuristic"
-    for piece in "${pieces[@]}"; do args+=(--stage "$piece"); done
-  else
-    args+=(-h "$heuristic")
-  fi
   # Split on spaces explicitly: the xargs wrapper below leaves IFS set to a tab,
   # under which `--mem-mb 600` would reach the planner as one unparseable word.
   if [ -n "$EXTRA" ]; then
     IFS=' ' read -r -a extra_args <<< "$EXTRA"
     args+=("${extra_args[@]}")
   fi
+  # What the configuration's own heuristic contributes, placed after $EXTRA on
+  # the command line below so that `-x "-h FF"` is still a default the
+  # configuration overrides rather than one that overrides it.
+  heur_args=()
+  if [ "$portfolio" -eq 1 ]; then
+    IFS=';' read -r -a pieces <<< "$heuristic"
+    for piece in "${pieces[@]}"; do heur_args+=(--stage "$piece"); done
+  else
+    heur_args+=(-h "$heuristic")
+  fi
   err="$(mktemp)"
   # `-v` costs one progress line a second and is what lets a run that dies of
   # memory still report how many nodes it had generated.
   (
     ulimit -v $((MEM_MB * 1024)) 2>/dev/null
-    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" "${args[@]}" -v -p "$prune" \
+    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" "${args[@]}" -v "${heur_args[@]}" -p "$prune" \
       "$domain" "$problem" >/dev/null 2>"$err"
   ) 2>/dev/null
   code=$?

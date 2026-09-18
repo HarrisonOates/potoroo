@@ -442,6 +442,12 @@ fn stage_parameters(cli: &Cli, stage: &Stage, deadline: Option<Instant>) -> Para
 /// the problem alone — but they are exactly the memory a stage should hand back
 /// before the next one starts, which is the point of `--stage-mem-mb`. The
 /// price is re-grounding under `-g`, one Fast Downward call a stage.
+///
+/// Dropping them is not enough on its own: the allocator keeps the freed arena
+/// and the resident set stays at the stage's peak, so the next stage would read
+/// that peak as its own and stop having expanded nothing. Between stages, and
+/// only between stages, the pages go back to the kernel; see
+/// [`potoroo::memory::release_free_memory`].
 fn run_lifted_portfolio(
     cli: &Cli,
     domain: &Domain,
@@ -454,30 +460,38 @@ fn run_lifted_portfolio(
     for (index, stage) in portfolio.iter().enumerate() {
         let params = stage_parameters(cli, stage, deadline);
         announce_stage(cli, index, portfolio.len(), stage);
-        let ctx = SearchContext::new(domain, problem, &params);
-        let (outcome, stats) = if cli.verbosity > 0 {
-            let mut printer = ProgressPrinter::new(cli.verbosity);
-            let mut report = |progress| printer.report(progress);
-            plan_with_progress(&ctx, &mut report)
-        } else {
-            plan_with_stats(&ctx)
-        };
-        let stats = RunStats::from(stats);
-        let outcome = match outcome {
-            Outcome::Solved(plan) => RunOutcome::Solved {
-                plan: format_steps(&ctx, &plan),
-                steps: plan.num_steps(),
-                cost: plan.cost(),
-            },
-            Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
-            Outcome::LimitReached => RunOutcome::LimitReached,
-            Outcome::NoSolution => RunOutcome::NoSolution,
+        // Scoped so the queues and the context are gone before the stage ends,
+        // which is what the next stage's memory bound is measured against.
+        let (outcome, stats) = {
+            let ctx = SearchContext::new(domain, problem, &params);
+            let (outcome, stats) = if cli.verbosity > 0 {
+                let mut printer = ProgressPrinter::new(cli.verbosity);
+                let mut report = |progress| printer.report(progress);
+                plan_with_progress(&ctx, &mut report)
+            } else {
+                plan_with_stats(&ctx)
+            };
+            let stats = RunStats::from(stats);
+            let outcome = match outcome {
+                Outcome::Solved(plan) => RunOutcome::Solved {
+                    plan: format_steps(&ctx, &plan),
+                    steps: plan.num_steps(),
+                    cost: plan.cost(),
+                },
+                Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
+                Outcome::LimitReached => RunOutcome::LimitReached,
+                Outcome::NoSolution => RunOutcome::NoSolution,
+            };
+            (outcome, stats)
         };
         total.add(&stats);
         report_stage(cli, index, portfolio.len(), &outcome, stats.nodes_generated);
         last = outcome;
         if last.ends_the_portfolio() {
             break;
+        }
+        if index + 1 < portfolio.len() {
+            potoroo::memory::release_free_memory();
         }
     }
     (last, total)
@@ -549,6 +563,9 @@ fn run_fdr_portfolio(
         last = outcome;
         if last.ends_the_portfolio() {
             break;
+        }
+        if index + 1 < portfolio.len() {
+            potoroo::memory::release_free_memory();
         }
     }
     Ok((last, total))

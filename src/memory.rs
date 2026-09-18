@@ -106,7 +106,11 @@ impl SearchStop {
         Some(SearchStop {
             deadline: params.deadline,
             memory_kb: params.memory_stop_mb.map(|mb| mb as u64 * 1024),
-            next_check: 0,
+            // The first reading is a whole interval in, not at the first
+            // expansion: a stage always gets its first [`CHECK_INTERVAL`]
+            // expansions, whatever the resident set happened to be when it
+            // started.
+            next_check: CHECK_INTERVAL,
         })
     }
 
@@ -132,6 +136,35 @@ impl SearchStop {
         false
     }
 }
+
+/// Returns the allocator's free arenas to the operating system.
+///
+/// Dropping a stage's queues frees them to glibc, not to the kernel: the
+/// allocator keeps the arena for the next allocation, so `VmRSS` stays at the
+/// stage's high-water mark and the stage that follows reads its predecessor's
+/// peak as its own. Against [`SearchStop`]'s resident-set ceiling that is
+/// fatal — every later stage stops at its first reading, having expanded
+/// nothing — so the restart has to hand the pages back rather than merely drop
+/// the references to them.
+///
+/// `malloc_trim` is what does that, and it has no portable equivalent: on any
+/// other target this is a no-op and `--stage-mem-mb` degrades to bounding the
+/// high-water mark of the run as a whole rather than of each stage.
+#[cfg(target_os = "linux")]
+pub fn release_free_memory() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: `malloc_trim` takes no pointers and returns only unreachable
+    // pages to the kernel, so the allocator stays valid whatever it reports.
+    // It is advisory: the return value says whether anything was released.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn release_free_memory() {}
 
 /// Keeps the best `keep` entries of a heap and returns how many were dropped.
 /// Linear in the heap: a selection rather than a sort, then a rebuild.
@@ -254,10 +287,20 @@ mod tests {
             ..Parameters::default()
         };
         let mut stop = SearchStop::new(&params).expect("a memory stop builds a stop");
-        assert_eq!(stop.expired(0), resident_set_kb() > 1024);
-        // The next reading is a whole interval away, so the intervening
-        // expansions cost nothing.
-        assert!(!stop.expired(1));
+        // A stage gets its first interval of expansions before the resident
+        // set is read at all, so a stage that starts above the bound still
+        // searches rather than stopping where it stands.
+        assert!(!stop.expired(0));
+        assert!(!stop.expired(CHECK_INTERVAL - 1));
+        assert_eq!(stop.expired(CHECK_INTERVAL), resident_set_kb() > 1024);
+        // The next reading is a whole interval away again.
+        assert!(!stop.expired(CHECK_INTERVAL + 1));
+    }
+
+    #[test]
+    fn releasing_free_memory_is_safe_to_call() {
+        // Check that the allocator-trim declaration links on this platform.
+        release_free_memory();
     }
 
     #[test]

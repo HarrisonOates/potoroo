@@ -1097,6 +1097,19 @@ impl<'a> Planner<'a> {
         // Whether time or memory ended the search. A stop is a restart, not a
         // prune: nothing queued has been discarded.
         let mut timed_out = false;
+        // The stop is consulted wherever the loop takes another plan off a
+        // queue, not only where it expands one: a complete plan that fails to
+        // linearize pops its successor and goes round again without expanding
+        // anything, and a search that spends its whole budget on such a run
+        // must still honour it.
+        macro_rules! stop_expired {
+            () => {
+                match stop.as_mut() {
+                    Some(stop) => stop.expired(stats.nodes_visited),
+                    None => false,
+                }
+            };
+        }
         let mut current_order = 0usize;
         let mut orders_left = n_orders;
         let mut next_switch = 1_000usize;
@@ -1151,14 +1164,16 @@ impl<'a> Planner<'a> {
                         &mut expand_count,
                         &mut stats,
                     );
-                    continue;
-                }
-
-                if let Some(stop) = stop.as_mut() {
-                    if stop.expired(stats.nodes_visited) {
+                    if stop_expired!() {
                         timed_out = true;
                         break;
                     }
+                    continue;
+                }
+
+                if stop_expired!() {
+                    timed_out = true;
+                    break;
                 }
                 stats.nodes_visited += 1;
                 stats.max_steps = stats.max_steps.max(plan.num_steps());

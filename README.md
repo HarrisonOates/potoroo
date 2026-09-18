@@ -970,8 +970,14 @@ planner honoured itself rather than a death it could not report. It exists
 because [the failures here are memory deaths](#node-size-and-memory): under a
 hard address-space cap a stage that runs out of memory aborts the whole
 process, so without it a memory-hungry heuristic could never be run anywhere
-but last. Dropping the stage's queues at the restart is what frees the memory;
-the resident set is read once every 1024 expansions, not every one.
+but last. Dropping the stage's queues is not by itself what frees the memory:
+the allocator keeps the freed arena, so the resident set stays at the stage's
+peak and the next stage would read that peak as its own. Between stages the
+pages go back to the kernel explicitly (`malloc_trim`, `src/memory.rs`), which
+is what makes the bound per stage rather than per run; on a target without it
+`--stage-mem-mb` bounds the run as a whole instead. The resident set is read
+once every 1024 expansions, not every one, and never before a stage's first
+1024, so a stage is never stopped before it has searched at all.
 
 `scripts/lm_sweep.sh` takes a portfolio as a configuration whose heuristic part
 joins several specs with `;`, so the whole thing stays one CSV column:
@@ -984,12 +990,14 @@ scripts/lm_sweep.sh -c 'fdr:ADD,fdr:CLFF@ALT,fdr:CLFF@ALT=10;ADD' -x '--stage-me
 **Why this is worth having, on the numbers already measured.** Computed offline
 from `docs/final-sweep-results.csv`: a 10 s + 10 s split of `--fdr-pocl ADD`
 and `--fdr-pocl CLFF -s ALT` would cover **157 of 441** problems against **138**
-for the best single configuration. The split hardly matters — any division from
-3 s to 13 s lands between 155 and 157 — because both configurations solve in
-about **80 ms median** when they solve at all, so a stage either wins almost
-immediately or was never going to. And `ADD`'s failures are memory deaths, not
-timeouts, which is what fixes the order: `ADD` must run **last**, or under
-`--stage-mem-mb`.
+for the best single configuration. Past a point the split matters little — of a
+20 s budget, giving `CLFF` the first 3–5 s covers 153 and anything from 6 s on
+covers 155 to 157 — because both configurations solve in about **80 ms median**
+when they solve at all (`ADD` 80 ms over 138 solved, `CLFF -s ALT` 82 ms over
+134), so a stage either wins almost immediately or was never going to. And
+`ADD`'s failures are memory deaths where `CLFF`'s are timeouts — 214 of its 303
+unsolved runs die of memory against 11 of `CLFF`'s — which is what fixes the
+order: `ADD` must run **last**, or under `--stage-mem-mb`.
 
 That is an estimate from rows measured one configuration at a time, not a
 portfolio sweep. The measured table goes here:
