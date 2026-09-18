@@ -49,6 +49,186 @@ struct Cli {
     /// Raw `-s` value as given on the command line (default `A`). Included in the
     /// `POTOROO_STATS_JSON` output so different algorithms are distinguishable.
     algorithm_name: String,
+    /// The `--stage` restart portfolio, in the order it was given. Empty for a
+    /// plain run, which is then a portfolio of one implicit stage; see
+    /// [`Cli::portfolio`].
+    stages: Vec<Stage>,
+    /// Wall-clock budget for one problem, from `--time-limit` or `-T`.
+    time_limit: Option<Duration>,
+    /// Resident-set ceiling at which a stage gives way to the next
+    /// (`--stage-mem-mb`).
+    stage_mem_mb: Option<usize>,
+}
+
+/// One stage of the `--stage` restart portfolio: `HEURISTIC[@SEARCH][=SECS]`.
+///
+/// A stage is a whole search, restarted from the initial plan with a different
+/// heuristic. It is not a pruning device: a stage that ends leaves its part of
+/// the search space unexplored rather than excluded, which is why the outcome
+/// it reports is the limit reached and why an exhausted search space ends the
+/// portfolio outright.
+#[derive(Clone)]
+struct Stage {
+    /// The spec exactly as written, for the STATS label and the `-v` lines.
+    spec: String,
+    heuristic: Heuristic,
+    /// `None` inherits the command line's `-s`.
+    search_algorithm: Option<SearchAlgorithm>,
+    /// Seconds this stage may run for. `None` runs to `--time-limit`, or
+    /// without a bound at all when there is none.
+    seconds: Option<f64>,
+}
+
+impl Cli {
+    /// The stages to run for one problem. Without `--stage` this is a single
+    /// stage carrying the command line's own heuristic and search algorithm,
+    /// so a plain run goes through exactly the same loop as a portfolio and
+    /// the two cannot drift apart.
+    fn portfolio(&self) -> Vec<Stage> {
+        if self.stages.is_empty() {
+            vec![Stage {
+                spec: format!("{}@{}", self.heuristic_name, self.algorithm_name),
+                heuristic: self.params.heuristic.clone(),
+                search_algorithm: Some(self.params.search_algorithm),
+                seconds: None,
+            }]
+        } else {
+            self.stages.clone()
+        }
+    }
+
+    /// The STATS `heuristic` field: `ALG(HEUR)` for a plain run, so different
+    /// algorithms on the same heuristic stay distinct columns, and
+    /// `portfolio(SPEC;SPEC)` for a `--stage` run, so a portfolio row can
+    /// never be mistaken for one of its stages run alone.
+    fn stats_label(&self) -> String {
+        if self.stages.is_empty() {
+            format!("{}({})", self.algorithm_name, self.heuristic_name)
+        } else {
+            let specs: Vec<&str> = self
+                .stages
+                .iter()
+                .map(|stage| stage.spec.as_str())
+                .collect();
+            format!("portfolio({})", specs.join(";"))
+        }
+    }
+}
+
+/// Search statistics summed over the stages of one problem: counters add up
+/// and peaks take a maximum, so a STATS row says what the whole problem cost
+/// rather than what its last stage cost. Also the single shape the STATS line
+/// is written from, since the two representations keep their own.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunStats {
+    nodes_generated: usize,
+    nodes_visited: usize,
+    h_evals: usize,
+    h_eval_ms: u128,
+    pruned: usize,
+    max_steps: usize,
+    max_open_conditions: usize,
+    max_threats: usize,
+    max_disjunctions: usize,
+    max_queued: usize,
+    dropped: usize,
+    /// Whether the *last* stage run stopped for time or memory, which is what
+    /// the problem's outcome should say.
+    timed_out: bool,
+}
+
+impl RunStats {
+    /// Folds one stage's statistics into the running total.
+    fn add(&mut self, stage: &RunStats) {
+        self.nodes_generated += stage.nodes_generated;
+        self.nodes_visited += stage.nodes_visited;
+        self.h_evals += stage.h_evals;
+        self.h_eval_ms += stage.h_eval_ms;
+        self.pruned += stage.pruned;
+        self.max_steps = self.max_steps.max(stage.max_steps);
+        self.max_open_conditions = self.max_open_conditions.max(stage.max_open_conditions);
+        self.max_threats = self.max_threats.max(stage.max_threats);
+        self.max_disjunctions = self.max_disjunctions.max(stage.max_disjunctions);
+        self.max_queued = self.max_queued.max(stage.max_queued);
+        self.dropped += stage.dropped;
+        self.timed_out = stage.timed_out;
+    }
+}
+
+impl From<potoroo::search::SearchStats> for RunStats {
+    fn from(stats: potoroo::search::SearchStats) -> Self {
+        RunStats {
+            nodes_generated: stats.nodes_generated,
+            nodes_visited: stats.nodes_visited,
+            h_evals: stats.h_evals,
+            h_eval_ms: stats.h_eval_ms,
+            pruned: stats.pruned,
+            max_steps: stats.max_steps,
+            max_open_conditions: stats.max_open_conditions,
+            max_threats: stats.max_threats,
+            // Ordering disjunctions only exist on finite-domain plans.
+            max_disjunctions: 0,
+            max_queued: stats.max_queued,
+            dropped: stats.dropped,
+            timed_out: stats.timed_out,
+        }
+    }
+}
+
+impl From<potoroo::fdr_pocl::SearchStats> for RunStats {
+    fn from(stats: potoroo::fdr_pocl::SearchStats) -> Self {
+        RunStats {
+            nodes_generated: stats.nodes_generated,
+            nodes_visited: stats.nodes_visited,
+            h_evals: stats.h_evals,
+            h_eval_ms: stats.h_eval_ms,
+            pruned: stats.pruned,
+            max_steps: stats.max_steps,
+            max_open_conditions: stats.max_open_conditions,
+            max_threats: stats.max_threats,
+            max_disjunctions: stats.max_disjunctions,
+            max_queued: stats.max_queued,
+            dropped: stats.dropped,
+            timed_out: stats.timed_out,
+        }
+    }
+}
+
+/// What one search returned, with the two representations' outcomes folded
+/// into one shape. The plan is already rendered: a stage's search context is
+/// dropped before the next stage starts, so it cannot be formatted later.
+enum RunOutcome {
+    Solved {
+        plan: String,
+        steps: usize,
+        cost: usize,
+    },
+    /// The node limit (`-l`) was reached.
+    LimitReached,
+    /// The wall-clock deadline or the resident-set ceiling was reached.
+    TimedOut,
+    /// The search space was exhausted without finding a plan.
+    NoSolution,
+}
+
+impl RunOutcome {
+    /// Whether this ends the whole portfolio rather than handing over to the
+    /// next stage. A plan obviously does; so does an exhausted search space,
+    /// which is exact and says the problem is unsolvable however it is
+    /// searched. Running out of time or of nodes says nothing of the kind.
+    fn ends_the_portfolio(&self) -> bool {
+        matches!(self, RunOutcome::Solved { .. } | RunOutcome::NoSolution)
+    }
+
+    /// The word the `-v` summary and the STATS `outcome` field are derived from.
+    fn status(&self) -> &'static str {
+        match self {
+            RunOutcome::Solved { .. } => "solved",
+            RunOutcome::LimitReached => "limit reached",
+            RunOutcome::TimedOut => "time limit reached",
+            RunOutcome::NoSolution => "no solution",
+        }
+    }
 }
 
 fn run() -> Result<ExitCode, String> {
@@ -120,87 +300,51 @@ fn run() -> Result<ExitCode, String> {
             print_search_configuration(&cli);
         }
         let timer = Instant::now();
-        let ctx = SearchContext::new(domain, problem, &cli.params);
-        if cli.fdr_pocl {
-            let task = potoroo::fdr_pocl::translate(&ctx).map_err(|e| e.to_string())?;
-            if cli.verbosity > 0 {
-                eprintln!(
-                    "SAS+ task: {} variables ({} multi-valued), {} facts, {} operators",
-                    task.variables.len(),
-                    task.multi_valued_variables(),
-                    task.num_facts(),
-                    task.operators.len()
-                );
-            }
-            let symmetries = cli.params.prune.symmetry.then(|| ctx.object_symmetries());
-            if let (Some(symmetries), true) = (&symmetries, cli.verbosity > 0) {
-                eprintln!("Symmetry: {}", symmetries.summary());
-            }
-            let search_result = if cli.verbosity > 0 {
-                let mut printer = ProgressPrinter::new(cli.verbosity);
-                let mut report = |progress| printer.report(progress);
-                potoroo::fdr_pocl::solve_with_context(
-                    &task,
-                    &cli.params,
-                    symmetries.as_deref(),
-                    Some(&mut report),
-                )
-            } else {
-                potoroo::fdr_pocl::solve_with_context(
-                    &task,
-                    &cli.params,
-                    symmetries.as_deref(),
-                    None,
-                )
-            };
-            let (outcome, stats) = search_result.map_err(|e| e.to_string())?;
-            let (solved, plan_len, plan_cost, status) = match outcome {
-                potoroo::fdr_pocl::Outcome::Solved(solution) => {
-                    if cli.verbosity > 0 {
-                        eprintln!(
-                            "Plan: {} steps | cost {}",
-                            solution.operators.len(),
-                            solution.plan.cost()
-                        );
-                    }
-                    println!("{}", solution.format(&task));
-                    (
-                        true,
-                        solution.operators.len(),
-                        solution.plan.cost(),
-                        "solved",
-                    )
+        // Include translation and grounding in the wall-clock deadline.
+        let deadline = cli.time_limit.map(|limit| timer + limit);
+        let portfolio = cli.portfolio();
+        let (outcome, stats) = if cli.fdr_pocl {
+            run_fdr_portfolio(&cli, domain, problem, &portfolio, deadline)?
+        } else {
+            run_lifted_portfolio(&cli, domain, problem, &portfolio, deadline)
+        };
+
+        let (solved, plan_len, plan_cost) = match &outcome {
+            RunOutcome::Solved { plan, steps, cost } => {
+                if cli.verbosity > 0 {
+                    eprintln!("Plan: {steps} steps | cost {cost}");
                 }
-                potoroo::fdr_pocl::Outcome::LimitReached => {
-                    println!("no plan");
-                    println!(";Search limit reached.");
-                    (false, 0, 0, "limit reached")
-                }
-                potoroo::fdr_pocl::Outcome::NoSolution => {
-                    println!("no plan");
-                    println!(";Problem has no solution.");
-                    (false, 0, 0, "no solution")
-                }
-            };
-            let ms = timer.elapsed().as_millis();
-            println!("Time: {ms}");
-            if cli.verbosity > 0 {
-                print_search_summary(
-                    status,
-                    ms,
-                    stats.nodes_generated,
-                    stats.nodes_visited,
-                    stats.max_queued,
-                    stats.h_evals,
-                    stats.h_eval_ms,
-                    stats.pruned,
-                    stats.max_steps,
-                    stats.max_open_conditions,
-                    stats.max_threats,
-                );
+                println!("{plan}");
+                (true, *steps, *cost)
             }
-            if std::env::var_os("POTOROO_STATS_JSON").is_some() {
-                let label = format!("FDR:{}({})", cli.algorithm_name, cli.heuristic_name);
+            RunOutcome::LimitReached => {
+                println!("no plan");
+                println!(";Search limit reached.");
+                (false, 0, 0)
+            }
+            RunOutcome::TimedOut => {
+                println!("no plan");
+                println!(";Time limit reached.");
+                (false, 0, 0)
+            }
+            RunOutcome::NoSolution => {
+                println!("no plan");
+                println!(";Problem has no solution.");
+                (false, 0, 0)
+            }
+        };
+        let status = outcome.status();
+        let ms = timer.elapsed().as_millis();
+        println!("Time: {ms}");
+        if cli.verbosity > 0 {
+            print_search_summary(status, ms, &stats);
+        }
+
+        // Machine-readable benchmark line (stderr, opt-in). Kept off stdout so
+        // the differential tests still diff stdout byte-for-byte.
+        if std::env::var_os("POTOROO_STATS_JSON").is_some() {
+            if cli.fdr_pocl {
+                let label = format!("FDR:{}", cli.stats_label());
                 eprintln!(
                     "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":true,\
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
@@ -227,9 +371,90 @@ fn run() -> Result<ExitCode, String> {
                     outcome_label(status),
                     peak_rss_kb(),
                 );
+            } else {
+                // Label: "ALG(HEUR)" so different algorithms on the same
+                // heuristic appear as distinct columns in the benchmark table.
+                let label = cli.stats_label();
+                eprintln!(
+                    "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
+                     \"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
+                     \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\"max_steps\":{},\
+                     \"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{},\
+                     \"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
+                    json_escape(&problem.name),
+                    json_escape(&label),
+                    cli.params.ground_actions,
+                    solved,
+                    plan_len,
+                    plan_cost,
+                    stats.nodes_generated,
+                    stats.nodes_visited,
+                    ms,
+                    stats.h_evals,
+                    stats.h_eval_ms,
+                    stats.pruned,
+                    stats.max_steps,
+                    stats.max_open_conditions,
+                    stats.max_threats,
+                    stats.max_queued,
+                    stats.dropped,
+                    outcome_label(status),
+                    peak_rss_kb(),
+                );
             }
-            continue;
         }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One stage's `Parameters`: the command line's, with the heuristic, the search
+/// algorithm and the deadline replaced. Everything else — flaw orders, node
+/// limits, weight, pruning rules, action cost — is shared, so the stages of a
+/// portfolio differ only in what a portfolio is there to vary.
+///
+/// The deadline is the earlier of this stage's own share, counted from now, and
+/// the problem's global `--time-limit`: a stage never outlives the problem's
+/// budget, and a share that is left off simply runs to that budget.
+fn stage_parameters(cli: &Cli, stage: &Stage, deadline: Option<Instant>) -> Parameters {
+    let mut params = cli.params.clone();
+    params.heuristic = stage.heuristic.clone();
+    if let Some(algorithm) = stage.search_algorithm {
+        params.search_algorithm = algorithm;
+    }
+    params.deadline = match (stage.seconds, deadline) {
+        (Some(share), Some(global)) => {
+            Some((Instant::now() + Duration::from_secs_f64(share)).min(global))
+        }
+        (Some(share), None) => Some(Instant::now() + Duration::from_secs_f64(share)),
+        (None, global) => global,
+    };
+    params.memory_stop_mb = cli.stage_mem_mb;
+    params
+}
+
+/// Runs the portfolio over the lifted or `-g` representation and returns the
+/// last stage's outcome together with the statistics summed over every stage.
+///
+/// A fresh [`SearchContext`] per stage. Nothing in a context depends on *which*
+/// heuristic asked for it — the planning graph, the compiled relaxation, the
+/// Sample-FF model and the landmark sets are all functions of the domain and
+/// the problem alone — but they are exactly the memory a stage should hand back
+/// before the next one starts, which is the point of `--stage-mem-mb`. The
+/// price is re-grounding under `-g`, one Fast Downward call a stage.
+fn run_lifted_portfolio(
+    cli: &Cli,
+    domain: &Domain,
+    problem: &Problem,
+    portfolio: &[Stage],
+    deadline: Option<Instant>,
+) -> (RunOutcome, RunStats) {
+    let mut total = RunStats::default();
+    let mut last = RunOutcome::NoSolution;
+    for (index, stage) in portfolio.iter().enumerate() {
+        let params = stage_parameters(cli, stage, deadline);
+        announce_stage(cli, index, portfolio.len(), stage);
+        let ctx = SearchContext::new(domain, problem, &params);
         let (outcome, stats) = if cli.verbosity > 0 {
             let mut printer = ProgressPrinter::new(cli.verbosity);
             let mut report = |progress| printer.report(progress);
@@ -237,79 +462,118 @@ fn run() -> Result<ExitCode, String> {
         } else {
             plan_with_stats(&ctx)
         };
-        let (solved, plan_len, plan_cost, status) = match &outcome {
-            Outcome::Solved(p) => {
-                if cli.verbosity > 0 {
-                    eprintln!("Plan: {} steps | cost {}", p.num_steps(), p.cost());
-                }
-                println!("{}", format_steps(&ctx, p));
-                (true, p.num_steps(), p.cost(), "solved")
-            }
-            Outcome::LimitReached => {
-                println!("no plan");
-                println!(";Search limit reached.");
-                (false, 0, 0, "limit reached")
-            }
-            Outcome::NoSolution => {
-                println!("no plan");
-                println!(";Problem has no solution.");
-                (false, 0, 0, "no solution")
-            }
+        let stats = RunStats::from(stats);
+        let outcome = match outcome {
+            Outcome::Solved(plan) => RunOutcome::Solved {
+                plan: format_steps(&ctx, &plan),
+                steps: plan.num_steps(),
+                cost: plan.cost(),
+            },
+            Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
+            Outcome::LimitReached => RunOutcome::LimitReached,
+            Outcome::NoSolution => RunOutcome::NoSolution,
         };
-        let ms = timer.elapsed().as_millis();
-        println!("Time: {ms}");
-        if cli.verbosity > 0 {
-            print_search_summary(
-                status,
-                ms,
-                stats.nodes_generated,
-                stats.nodes_visited,
-                stats.max_queued,
-                stats.h_evals,
-                stats.h_eval_ms,
-                stats.pruned,
-                stats.max_steps,
-                stats.max_open_conditions,
-                stats.max_threats,
-            );
-        }
-
-        // Machine-readable benchmark line (stderr, opt-in). Kept off stdout so
-        // the differential tests still diff stdout byte-for-byte.
-        if std::env::var_os("POTOROO_STATS_JSON").is_some() {
-            // Label: "ALG(HEUR)" so different algorithms on the same heuristic
-            // appear as distinct columns in the benchmark table.
-            let label = format!("{}({})", cli.algorithm_name, cli.heuristic_name);
-            eprintln!(
-                "STATS {{\"problem\":\"{}\",\"heuristic\":\"{}\",\"ground\":{},\"solved\":{},\
-                 \"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\"wall_ms\":{},\
-                 \"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\"max_steps\":{},\
-                 \"max_open_conditions\":{},\"max_threats\":{},\"max_queued\":{},\
-                 \"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
-                json_escape(&problem.name),
-                json_escape(&label),
-                cli.params.ground_actions,
-                solved,
-                plan_len,
-                plan_cost,
-                stats.nodes_generated,
-                stats.nodes_visited,
-                ms,
-                stats.h_evals,
-                stats.h_eval_ms,
-                stats.pruned,
-                stats.max_steps,
-                stats.max_open_conditions,
-                stats.max_threats,
-                stats.max_queued,
-                stats.dropped,
-                outcome_label(status),
-                peak_rss_kb(),
-            );
+        total.add(&stats);
+        report_stage(cli, index, portfolio.len(), &outcome, stats.nodes_generated);
+        last = outcome;
+        if last.ends_the_portfolio() {
+            break;
         }
     }
+    (last, total)
+}
 
-    Ok(ExitCode::SUCCESS)
+/// Runs the portfolio over the finite-domain representation.
+///
+/// The SAS+ translation reads only the domain and the problem, so it is done
+/// once for the whole portfolio: it costs a Fast Downward invocation, which a
+/// restart has no reason to pay again. Each stage still builds its own planner,
+/// so the heuristic's tables are freed at the stage boundary.
+fn run_fdr_portfolio(
+    cli: &Cli,
+    domain: &Domain,
+    problem: &Problem,
+    portfolio: &[Stage],
+    deadline: Option<Instant>,
+) -> Result<(RunOutcome, RunStats), String> {
+    let ctx = SearchContext::new(domain, problem, &cli.params);
+    let task = potoroo::fdr_pocl::translate(&ctx).map_err(|e| e.to_string())?;
+    if cli.verbosity > 0 {
+        eprintln!(
+            "SAS+ task: {} variables ({} multi-valued), {} facts, {} operators",
+            task.variables.len(),
+            task.multi_valued_variables(),
+            task.num_facts(),
+            task.operators.len()
+        );
+    }
+    let symmetries = cli.params.prune.symmetry.then(|| ctx.object_symmetries());
+    if let (Some(symmetries), true) = (&symmetries, cli.verbosity > 0) {
+        eprintln!("Symmetry: {}", symmetries.summary());
+    }
+    // The lifted context has served its purpose; the SAS+ task and the symmetry
+    // table do not borrow from it, and a portfolio has no use for its memory.
+    drop(ctx);
+
+    let mut total = RunStats::default();
+    let mut last = RunOutcome::NoSolution;
+    for (index, stage) in portfolio.iter().enumerate() {
+        let params = stage_parameters(cli, stage, deadline);
+        announce_stage(cli, index, portfolio.len(), stage);
+        let search_result = if cli.verbosity > 0 {
+            let mut printer = ProgressPrinter::new(cli.verbosity);
+            let mut report = |progress| printer.report(progress);
+            potoroo::fdr_pocl::solve_with_context(
+                &task,
+                &params,
+                symmetries.as_deref(),
+                Some(&mut report),
+            )
+        } else {
+            potoroo::fdr_pocl::solve_with_context(&task, &params, symmetries.as_deref(), None)
+        };
+        let (outcome, stats) = search_result.map_err(|e| e.to_string())?;
+        let stats = RunStats::from(stats);
+        let outcome = match outcome {
+            potoroo::fdr_pocl::Outcome::Solved(solution) => RunOutcome::Solved {
+                plan: solution.format(&task),
+                steps: solution.operators.len(),
+                cost: solution.plan.cost(),
+            },
+            potoroo::fdr_pocl::Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
+            potoroo::fdr_pocl::Outcome::LimitReached => RunOutcome::LimitReached,
+            potoroo::fdr_pocl::Outcome::NoSolution => RunOutcome::NoSolution,
+        };
+        total.add(&stats);
+        report_stage(cli, index, portfolio.len(), &outcome, stats.nodes_generated);
+        last = outcome;
+        if last.ends_the_portfolio() {
+            break;
+        }
+    }
+    Ok((last, total))
+}
+
+/// The `-v` line at the start of a stage. Silent for a plain run, whose single
+/// implicit stage is the whole search: saying so would only be noise.
+fn announce_stage(cli: &Cli, index: usize, stages: usize, stage: &Stage) {
+    if cli.verbosity > 0 && !cli.stages.is_empty() {
+        eprintln!("Stage {}/{} started: {}", index + 1, stages, stage.spec);
+    }
+}
+
+/// The `-v` line at the end of a stage, saying why it stopped and how much of
+/// the search space it had covered when it did.
+fn report_stage(cli: &Cli, index: usize, stages: usize, outcome: &RunOutcome, generated: usize) {
+    if cli.verbosity > 0 && !cli.stages.is_empty() {
+        eprintln!(
+            "Stage {}/{} finished: {} | generated {}",
+            index + 1,
+            stages,
+            outcome.status(),
+            generated,
+        );
+    }
 }
 
 /// Throttles the per-expansion callback into compact, line-oriented telemetry.
@@ -399,6 +663,24 @@ fn print_search_configuration(cli: &Cli) {
         limits,
     );
 
+    if let Some(limit) = cli.time_limit {
+        eprintln!(
+            "Time limit: {:.3}s per problem, counted from before translation",
+            limit.as_secs_f64()
+        );
+    }
+    if !cli.stages.is_empty() {
+        let specs: Vec<&str> = cli.stages.iter().map(|stage| stage.spec.as_str()).collect();
+        eprintln!(
+            "Portfolio: {} stages | {}",
+            cli.stages.len(),
+            specs.join(" ; ")
+        );
+    }
+    if let Some(mb) = cli.stage_mem_mb {
+        eprintln!("Stage memory: a stage ends once the process holds {mb} MB resident");
+    }
+
     let prune = cli.params.prune.names();
     if !prune.is_empty() {
         eprintln!("Pruning: {}", prune.join(","));
@@ -447,33 +729,20 @@ fn action_cost_name(cost: ActionCost) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn print_search_summary(
-    status: &str,
-    wall_ms: u128,
-    generated: usize,
-    visited: usize,
-    max_queued: usize,
-    h_evals: usize,
-    h_eval_ms: u128,
-    pruned: usize,
-    max_steps: usize,
-    max_open: usize,
-    max_threats: usize,
-) {
+fn print_search_summary(status: &str, wall_ms: u128, stats: &RunStats) {
     eprintln!(
         "Search finished: {} in {:.2}s | visited {} | generated {} | max queued {} | h {} evals / {} ms | pruned {} | largest plan steps={} open={} threats={}",
         status,
         wall_ms as f64 / 1000.0,
-        visited,
-        generated,
-        max_queued,
-        h_evals,
-        h_eval_ms,
-        pruned,
-        max_steps,
-        max_open,
-        max_threats,
+        stats.nodes_visited,
+        stats.nodes_generated,
+        stats.max_queued,
+        stats.h_evals,
+        stats.h_eval_ms,
+        stats.pruned,
+        stats.max_steps,
+        stats.max_open_conditions,
+        stats.max_threats,
     );
 }
 
@@ -496,6 +765,10 @@ fn outcome_label(status: &str) -> &'static str {
     match status {
         "solved" => "solved",
         "limit reached" => "limit",
+        // A stage or a run stopped by `--stage-mem-mb` reports the same
+        // outcome: from the sweep's side both are budgets the planner honoured
+        // itself rather than deaths it could not report.
+        "time limit reached" => "timeout",
         _ => "noplan",
     }
 }
@@ -531,6 +804,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
     let mut flaw_order_names: Vec<String> = Vec::new();
     let mut search_limits: Vec<usize> = Vec::new();
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut time_limit: Option<Duration> = None;
+    let mut stage_mem_mb: Option<usize> = None;
 
     let args: Vec<String> = args.collect();
     let mut i = 0;
@@ -626,6 +902,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 let v = required_value!();
                 params.memory_limit_mb = Some(parse_count(&flag, &v)?);
             }
+            "stage" => {
+                let v = required_value!();
+                stages.push(parse_stage(&v)?);
+            }
+            "stage-mem-mb" => {
+                let v = required_value!();
+                stage_mem_mb = Some(parse_count(&flag, &v)?);
+            }
             "r" => return Err("-r (random open conditions) is not yet supported".to_string()),
             "S" => {
                 let _ = required_value!(); // seed; only relevant with -r
@@ -636,7 +920,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 algorithm_name = v.to_ascii_uppercase();
             }
             "T" => {
-                let _ = required_value!(); // time limit (minutes) — accepted, not enforced
+                // VHPOP spells the wall-clock limit in minutes; `--time-limit`
+                // spells the same limit in seconds.
+                let v = required_value!();
+                time_limit = Some(Duration::from_secs_f64(60.0 * parse_seconds(&v)?));
+            }
+            "time-limit" => {
+                let v = required_value!();
+                time_limit = Some(Duration::from_secs_f64(parse_seconds(&v)?));
             }
             "t" => {
                 let _ = required_value!(); // durative tolerance — deferred
@@ -679,7 +970,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         let pad = params.search_limits.last().copied().unwrap_or(usize::MAX);
         params.search_limits.push(pad);
     }
-    if !fdr_pocl && params.heuristic.requires_fdr_pocl() {
+    if !fdr_pocl
+        && (params.heuristic.requires_fdr_pocl()
+            || stages
+                .iter()
+                .any(|stage| stage.heuristic.requires_fdr_pocl()))
+    {
         return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
     }
 
@@ -696,7 +992,40 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         flaw_order_names,
         heuristic_name,
         algorithm_name,
+        stages,
+        time_limit,
+        stage_mem_mb,
     }))
+}
+
+/// Parses one `--stage` value: `HEURISTIC[@SEARCH][=SECS]`. The heuristic is
+/// required; the search algorithm and the time share fall back to `-s` and
+/// `--time-limit`. No heuristic or algorithm name contains `@` or `=`, so the
+/// spec splits unambiguously left to right.
+fn parse_stage(spec: &str) -> Result<Stage, String> {
+    let (head, seconds) = match spec.split_once('=') {
+        Some((head, share)) => (
+            head,
+            Some(
+                parse_seconds(share)
+                    .map_err(|_| format!("invalid stage time limit `{share}` in `{spec}`"))?,
+            ),
+        ),
+        None => (spec, None),
+    };
+    let (heuristic_name, algorithm_name) = match head.split_once('@') {
+        Some((heuristic, algorithm)) => (heuristic, Some(algorithm)),
+        None => (head, None),
+    };
+    if heuristic_name.is_empty() {
+        return Err(format!("stage `{spec}` names no heuristic"));
+    }
+    Ok(Stage {
+        spec: spec.to_string(),
+        heuristic: Heuristic::parse(heuristic_name)?,
+        search_algorithm: algorithm_name.map(parse_search_algorithm).transpose()?,
+        seconds,
+    })
 }
 
 /// Maps a long option name to its short letter.
@@ -716,7 +1045,9 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "random-open-conditions" => "r",
         "seed" => "S",
         "search-algorithm" => "s",
-        "time-limit" => "T",
+        "stage" => "stage",
+        "stage-mem-mb" => "stage-mem-mb",
+        "time-limit" => "time-limit",
         "tolerance" => "t",
         "verbose" => "v",
         "version" => "V",
@@ -734,6 +1065,15 @@ fn parse_count(flag: &str, v: &str) -> Result<usize, String> {
         _ => Err(format!(
             "option --{flag} requires a positive integer, got `{v}`"
         )),
+    }
+}
+
+/// A positive, finite time in the option's own unit — seconds for
+/// `--time-limit` and a stage's share, minutes for `-T`.
+fn parse_seconds(v: &str) -> Result<f64, String> {
+    match v.parse::<f64>() {
+        Ok(seconds) if seconds > 0.0 && seconds.is_finite() => Ok(seconds),
+        _ => Err(format!("invalid time limit `{v}`")),
     }
 }
 
@@ -785,6 +1125,14 @@ fn print_help() {
          \x20 -p, --prune=RULES          opt-in pruning: cutset, edelete, disjunctive, params,\n\
          \x20                            recursion, minimality, symmetry, all, none (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
+         \x20     --stage=SPEC           restart-portfolio stage HEURISTIC[@SEARCH][=SECS];\n\
+         \x20                            repeatable, run in order, @SEARCH defaults to -s and\n\
+         \x20                            =SECS to the remaining --time-limit\n\
+         \x20     --stage-mem-mb=M       end a stage once the process holds M MB resident, so\n\
+         \x20                            the next one starts with the memory back\n\
+         \x20 -T, --time-limit=SECS      wall-clock limit per problem, counted from before\n\
+         \x20                            translation and grounding; -T takes minutes,\n\
+         \x20                            --time-limit takes seconds\n\
          \x20 -v, --verbose[=N]          live search telemetry (repeat for more frequent updates)\n\
          \x20 -w, --weight=W             heuristic weight (default 1)\n\
          \x20 -H, --help                 display this help and exit\n\
@@ -823,5 +1171,132 @@ mod tests {
     fn an_explicit_heuristic_still_wins() {
         assert_eq!(cli(&["-h", "ADDR"]).heuristic_name, "ADDR");
         assert_eq!(cli(&["--fdr-pocl", "-h", "ADDR"]).heuristic_name, "ADDR");
+    }
+
+    fn rejects(args: &[&str]) -> String {
+        match parse_args(args.iter().map(|arg| (*arg).to_string())) {
+            Err(message) => message,
+            Ok(_) => panic!("arguments {args:?} were accepted"),
+        }
+    }
+
+    #[test]
+    fn a_stage_spec_takes_a_heuristic_a_search_and_a_time_share() {
+        let cli = cli(&[
+            "--fdr-pocl",
+            "--stage",
+            "CLFF@ALT=10",
+            "--stage=ADD=2.5",
+            "--stage",
+            "ADDR",
+        ]);
+        assert_eq!(cli.stages.len(), 3);
+
+        assert_eq!(cli.stages[0].spec, "CLFF@ALT=10");
+        assert_eq!(cli.stages[0].search_algorithm, Some(SearchAlgorithm::Alt));
+        assert_eq!(cli.stages[0].seconds, Some(10.0));
+
+        // `@SEARCH` omitted: the stage inherits `-s`, which the runner supplies
+        // rather than the parser, so the stage itself records nothing.
+        assert_eq!(cli.stages[1].spec, "ADD=2.5");
+        assert_eq!(cli.stages[1].search_algorithm, None);
+        assert_eq!(cli.stages[1].seconds, Some(2.5));
+
+        // `=SECS` omitted: the stage runs to the global limit, or forever.
+        assert_eq!(cli.stages[2].spec, "ADDR");
+        assert_eq!(cli.stages[2].search_algorithm, None);
+        assert_eq!(cli.stages[2].seconds, None);
+    }
+
+    #[test]
+    fn a_stage_spec_rejects_what_it_cannot_run() {
+        assert!(rejects(&["--stage", "ADD=0"]).contains("invalid stage time limit `0`"));
+        assert!(rejects(&["--stage", "ADD=x"]).contains("invalid stage time limit `x`"));
+        assert!(rejects(&["--stage", "ADD=-1"]).contains("invalid stage time limit `-1`"));
+        assert!(rejects(&["--stage", "NOPE"]).contains("invalid heuristic `NOPE`"));
+        assert!(rejects(&["--stage", "ADD@NOPE"]).contains("invalid search algorithm `NOPE`"));
+        assert!(rejects(&["--stage", "=10"]).contains("names no heuristic"));
+        // The same rejection `-h` gives, so a portfolio cannot smuggle an FDR
+        // heuristic into a representation that has no facts for it.
+        assert!(rejects(&["--stage", "LMCUT"]).contains("require --fdr-pocl"));
+        assert!(rejects(&["--stage", "ADD", "--stage", "CLFF"]).contains("require --fdr-pocl"));
+    }
+
+    #[test]
+    fn the_time_limit_is_seconds_and_dash_t_is_minutes() {
+        assert_eq!(cli(&[]).time_limit, None);
+        assert_eq!(
+            cli(&["--time-limit", "2.5"]).time_limit,
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(
+            cli(&["--time-limit=0.001"]).time_limit,
+            Some(Duration::from_micros(1000))
+        );
+        assert_eq!(cli(&["-T", "2"]).time_limit, Some(Duration::from_secs(120)));
+        assert!(rejects(&["--time-limit", "0"]).contains("invalid time limit `0`"));
+        assert!(rejects(&["-T", "later"]).contains("invalid time limit `later`"));
+    }
+
+    #[test]
+    fn a_plain_run_is_a_portfolio_of_one_stage() {
+        let cli = cli(&["-h", "ADDR", "-s", "GBFS"]);
+        assert!(cli.stages.is_empty());
+        let portfolio = cli.portfolio();
+        assert_eq!(portfolio.len(), 1);
+        assert_eq!(portfolio[0].search_algorithm, Some(SearchAlgorithm::Gbfs));
+        assert_eq!(portfolio[0].seconds, None);
+        assert_eq!(cli.stats_label(), "GBFS(ADDR)");
+    }
+
+    #[test]
+    fn a_portfolio_is_labelled_apart_from_any_stage_run_alone() {
+        let cli = cli(&["--stage", "ADD=10", "--stage", "ADDR@ALT"]);
+        assert_eq!(cli.stats_label(), "portfolio(ADD=10;ADDR@ALT)");
+        assert_eq!(cli.portfolio().len(), 2);
+    }
+
+    #[test]
+    fn a_stage_inherits_every_parameter_it_does_not_name() {
+        let cli = cli(&[
+            "--stage",
+            "ADDR@GBFS=10",
+            "-s",
+            "ALT",
+            "-w",
+            "3",
+            "-l",
+            "500",
+            "-p",
+            "cutset",
+            "--stage-mem-mb",
+            "600",
+        ]);
+        let stage = &cli.portfolio()[0];
+        let params = stage_parameters(&cli, stage, None);
+        assert_eq!(params.search_algorithm, SearchAlgorithm::Gbfs);
+        assert_eq!(params.weight, 3.0);
+        assert_eq!(params.search_limits, vec![500]);
+        assert!(params.prune.cutset);
+        assert_eq!(params.memory_stop_mb, Some(600));
+        assert!(params.deadline.is_some());
+
+        // A stage with no share of its own runs to the global deadline.
+        let unbounded = Stage {
+            seconds: None,
+            ..stage.clone()
+        };
+        assert!(stage_parameters(&cli, &unbounded, None).deadline.is_none());
+        let global = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            stage_parameters(&cli, &unbounded, Some(global)).deadline,
+            Some(global)
+        );
+        // A share longer than what is left of the global limit is cut to it.
+        let near = Instant::now() + Duration::from_millis(1);
+        assert_eq!(
+            stage_parameters(&cli, stage, Some(near)).deadline,
+            Some(near)
+        );
     }
 }

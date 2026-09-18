@@ -1,5 +1,7 @@
 //! Planning parameters and defaults.
 
+use std::time::Instant;
+
 use crate::heuristics::{FlawSelectionOrder, Heuristic};
 use crate::pruning::PruneOptions;
 
@@ -72,6 +74,20 @@ pub struct Parameters {
     /// Halve every open list once the process's resident set exceeds this
     /// many megabytes. Incomplete; see [`crate::memory`].
     pub memory_limit_mb: Option<usize>,
+    /// Wall-clock instant at which the search must give up and report the
+    /// limit reached. Checked once per expanded node: a clock read costs a
+    /// fraction of an expansion, and a node is the finest granularity a
+    /// restart portfolio has any use for. `None` (the default) never reads the
+    /// clock at all, so an unbounded run pays nothing for the field.
+    pub deadline: Option<Instant>,
+    /// Stop the search once the process's resident set exceeds this many
+    /// megabytes. Unlike [`Parameters::memory_limit_mb`], which trims the open
+    /// list and is therefore incomplete, this only *ends* the search: no node
+    /// is dropped and the outcome is the same limit-reached that a deadline
+    /// gives. That is what lets a memory-hungry stage of a `--stage` portfolio
+    /// run before another one — its queues are freed at the restart instead of
+    /// the process being killed under a hard address-space cap.
+    pub memory_stop_mb: Option<usize>,
 }
 
 impl Default for Parameters {
@@ -90,6 +106,8 @@ impl Default for Parameters {
             prune: PruneOptions::default(),
             max_queued: None,
             memory_limit_mb: None,
+            deadline: None,
+            memory_stop_mb: None,
         }
     }
 }

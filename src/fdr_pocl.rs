@@ -735,6 +735,10 @@ pub struct SearchStats {
     pub max_queued: usize,
     /// Queued plans discarded by an open-list bound; see [`crate::memory`].
     pub dropped: usize,
+    /// Whether the search stopped because its wall-clock deadline or its
+    /// resident-set ceiling passed, rather than because it ran out of nodes or
+    /// of search space. See [`crate::memory::SearchStop`].
+    pub timed_out: bool,
     h_eval_nanos: u128,
 }
 
@@ -1089,6 +1093,10 @@ impl<'a> Planner<'a> {
         let mut generated_per_order = vec![0usize; n_orders];
         let mut stats = SearchStats::default();
         let mut bound = crate::memory::OpenListBound::new(params);
+        let mut stop = crate::memory::SearchStop::new(params);
+        // Whether time or memory ended the search. A stop is a restart, not a
+        // prune: nothing queued has been discarded.
+        let mut timed_out = false;
         let mut current_order = 0usize;
         let mut orders_left = n_orders;
         let mut next_switch = 1_000usize;
@@ -1146,6 +1154,12 @@ impl<'a> Planner<'a> {
                     continue;
                 }
 
+                if let Some(stop) = stop.as_mut() {
+                    if stop.expired(stats.nodes_visited) {
+                        timed_out = true;
+                        break;
+                    }
+                }
                 stats.nodes_visited += 1;
                 stats.max_steps = stats.max_steps.max(plan.num_steps());
                 stats.max_open_conditions =
@@ -1324,6 +1338,9 @@ impl<'a> Planner<'a> {
                 }
             }
 
+            if timed_out {
+                break;
+            }
             if orders_left == 0 {
                 break;
             }
@@ -1336,8 +1353,10 @@ impl<'a> Planner<'a> {
             }
         }
 
-        // Queues emptied by an open-list bound say nothing about solvability.
-        if limit_reached || stats.dropped > 0 {
+        // Queues emptied by an open-list bound say nothing about solvability,
+        // and neither does a search stopped part-way for time or memory.
+        stats.timed_out = timed_out;
+        if timed_out || limit_reached || stats.dropped > 0 {
             (Outcome::LimitReached, stats)
         } else {
             (Outcome::NoSolution, stats)

@@ -6,6 +6,7 @@
 //! may retain freed memory. These limits are disabled by default.
 
 use std::collections::BinaryHeap;
+use std::time::Instant;
 
 use crate::params::Parameters;
 
@@ -74,6 +75,61 @@ impl OpenListBound {
             (None, None) => return None,
         };
         (queued > capacity + capacity / SLACK).then_some(capacity)
+    }
+}
+
+/// The stops a search honours at each expanded node: a wall-clock deadline
+/// (`--time-limit`, or one stage's share of it) and a resident-set ceiling
+/// (`--stage-mem-mb`).
+///
+/// Neither drops a node, which is what separates this from [`OpenListBound`]
+/// above: the search simply ends where it stands and reports the limit
+/// reached, so nothing it would have explored is silently discarded. That
+/// makes a stop sound in a way trimming the open list is not, and it is what a
+/// restart portfolio needs — a stage that ends has its queues freed for the
+/// next one rather than taking the process down with it.
+#[derive(Debug)]
+pub struct SearchStop {
+    deadline: Option<Instant>,
+    memory_kb: Option<u64>,
+    /// Expansion count at which the resident set is next read.
+    next_check: usize,
+}
+
+impl SearchStop {
+    /// `None` when neither stop is set, so an unbounded search never reads the
+    /// clock or `/proc` at all.
+    pub fn new(params: &Parameters) -> Option<Self> {
+        if params.deadline.is_none() && params.memory_stop_mb.is_none() {
+            return None;
+        }
+        Some(SearchStop {
+            deadline: params.deadline,
+            memory_kb: params.memory_stop_mb.map(|mb| mb as u64 * 1024),
+            next_check: 0,
+        })
+    }
+
+    /// Whether the search should stop now, given how many nodes it has
+    /// expanded. The clock is read every call, since a read is cheap beside an
+    /// expansion and a late stop is a stage overrunning its share; the
+    /// resident set comes from a file in `/proc` and is read only every
+    /// [`CHECK_INTERVAL`] expansions.
+    pub fn expired(&mut self, expansions: usize) -> bool {
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                return true;
+            }
+        }
+        if let Some(limit) = self.memory_kb {
+            if expansions >= self.next_check {
+                self.next_check = expansions.saturating_add(CHECK_INTERVAL);
+                if resident_set_kb() > limit {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -165,6 +221,43 @@ mod tests {
         assert_eq!(queues[1].peek(), Some(&29));
         assert!(queues[2].is_empty());
         assert_eq!(trim_all(&mut queues, 10), 0);
+    }
+
+    #[test]
+    fn no_stop_is_built_without_a_time_or_memory_bound() {
+        assert!(SearchStop::new(&Parameters::default()).is_none());
+    }
+
+    #[test]
+    fn a_passed_deadline_stops_the_search() {
+        let params = Parameters {
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..Parameters::default()
+        };
+        let mut stop = SearchStop::new(&params).expect("a deadline builds a stop");
+        assert!(stop.expired(0));
+
+        let params = Parameters {
+            deadline: Some(Instant::now() + std::time::Duration::from_secs(3600)),
+            ..Parameters::default()
+        };
+        let mut stop = SearchStop::new(&params).expect("a deadline builds a stop");
+        assert!(!stop.expired(0));
+    }
+
+    #[test]
+    fn a_memory_stop_fires_once_the_resident_set_is_over_the_bound() {
+        // One megabyte is below anything this process can be running in, so
+        // the reading is over the bound whenever it can be taken at all.
+        let params = Parameters {
+            memory_stop_mb: Some(1),
+            ..Parameters::default()
+        };
+        let mut stop = SearchStop::new(&params).expect("a memory stop builds a stop");
+        assert_eq!(stop.expired(0), resident_set_kb() > 1024);
+        // The next reading is a whole interval away, so the intervening
+        // expansions cost nothing.
+        assert!(!stop.expired(1));
     }
 
     #[test]

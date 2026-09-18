@@ -10,13 +10,19 @@
 #                 SEARCH is a -s value; several rules are joined with `+`.
 #                 e.g. ADD, ADD+cutset, fdr:ADD@ALT, g:ADD,
 #                 fdr:LMCUT+cutset+edelete+disjunctive
+#                 A HEURISTIC that joins several specs with `;` is a restart
+#                 portfolio: each piece becomes a --stage HEURISTIC[@SEARCH][=SECS],
+#                 run in order until one solves the problem, and the rules still
+#                 trail the whole configuration.
+#                 e.g. fdr:CLFF@ALT=10;ADD, fdr:CLFF@ALT=10;ADD+cutset
 #     -t SECS     per-run wall timeout (default 60)
 #     -n N        problems per family, smallest first (default 5)
 #     -j N        concurrent runs (default 4)
 #     -m MB       per-run address-space cap (default 4096)
 #     -o FILE     result CSV (default sweep-results.csv)
 #     -x FLAGS    extra planner flags applied to every configuration,
-#                 e.g. -x "--mem-mb 600" for a run under -m 768
+#                 e.g. -x "--mem-mb 600" for a run under -m 768, or
+#                 -x "--stage-mem-mb 600" to bound each stage of a portfolio
 #     -r          resume: keep the rows already in the result CSV and run
 #                 only the (family, problem, config) triples it lacks
 #
@@ -79,10 +85,16 @@ fi
 run_one() {
   family="$1"; domain="$2"; problem="$3"; config="$4"
   name="$(basename "$problem" .pddl)"
-  # A configuration is [MODE:]HEURISTIC[+RULES][@SEARCH].
-  cfg="$config"; mode="lifted"; search=""
+  # A configuration is [MODE:]HEURISTIC[+RULES][@SEARCH], and a HEURISTIC that
+  # joins several specs with `;` is a restart portfolio.
+  cfg="$config"; mode="lifted"; search=""; portfolio=0
   case "$cfg" in *:*) mode="${cfg%%:*}"; cfg="${cfg#*:}" ;; esac
-  case "$cfg" in *@*) search="${cfg##*@}"; cfg="${cfg%@*}" ;; esac
+  # The `;` is looked for before `@SEARCH` is split off: every stage carries its
+  # own `@`, so `CLFF@ALT=10;ADD` has no trailing search algorithm to extract.
+  case "${cfg%%+*}" in *\;*) portfolio=1 ;; esac
+  if [ "$portfolio" -eq 0 ]; then
+    case "$cfg" in *@*) search="${cfg##*@}"; cfg="${cfg%@*}" ;; esac
+  fi
   heuristic="${cfg%%+*}"
   if [ "$heuristic" = "$cfg" ]; then prune="none"; else prune="${cfg#*+}"; prune="${prune//+/,}"; fi
   # Built as an array: the xargs wrapper below sets IFS to a tab, so a
@@ -95,14 +107,24 @@ run_one() {
     *) printf '%s,%s,%s,0,0,0,0,badconfig,0,0\n' "$family" "$name" "$config"; return ;;
   esac
   [ -n "$search" ] && args+=(-s "$search")
-  # shellcheck disable=SC2206
-  [ -n "$EXTRA" ] && args+=($EXTRA)
+  if [ "$portfolio" -eq 1 ]; then
+    IFS=';' read -r -a pieces <<< "$heuristic"
+    for piece in "${pieces[@]}"; do args+=(--stage "$piece"); done
+  else
+    args+=(-h "$heuristic")
+  fi
+  # Split on spaces explicitly: the xargs wrapper below leaves IFS set to a tab,
+  # under which `--mem-mb 600` would reach the planner as one unparseable word.
+  if [ -n "$EXTRA" ]; then
+    IFS=' ' read -r -a extra_args <<< "$EXTRA"
+    args+=("${extra_args[@]}")
+  fi
   err="$(mktemp)"
   # `-v` costs one progress line a second and is what lets a run that dies of
   # memory still report how many nodes it had generated.
   (
     ulimit -v $((MEM_MB * 1024)) 2>/dev/null
-    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" "${args[@]}" -v -h "$heuristic" -p "$prune" \
+    POTOROO_STATS_JSON=1 timeout "$TIMEOUT" "$BIN" "${args[@]}" -v -p "$prune" \
       "$domain" "$problem" >/dev/null 2>"$err"
   ) 2>/dev/null
   code=$?

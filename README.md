@@ -320,6 +320,9 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | — | `--mem-mb` | M | Hold the open lists so the resident set stays near M MB (incomplete; same section) | off |
 | `-p` | `--prune` | RULES | Opt-in pruning rules (see [Pruning rules](#pruning-rules)); `symmetry` is the one new here | none |
 | `-s` | `--search-algorithm` | `A`\|`IDA`\|`HC`\|`BFS`\|`GBFS`\|`LGBFS`\|`LGBFS-D`\|`ALT` | Search algorithm (`A` = best-first A\*; `ALT` = LAMA-style 1:1 alternation between A\*- and GBFS-ordered queues) | `A` |
+| — | `--stage` | `HEUR[@SEARCH][=SECS]` | One stage of a sequential restart portfolio; repeatable (see [Restart portfolio](#a-restart-portfolio)) | off |
+| — | `--stage-mem-mb` | M | End a stage once the process holds M MB resident, so the next one starts with the memory back (same section) | off |
+| `-T` | `--time-limit` | SECS | Wall-clock limit per problem, counted from before translation. `-T` takes **minutes**, `--time-limit` **seconds** | unlimited |
 | `-v` | `--verbose` | [N] | Live telemetry; repeat for faster updates (`-vv`, `-vvv`) | 0 |
 | `-w` | `--weight` | W | Heuristic weight multiplier on the h-term | 1.0 |
 | `-H` | `--help` | — | Display help and exit | |
@@ -925,6 +928,73 @@ empties its lists after dropping anything reports the limit reached rather
 than the problem unsolvable, and `dropped` in the statistics counts what it
 threw away. Under an admissible heuristic the returned plan is no longer
 guaranteed optimal.
+
+### A restart portfolio
+
+The sound counterpart, and the other thing to do with a memory bound. A
+**stage** is a whole search, restarted from the initial plan with a different
+heuristic; a stage that ends leaves its part of the search space unexplored
+rather than excluded, so nothing here drops a node.
+
+```bash
+# Ten seconds of CLFF under queue alternation, then ADD with whatever is left
+potoroo --fdr-pocl --stage 'CLFF@ALT=10' --stage ADD --time-limit 20 domain.pddl p01.pddl
+
+# The same, with each stage handing back its memory at 600 MB
+potoroo --fdr-pocl --stage 'CLFF@ALT=10' --stage ADD --stage-mem-mb 600 domain.pddl p01.pddl
+```
+
+`--stage HEURISTIC[@SEARCH][=SECS]` is repeatable and the stages run in the
+order given. `HEURISTIC` is anything `-h` accepts; `@SEARCH` is anything `-s`
+accepts and defaults to `-s`; `=SECS` is that stage's share of the clock and
+defaults to whatever is left of `--time-limit`. Everything else — flaw orders,
+`-l`, `-w`, `-p`, `-a` — is shared, so the stages differ only in what a
+portfolio is there to vary. A stage ends when it solves the problem (the
+portfolio ends with it), when its share runs out, or when it hits `-l`; an
+**exhausted search space ends the whole portfolio**, since that verdict is
+exact and re-searching it with another heuristic would only confirm it. The
+statistics sum over the stages, and the STATS `heuristic` field becomes
+`FDR:portfolio(CLFF@ALT=10;ADD)` so a portfolio row can never be mistaken for
+one of its stages run alone.
+
+`--time-limit SECS` works on its own, without any `--stage`: the search stops
+at the deadline, prints `;Time limit reached.`, and reports `"outcome":
+"timeout"`. The deadline is taken *before* translation and grounding, because
+a sweep measures wall time from process start and a limit covering only search
+would let a slow front end overrun it uncharged. `-T` is the same limit in
+minutes, which is what VHPOP spells it in.
+
+`--stage-mem-mb M` ends a stage once the process's resident set passes `M`,
+reported as a time limit because it is the same kind of budget — one the
+planner honoured itself rather than a death it could not report. It exists
+because [the failures here are memory deaths](#node-size-and-memory): under a
+hard address-space cap a stage that runs out of memory aborts the whole
+process, so without it a memory-hungry heuristic could never be run anywhere
+but last. Dropping the stage's queues at the restart is what frees the memory;
+the resident set is read once every 1024 expansions, not every one.
+
+`scripts/lm_sweep.sh` takes a portfolio as a configuration whose heuristic part
+joins several specs with `;`, so the whole thing stays one CSV column:
+
+```bash
+scripts/lm_sweep.sh -c 'fdr:ADD,fdr:CLFF@ALT,fdr:CLFF@ALT=10;ADD' -x '--stage-mem-mb 600'
+# fdr:CLFF@ALT=10;ADD+cutset  ->  --fdr-pocl --stage CLFF@ALT=10 --stage ADD -p cutset
+```
+
+**Why this is worth having, on the numbers already measured.** Computed offline
+from `docs/final-sweep-results.csv`: a 10 s + 10 s split of `--fdr-pocl ADD`
+and `--fdr-pocl CLFF -s ALT` would cover **157 of 441** problems against **138**
+for the best single configuration. The split hardly matters — any division from
+3 s to 13 s lands between 155 and 157 — because both configurations solve in
+about **80 ms median** when they solve at all, so a stage either wins almost
+immediately or was never going to. And `ADD`'s failures are memory deaths, not
+timeouts, which is what fixes the order: `ADD` must run **last**, or under
+`--stage-mem-mb`.
+
+That is an estimate from rows measured one configuration at a time, not a
+portfolio sweep. The measured table goes here:
+
+<!-- PORTFOLIO-SWEEP -->
 
 ## Landmark sweep
 

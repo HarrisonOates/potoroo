@@ -764,6 +764,11 @@ pub struct SearchStats {
     /// Queued plans discarded by an open-list bound (`--max-queued`,
     /// `--mem-mb`). Zero unless one is set; see [`crate::memory`].
     pub dropped: usize,
+    /// Whether the search stopped because its wall-clock deadline or its
+    /// resident-set ceiling passed, rather than because it ran out of nodes or
+    /// of search space. The outcome is [`Outcome::LimitReached`] either way;
+    /// this is what tells the two apart. See [`crate::memory::SearchStop`].
+    pub timed_out: bool,
 }
 
 /// A point-in-time view of an active search, delivered after an expansion.
@@ -1129,7 +1134,12 @@ fn plan_impl(
     let mut max_threats: usize = 0;
     let mut max_queued: usize = 0;
     let mut bound = crate::memory::OpenListBound::new(ctx.params);
+    let mut stop = crate::memory::SearchStop::new(ctx.params);
     let mut num_dropped: usize = 0;
+    // Whether the wall-clock deadline or the resident-set ceiling ended the
+    // search. A stop is a restart, not a prune: the node it stopped at is
+    // still in the queue, and nothing has been discarded.
+    let mut timed_out = false;
     let stats = std::env::var_os("POTOROO_STATS").is_some();
 
     let mut current_flaw_order: usize = 0;
@@ -1157,6 +1167,12 @@ fn plan_impl(
         while let Some(plan) = current_plan.clone() {
             if plan.complete() {
                 break;
+            }
+            if let Some(stop) = stop.as_mut() {
+                if stop.expired(num_visited_plans) {
+                    timed_out = true;
+                    break;
+                }
             }
             num_visited_plans += 1;
             max_steps = max_steps.max(plan.num_steps());
@@ -1449,6 +1465,9 @@ fn plan_impl(
             }
         }
 
+        if timed_out {
+            break;
+        }
         if matches!(&current_plan, Some(p) if p.complete()) {
             break;
         }
@@ -1477,6 +1496,7 @@ fn plan_impl(
         max_threats,
         max_queued,
         dropped: num_dropped,
+        timed_out,
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {
@@ -1496,8 +1516,9 @@ fn plan_impl(
             );
             Outcome::Solved(p)
         }
-        // Queues emptied by an open-list bound say nothing about solvability.
-        _ if limit_reached || num_dropped > 0 => Outcome::LimitReached,
+        // Queues emptied by an open-list bound say nothing about solvability,
+        // and neither does a search stopped part-way for time or memory.
+        _ if timed_out || limit_reached || num_dropped > 0 => Outcome::LimitReached,
         _ => Outcome::NoSolution,
     };
     (outcome, search_stats)
