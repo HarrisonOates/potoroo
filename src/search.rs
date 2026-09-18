@@ -764,11 +764,11 @@ pub struct SearchStats {
     /// Queued plans discarded by an open-list bound (`--max-queued`,
     /// `--mem-mb`). Zero unless one is set; see [`crate::memory`].
     pub dropped: usize,
-    /// Whether the search stopped because its wall-clock deadline or its
-    /// resident-set ceiling passed, rather than because it ran out of nodes or
-    /// of search space. The outcome is [`Outcome::LimitReached`] either way;
-    /// this is what tells the two apart. See [`crate::memory::SearchStop`].
-    pub timed_out: bool,
+    /// Why the search stopped short, when a budget rather than the search
+    /// itself ended it. The outcome is [`Outcome::LimitReached`] here as it is
+    /// for the node limit; this is what tells them apart, and which budget it
+    /// was. See [`crate::memory::SearchStop`].
+    pub stopped: Option<crate::memory::StopReason>,
 }
 
 /// A point-in-time view of an active search, delivered after an expansion.
@@ -1136,11 +1136,25 @@ fn plan_impl(
     let mut bound = crate::memory::OpenListBound::new(ctx.params);
     let mut stop = crate::memory::SearchStop::new(ctx.params);
     let mut num_dropped: usize = 0;
-    // Whether the wall-clock deadline or the resident-set ceiling ended the
-    // search. A stop is a restart, not a prune: the node it stopped at is
-    // still in the queue, and nothing has been discarded.
-    let mut timed_out = false;
+    // Which budget ended the search, if one did. A stop is a restart, not a
+    // prune: the node it stopped at is still in the queue, and nothing has
+    // been discarded.
+    let mut stopped: Option<crate::memory::StopReason> = None;
     let stats = std::env::var_os("POTOROO_STATS").is_some();
+
+    // The stop is consulted wherever the loop takes another plan off a queue,
+    // not only where it expands one: a complete plan that cannot be
+    // instantiated pops its successor and goes round again without expanding
+    // anything, and a search that spends its whole budget on such a run must
+    // still honour it.
+    macro_rules! stop_expired {
+        () => {
+            match stop.as_mut() {
+                Some(stop) => stop.expired(num_visited_plans),
+                None => None,
+            }
+        };
+    }
 
     let mut current_flaw_order: usize = 0;
     let mut flaw_orders_left: usize = n_orders;
@@ -1168,11 +1182,9 @@ fn plan_impl(
             if plan.complete() {
                 break;
             }
-            if let Some(stop) = stop.as_mut() {
-                if stop.expired(num_visited_plans) {
-                    timed_out = true;
-                    break;
-                }
+            if let Some(reason) = stop_expired!() {
+                stopped = Some(reason);
+                break;
             }
             num_visited_plans += 1;
             max_steps = max_steps.max(plan.num_steps());
@@ -1451,10 +1463,17 @@ fn plan_impl(
                                         &mut boost_budget,
                                         &mut expand_count,
                                     );
+                                    if let Some(reason) = stop_expired!() {
+                                        stopped = Some(reason);
+                                        break;
+                                    }
                                 }
                             },
                             _ => break,
                         }
+                    }
+                    if stopped.is_some() {
+                        break;
                     }
                 }
             } else {
@@ -1465,7 +1484,7 @@ fn plan_impl(
             }
         }
 
-        if timed_out {
+        if stopped.is_some() {
             break;
         }
         if matches!(&current_plan, Some(p) if p.complete()) {
@@ -1496,7 +1515,7 @@ fn plan_impl(
         max_threats,
         max_queued,
         dropped: num_dropped,
-        timed_out,
+        stopped,
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {
@@ -1518,7 +1537,7 @@ fn plan_impl(
         }
         // Queues emptied by an open-list bound say nothing about solvability,
         // and neither does a search stopped part-way for time or memory.
-        _ if timed_out || limit_reached || num_dropped > 0 => Outcome::LimitReached,
+        _ if stopped.is_some() || limit_reached || num_dropped > 0 => Outcome::LimitReached,
         _ => Outcome::NoSolution,
     };
     (outcome, search_stats)

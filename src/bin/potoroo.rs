@@ -74,9 +74,10 @@ struct Stage {
     heuristic: Heuristic,
     /// `None` inherits the command line's `-s`.
     search_algorithm: Option<SearchAlgorithm>,
-    /// Seconds this stage may run for. `None` runs to `--time-limit`, or
-    /// without a bound at all when there is none.
-    seconds: Option<f64>,
+    /// How long this stage may run for. `None` runs to `--time-limit`, or
+    /// without a bound at all when there is none, and is therefore only
+    /// allowed on the last stage — anything after it would never start.
+    share: Option<Duration>,
 }
 
 impl Cli {
@@ -90,7 +91,7 @@ impl Cli {
                 spec: format!("{}@{}", self.heuristic_name, self.algorithm_name),
                 heuristic: self.params.heuristic.clone(),
                 search_algorithm: Some(self.params.search_algorithm),
-                seconds: None,
+                share: None,
             }]
         } else {
             self.stages.clone()
@@ -132,9 +133,6 @@ struct RunStats {
     max_disjunctions: usize,
     max_queued: usize,
     dropped: usize,
-    /// Whether the *last* stage run stopped for time or memory, which is what
-    /// the problem's outcome should say.
-    timed_out: bool,
 }
 
 impl RunStats {
@@ -151,7 +149,6 @@ impl RunStats {
         self.max_disjunctions = self.max_disjunctions.max(stage.max_disjunctions);
         self.max_queued = self.max_queued.max(stage.max_queued);
         self.dropped += stage.dropped;
-        self.timed_out = stage.timed_out;
     }
 }
 
@@ -170,7 +167,6 @@ impl From<potoroo::search::SearchStats> for RunStats {
             max_disjunctions: 0,
             max_queued: stats.max_queued,
             dropped: stats.dropped,
-            timed_out: stats.timed_out,
         }
     }
 }
@@ -189,7 +185,6 @@ impl From<potoroo::fdr_pocl::SearchStats> for RunStats {
             max_disjunctions: stats.max_disjunctions,
             max_queued: stats.max_queued,
             dropped: stats.dropped,
-            timed_out: stats.timed_out,
         }
     }
 }
@@ -205,13 +200,25 @@ enum RunOutcome {
     },
     /// The node limit (`-l`) was reached.
     LimitReached,
-    /// The wall-clock deadline or the resident-set ceiling was reached.
+    /// The wall-clock deadline was reached.
     TimedOut,
+    /// The resident-set ceiling (`--stage-mem-mb`) was reached.
+    MemoryStopped,
     /// The search space was exhausted without finding a plan.
     NoSolution,
 }
 
 impl RunOutcome {
+    /// Reads a limit-reached search's own account of why it stopped. The node
+    /// limit is the case where no budget fired.
+    fn stopped_short(reason: Option<potoroo::memory::StopReason>) -> Self {
+        match reason {
+            Some(potoroo::memory::StopReason::Deadline) => RunOutcome::TimedOut,
+            Some(potoroo::memory::StopReason::Memory) => RunOutcome::MemoryStopped,
+            None => RunOutcome::LimitReached,
+        }
+    }
+
     /// Whether this ends the whole portfolio rather than handing over to the
     /// next stage. A plan obviously does; so does an exhausted search space,
     /// which is exact and says the problem is unsolvable however it is
@@ -226,6 +233,7 @@ impl RunOutcome {
             RunOutcome::Solved { .. } => "solved",
             RunOutcome::LimitReached => "limit reached",
             RunOutcome::TimedOut => "time limit reached",
+            RunOutcome::MemoryStopped => "memory bound reached",
             RunOutcome::NoSolution => "no solution",
         }
     }
@@ -306,7 +314,7 @@ fn run() -> Result<ExitCode, String> {
         let (outcome, stats) = if cli.fdr_pocl {
             run_fdr_portfolio(&cli, domain, problem, &portfolio, deadline)?
         } else {
-            run_lifted_portfolio(&cli, domain, problem, &portfolio, deadline)
+            run_lifted_portfolio(&cli, domain, problem, &portfolio, deadline)?
         };
 
         let (solved, plan_len, plan_cost) = match &outcome {
@@ -325,6 +333,11 @@ fn run() -> Result<ExitCode, String> {
             RunOutcome::TimedOut => {
                 println!("no plan");
                 println!(";Time limit reached.");
+                (false, 0, 0)
+            }
+            RunOutcome::MemoryStopped => {
+                println!("no plan");
+                println!(";Memory bound reached.");
                 (false, 0, 0)
             }
             RunOutcome::NoSolution => {
@@ -422,68 +435,37 @@ fn stage_parameters(cli: &Cli, stage: &Stage, deadline: Option<Instant>) -> Para
     if let Some(algorithm) = stage.search_algorithm {
         params.search_algorithm = algorithm;
     }
-    params.deadline = match (stage.seconds, deadline) {
-        (Some(share), Some(global)) => {
-            Some((Instant::now() + Duration::from_secs_f64(share)).min(global))
-        }
-        (Some(share), None) => Some(Instant::now() + Duration::from_secs_f64(share)),
+    params.deadline = match (stage.share, deadline) {
+        (Some(share), Some(global)) => Some((Instant::now() + share).min(global)),
+        (Some(share), None) => Some(Instant::now() + share),
         (None, global) => global,
     };
     params.memory_stop_mb = cli.stage_mem_mb;
     params
 }
 
-/// Runs the portfolio over the lifted or `-g` representation and returns the
-/// last stage's outcome together with the statistics summed over every stage.
+/// Runs the stages in order and returns the last one's outcome together with
+/// the statistics summed over all of them. `run_stage` performs one search; the
+/// sequencing policy around it lives here, once, for every representation.
 ///
-/// A fresh [`SearchContext`] per stage. Nothing in a context depends on *which*
-/// heuristic asked for it — the planning graph, the compiled relaxation, the
-/// Sample-FF model and the landmark sets are all functions of the domain and
-/// the problem alone — but they are exactly the memory a stage should hand back
-/// before the next one starts, which is the point of `--stage-mem-mb`. The
-/// price is re-grounding under `-g`, one Fast Downward call a stage.
-///
-/// Dropping them is not enough on its own: the allocator keeps the freed arena
-/// and the resident set stays at the stage's peak, so the next stage would read
-/// that peak as its own and stop having expanded nothing. Between stages, and
-/// only between stages, the pages go back to the kernel; see
-/// [`potoroo::memory::release_free_memory`].
-fn run_lifted_portfolio(
+/// That policy: a stage that solves the problem or exhausts the search space
+/// ends the portfolio, and a stage that runs out of time, memory or nodes hands
+/// over to the next. Between two stages — and only between them, so a plain run
+/// pays nothing — the pages the finished stage freed go back to the kernel,
+/// because the allocator holds on to them otherwise and the next stage would
+/// read its predecessor's peak as its own resident set.
+fn run_portfolio(
     cli: &Cli,
-    domain: &Domain,
-    problem: &Problem,
     portfolio: &[Stage],
     deadline: Option<Instant>,
-) -> (RunOutcome, RunStats) {
+    mut run_stage: impl FnMut(&Stage, &Parameters) -> Result<(RunOutcome, RunStats), String>,
+) -> Result<(RunOutcome, RunStats), String> {
     let mut total = RunStats::default();
     let mut last = RunOutcome::NoSolution;
     for (index, stage) in portfolio.iter().enumerate() {
         let params = stage_parameters(cli, stage, deadline);
         announce_stage(cli, index, portfolio.len(), stage);
-        // Scoped so the queues and the context are gone before the stage ends,
-        // which is what the next stage's memory bound is measured against.
-        let (outcome, stats) = {
-            let ctx = SearchContext::new(domain, problem, &params);
-            let (outcome, stats) = if cli.verbosity > 0 {
-                let mut printer = ProgressPrinter::new(cli.verbosity);
-                let mut report = |progress| printer.report(progress);
-                plan_with_progress(&ctx, &mut report)
-            } else {
-                plan_with_stats(&ctx)
-            };
-            let stats = RunStats::from(stats);
-            let outcome = match outcome {
-                Outcome::Solved(plan) => RunOutcome::Solved {
-                    plan: format_steps(&ctx, &plan),
-                    steps: plan.num_steps(),
-                    cost: plan.cost(),
-                },
-                Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
-                Outcome::LimitReached => RunOutcome::LimitReached,
-                Outcome::NoSolution => RunOutcome::NoSolution,
-            };
-            (outcome, stats)
-        };
+        let (outcome, stats) = run_stage(stage, &params)?;
         total.add(&stats);
         report_stage(cli, index, portfolio.len(), &outcome, stats.nodes_generated);
         last = outcome;
@@ -494,7 +476,46 @@ fn run_lifted_portfolio(
             potoroo::memory::release_free_memory();
         }
     }
-    (last, total)
+    Ok((last, total))
+}
+
+/// Runs the portfolio over the lifted or `-g` representation.
+///
+/// A fresh [`SearchContext`] per stage. Nothing in a context depends on *which*
+/// heuristic asked for it — the planning graph, the compiled relaxation, the
+/// Sample-FF model and the landmark sets are all functions of the domain and
+/// the problem alone — but they are exactly the memory a stage should hand back
+/// before the next one starts, which is the point of `--stage-mem-mb`. The
+/// price is re-grounding under `-g`, one Fast Downward call a stage.
+fn run_lifted_portfolio(
+    cli: &Cli,
+    domain: &Domain,
+    problem: &Problem,
+    portfolio: &[Stage],
+    deadline: Option<Instant>,
+) -> Result<(RunOutcome, RunStats), String> {
+    run_portfolio(cli, portfolio, deadline, |_stage, params| {
+        // Scoped so the queues and the context are gone before the stage ends,
+        // which is what the next stage's memory bound is measured against.
+        let ctx = SearchContext::new(domain, problem, params);
+        let (outcome, stats) = if cli.verbosity > 0 {
+            let mut printer = ProgressPrinter::new(cli.verbosity);
+            let mut report = |progress| printer.report(progress);
+            plan_with_progress(&ctx, &mut report)
+        } else {
+            plan_with_stats(&ctx)
+        };
+        let outcome = match outcome {
+            Outcome::Solved(plan) => RunOutcome::Solved {
+                plan: format_steps(&ctx, &plan),
+                steps: plan.num_steps(),
+                cost: plan.cost(),
+            },
+            Outcome::LimitReached => RunOutcome::stopped_short(stats.stopped),
+            Outcome::NoSolution => RunOutcome::NoSolution,
+        };
+        Ok((outcome, RunStats::from(stats)))
+    })
 }
 
 /// Runs the portfolio over the finite-domain representation.
@@ -529,46 +550,49 @@ fn run_fdr_portfolio(
     // table do not borrow from it, and a portfolio has no use for its memory.
     drop(ctx);
 
-    let mut total = RunStats::default();
-    let mut last = RunOutcome::NoSolution;
-    for (index, stage) in portfolio.iter().enumerate() {
-        let params = stage_parameters(cli, stage, deadline);
-        announce_stage(cli, index, portfolio.len(), stage);
+    // Whether the task can be searched under each stage's parameters is settled
+    // before any of them runs. The command line has already rejected the
+    // heuristics this representation can never evaluate; what is left is
+    // task-dependent, and a portfolio that discovered it after its first stage
+    // had spent its share of the clock would abort with no plan, no `Time:` and
+    // no statistics. One planner answers for every stage, so this costs a
+    // single extra construction, and only where there is more than one stage.
+    if portfolio.len() > 1 {
+        // The deadlines in these copies are not the ones the stages will run
+        // under — they are counted from now rather than from each stage's start
+        // — but validation does not look at them.
+        let staged: Vec<Parameters> = portfolio
+            .iter()
+            .map(|stage| stage_parameters(cli, stage, deadline))
+            .collect();
+        potoroo::fdr_pocl::validate_all(&task, &staged).map_err(|e| e.to_string())?;
+    }
+
+    run_portfolio(cli, portfolio, deadline, |_stage, params| {
         let search_result = if cli.verbosity > 0 {
             let mut printer = ProgressPrinter::new(cli.verbosity);
             let mut report = |progress| printer.report(progress);
             potoroo::fdr_pocl::solve_with_context(
                 &task,
-                &params,
+                params,
                 symmetries.as_deref(),
                 Some(&mut report),
             )
         } else {
-            potoroo::fdr_pocl::solve_with_context(&task, &params, symmetries.as_deref(), None)
+            potoroo::fdr_pocl::solve_with_context(&task, params, symmetries.as_deref(), None)
         };
         let (outcome, stats) = search_result.map_err(|e| e.to_string())?;
-        let stats = RunStats::from(stats);
         let outcome = match outcome {
             potoroo::fdr_pocl::Outcome::Solved(solution) => RunOutcome::Solved {
                 plan: solution.format(&task),
                 steps: solution.operators.len(),
                 cost: solution.plan.cost(),
             },
-            potoroo::fdr_pocl::Outcome::LimitReached if stats.timed_out => RunOutcome::TimedOut,
-            potoroo::fdr_pocl::Outcome::LimitReached => RunOutcome::LimitReached,
+            potoroo::fdr_pocl::Outcome::LimitReached => RunOutcome::stopped_short(stats.stopped),
             potoroo::fdr_pocl::Outcome::NoSolution => RunOutcome::NoSolution,
         };
-        total.add(&stats);
-        report_stage(cli, index, portfolio.len(), &outcome, stats.nodes_generated);
-        last = outcome;
-        if last.ends_the_portfolio() {
-            break;
-        }
-        if index + 1 < portfolio.len() {
-            potoroo::memory::release_free_memory();
-        }
-    }
-    Ok((last, total))
+        Ok((outcome, RunStats::from(stats)))
+    })
 }
 
 /// The `-v` line at the start of a stage. Silent for a plain run, whose single
@@ -782,10 +806,9 @@ fn outcome_label(status: &str) -> &'static str {
     match status {
         "solved" => "solved",
         "limit reached" => "limit",
-        // A stage or a run stopped by `--stage-mem-mb` reports the same
-        // outcome: from the sweep's side both are budgets the planner honoured
-        // itself rather than deaths it could not report.
-        "time limit reached" => "timeout",
+        // Both time and stage-memory stops report `timeout` in STATS.
+        // The external runner reserves `oom` for processes killed before reporting.
+        "time limit reached" | "memory bound reached" => "timeout",
         _ => "noplan",
     }
 }
@@ -940,11 +963,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 // VHPOP spells the wall-clock limit in minutes; `--time-limit`
                 // spells the same limit in seconds.
                 let v = required_value!();
-                time_limit = Some(Duration::from_secs_f64(60.0 * parse_seconds(&v)?));
+                time_limit = Some(parse_time_limit(&v, 60.0)?);
             }
             "time-limit" => {
                 let v = required_value!();
-                time_limit = Some(Duration::from_secs_f64(parse_seconds(&v)?));
+                time_limit = Some(parse_time_limit(&v, 1.0)?);
             }
             "t" => {
                 let _ = required_value!(); // durative tolerance — deferred
@@ -987,13 +1010,33 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         let pad = params.search_limits.last().copied().unwrap_or(usize::MAX);
         params.search_limits.push(pad);
     }
-    if !fdr_pocl
-        && (params.heuristic.requires_fdr_pocl()
-            || stages
-                .iter()
-                .any(|stage| stage.heuristic.requires_fdr_pocl()))
+    // Every heuristic a run could reach is checked against its representation
+    // here rather than when search reaches it: a portfolio that only found out
+    // at its second stage would already have spent the first stage's share of
+    // the clock, and would then abort with no plan and no statistics.
+    let heuristics = std::iter::once(&params.heuristic).chain(stages.iter().map(|s| &s.heuristic));
+    for heuristic in heuristics {
+        if !fdr_pocl && heuristic.requires_fdr_pocl() {
+            return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
+        }
+        if fdr_pocl {
+            potoroo::fdr_pocl::supports_heuristic(heuristic).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Only the last stage may run without a share of the clock: one before it
+    // that never gives up would starve every stage after it, which is a
+    // configuration nobody means to write.
+    if let Some(position) = stages
+        .iter()
+        .take(stages.len().saturating_sub(1))
+        .position(|stage| stage.share.is_none())
     {
-        return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
+        return Err(format!(
+            "stage `{}` has no time limit, so no stage after it would ever run: \
+             give every stage but the last one an `=SECS`",
+            stages[position].spec
+        ));
     }
 
     // Per-evaluation timing is only worth its two clock reads per generated
@@ -1020,11 +1063,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
 /// `--time-limit`. No heuristic or algorithm name contains `@` or `=`, so the
 /// spec splits unambiguously left to right.
 fn parse_stage(spec: &str) -> Result<Stage, String> {
-    let (head, seconds) = match spec.split_once('=') {
+    let (head, share) = match spec.split_once('=') {
         Some((head, share)) => (
             head,
             Some(
-                parse_seconds(share)
+                parse_time_limit(share, 1.0)
                     .map_err(|_| format!("invalid stage time limit `{share}` in `{spec}`"))?,
             ),
         ),
@@ -1041,7 +1084,7 @@ fn parse_stage(spec: &str) -> Result<Stage, String> {
         spec: spec.to_string(),
         heuristic: Heuristic::parse(heuristic_name)?,
         search_algorithm: algorithm_name.map(parse_search_algorithm).transpose()?,
-        seconds,
+        share,
     })
 }
 
@@ -1085,11 +1128,22 @@ fn parse_count(flag: &str, v: &str) -> Result<usize, String> {
     }
 }
 
-/// A positive, finite time in the option's own unit — seconds for
-/// `--time-limit` and a stage's share, minutes for `-T`.
-fn parse_seconds(v: &str) -> Result<f64, String> {
+/// The longest time limit accepted, in seconds: about thirty years. The point
+/// is not the length but the arithmetic — beyond roughly this,
+/// `Duration::from_secs_f64` and adding the result to an `Instant` overflow and
+/// panic, and a planner run that meant `1e20` seconds meant something else.
+const MAX_LIMIT_SECONDS: f64 = 1e9;
+
+/// A positive, finite time limit, written in units of `unit_seconds` seconds:
+/// one for `--time-limit` and a stage's share, sixty for `-T`, which VHPOP
+/// spells in minutes. The bound rejects rather than saturates, since a value
+/// this far out is a mistake and silently reinterpreting it would hide it.
+fn parse_time_limit(v: &str, unit_seconds: f64) -> Result<Duration, String> {
     match v.parse::<f64>() {
-        Ok(seconds) if seconds > 0.0 && seconds.is_finite() => Ok(seconds),
+        // Excludes infinities and NaN, both of which fail the comparison.
+        Ok(value) if value > 0.0 && value * unit_seconds <= MAX_LIMIT_SECONDS => {
+            Ok(Duration::from_secs_f64(value * unit_seconds))
+        }
         _ => Err(format!("invalid time limit `{v}`")),
     }
 }
@@ -1144,7 +1198,8 @@ fn print_help() {
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20     --stage=SPEC           restart-portfolio stage HEURISTIC[@SEARCH][=SECS];\n\
          \x20                            repeatable, run in order, @SEARCH defaults to -s and\n\
-         \x20                            =SECS to the remaining --time-limit\n\
+         \x20                            =SECS to the remaining --time-limit; only the last\n\
+         \x20                            stage may leave =SECS off\n\
          \x20     --stage-mem-mb=M       end a stage once the process holds M MB resident, so\n\
          \x20                            the next one starts with the memory back\n\
          \x20 -T, --time-limit=SECS      wall-clock limit per problem, counted from before\n\
@@ -1211,18 +1266,19 @@ mod tests {
 
         assert_eq!(cli.stages[0].spec, "CLFF@ALT=10");
         assert_eq!(cli.stages[0].search_algorithm, Some(SearchAlgorithm::Alt));
-        assert_eq!(cli.stages[0].seconds, Some(10.0));
+        assert_eq!(cli.stages[0].share, Some(Duration::from_secs(10)));
 
         // `@SEARCH` omitted: the stage inherits `-s`, which the runner supplies
         // rather than the parser, so the stage itself records nothing.
         assert_eq!(cli.stages[1].spec, "ADD=2.5");
         assert_eq!(cli.stages[1].search_algorithm, None);
-        assert_eq!(cli.stages[1].seconds, Some(2.5));
+        assert_eq!(cli.stages[1].share, Some(Duration::from_millis(2500)));
 
-        // `=SECS` omitted: the stage runs to the global limit, or forever.
+        // `=SECS` omitted on the last stage: it runs to the global limit, or
+        // forever.
         assert_eq!(cli.stages[2].spec, "ADDR");
         assert_eq!(cli.stages[2].search_algorithm, None);
-        assert_eq!(cli.stages[2].seconds, None);
+        assert_eq!(cli.stages[2].share, None);
     }
 
     #[test]
@@ -1237,6 +1293,51 @@ mod tests {
         // heuristic into a representation that has no facts for it.
         assert!(rejects(&["--stage", "LMCUT"]).contains("require --fdr-pocl"));
         assert!(rejects(&["--stage", "ADD", "--stage", "CLFF"]).contains("require --fdr-pocl"));
+    }
+
+    #[test]
+    fn a_stage_the_representation_cannot_evaluate_is_rejected_before_any_search() {
+        // The mirror image: a literal-plan heuristic under --fdr-pocl. Caught
+        // at parse time rather than when the second stage starts, which is
+        // after the first has spent its share of the clock.
+        for args in [
+            &["--fdr-pocl", "-h", "LPSAS"][..],
+            &["--fdr-pocl", "--stage", "LPSAS"][..],
+            &["--fdr-pocl", "--stage", "CLFF@ALT=10", "--stage", "LPSAS"][..],
+            &["--fdr-pocl", "--stage", "ADD=10", "--stage", "SAMPLE_FF"][..],
+        ] {
+            assert!(
+                rejects(args).contains("literal plan representation"),
+                "{args:?} was not rejected for its representation"
+            );
+        }
+        // And the same heuristics are fine where they do belong.
+        assert_eq!(cli(&["-g", "--stage", "LPSAS"]).stages.len(), 1);
+    }
+
+    #[test]
+    fn only_the_last_stage_may_run_without_a_time_share() {
+        assert_eq!(cli(&["--stage", "ADD"]).stages.len(), 1);
+        assert_eq!(
+            cli(&["--stage", "ADD=10", "--stage", "ADDR"]).stages.len(),
+            2
+        );
+        let message = rejects(&["--stage", "ADD", "--stage", "ADDR"]);
+        assert!(
+            message.contains("stage `ADD` has no time limit"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no stage after it would ever run"),
+            "{message}"
+        );
+        // The offending stage named is the first one without a share, not the
+        // last stage, which is allowed to have none.
+        let message = rejects(&["--stage", "ADD=1", "--stage", "ADDR", "--stage", "ADD"]);
+        assert!(
+            message.contains("stage `ADDR` has no time limit"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1256,13 +1357,35 @@ mod tests {
     }
 
     #[test]
+    fn an_absurd_time_limit_is_an_error_rather_than_a_panic() {
+        // `Duration::from_secs_f64` panics past its range, and so does adding
+        // the result to an `Instant`; the bound is checked before either.
+        for value in ["1e20", "inf", "NaN", "1e300"] {
+            assert!(
+                rejects(&["--time-limit", value]).contains("invalid time limit"),
+                "--time-limit {value} was accepted"
+            );
+            assert!(
+                rejects(&["--stage", &format!("ADD={value}")]).contains("invalid stage time limit"),
+                "--stage ADD={value} was accepted"
+            );
+        }
+        // `-T` is in minutes, so the bound bites sixty times sooner.
+        assert!(rejects(&["-T", "1e9"]).contains("invalid time limit"));
+        assert_eq!(
+            cli(&["--time-limit", "1e9"]).time_limit,
+            Some(Duration::from_secs(1_000_000_000))
+        );
+    }
+
+    #[test]
     fn a_plain_run_is_a_portfolio_of_one_stage() {
         let cli = cli(&["-h", "ADDR", "-s", "GBFS"]);
         assert!(cli.stages.is_empty());
         let portfolio = cli.portfolio();
         assert_eq!(portfolio.len(), 1);
         assert_eq!(portfolio[0].search_algorithm, Some(SearchAlgorithm::Gbfs));
-        assert_eq!(portfolio[0].seconds, None);
+        assert_eq!(portfolio[0].share, None);
         assert_eq!(cli.stats_label(), "GBFS(ADDR)");
     }
 
@@ -1289,7 +1412,8 @@ mod tests {
             "--stage-mem-mb",
             "600",
         ]);
-        let stage = &cli.portfolio()[0];
+        let stage = cli.portfolio()[0].clone();
+        let stage = &stage;
         let params = stage_parameters(&cli, stage, None);
         assert_eq!(params.search_algorithm, SearchAlgorithm::Gbfs);
         assert_eq!(params.weight, 3.0);
@@ -1300,7 +1424,7 @@ mod tests {
 
         // A stage with no share of its own runs to the global deadline.
         let unbounded = Stage {
-            seconds: None,
+            share: None,
             ..stage.clone()
         };
         assert!(stage_parameters(&cli, &unbounded, None).deadline.is_none());

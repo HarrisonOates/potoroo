@@ -947,15 +947,22 @@ potoroo --fdr-pocl --stage 'CLFF@ALT=10' --stage ADD --stage-mem-mb 600 domain.p
 `--stage HEURISTIC[@SEARCH][=SECS]` is repeatable and the stages run in the
 order given. `HEURISTIC` is anything `-h` accepts; `@SEARCH` is anything `-s`
 accepts and defaults to `-s`; `=SECS` is that stage's share of the clock and
-defaults to whatever is left of `--time-limit`. Everything else — flaw orders,
-`-l`, `-w`, `-p`, `-a` — is shared, so the stages differ only in what a
-portfolio is there to vary. A stage ends when it solves the problem (the
-portfolio ends with it), when its share runs out, or when it hits `-l`; an
-**exhausted search space ends the whole portfolio**, since that verdict is
-exact and re-searching it with another heuristic would only confirm it. The
-statistics sum over the stages, and the STATS `heuristic` field becomes
-`FDR:portfolio(CLFF@ALT=10;ADD)` so a portfolio row can never be mistaken for
-one of its stages run alone.
+defaults to whatever is left of `--time-limit`. Only the **last** stage may
+leave `=SECS` off — one before it that never gives up would starve every stage
+after it, so that is rejected on the command line rather than discovered at
+runtime. Everything else — flaw orders, `-l`, `-w`, `-p`, `-a` — is shared, so
+the stages differ only in what a portfolio is there to vary. A stage ends when
+it solves the problem (the portfolio ends with it), when its share runs out, or
+when it hits `-l`; an **exhausted search space ends the whole portfolio**,
+since that verdict is exact and re-searching it with another heuristic would
+only confirm it. The statistics sum over the stages, and the STATS `heuristic`
+field becomes `FDR:portfolio(CLFF@ALT=10;ADD)` so a portfolio row can never be
+mistaken for one of its stages run alone.
+
+`-l` is **per stage** (and, as ever, per flaw-selection order), because each
+stage is a whole search: `-l 20000` over a three-stage portfolio permits sixty
+thousand generated nodes in total, twenty thousand of them in any one stage.
+The same goes for a node limit written per flaw order with repeated `-f`/`-l`.
 
 `--time-limit SECS` works on its own, without any `--stage`: the search stops
 at the deadline, prints `;Time limit reached.`, and reports `"outcome":
@@ -964,9 +971,12 @@ a sweep measures wall time from process start and a limit covering only search
 would let a slow front end overrun it uncharged. `-T` is the same limit in
 minutes, which is what VHPOP spells it in.
 
-`--stage-mem-mb M` ends a stage once the process's resident set passes `M`,
-reported as a time limit because it is the same kind of budget — one the
-planner honoured itself rather than a death it could not report. It exists
+`--stage-mem-mb M` ends a stage once the process's resident set passes `M`. The
+`-v` output names it for what it is (`memory bound reached`, and
+`;Memory bound reached.` on stdout), but the STATS `outcome` field deliberately
+says **`timeout`** for it, exactly as for the clock: both are budgets the
+planner honoured itself, and the sweep's `oom` is reserved for the runs that
+died without being able to report anything at all. It exists
 because [the failures here are memory deaths](#node-size-and-memory): under a
 hard address-space cap a stage that runs out of memory aborts the whole
 process, so without it a memory-hungry heuristic could never be run anywhere
@@ -991,10 +1001,12 @@ scripts/lm_sweep.sh -c 'fdr:ADD,fdr:CLFF@ALT,fdr:CLFF@ALT=10;ADD' -x '--stage-me
 from `docs/final-sweep-results.csv`: a 10 s + 10 s split of `--fdr-pocl ADD`
 and `--fdr-pocl CLFF -s ALT` would cover **157 of 441** problems against **138**
 for the best single configuration. Past a point the split matters little — of a
-20 s budget, giving `CLFF` the first 3–5 s covers 153 and anything from 6 s on
-covers 155 to 157 — because both configurations solve in about **80 ms median**
-when they solve at all (`ADD` 80 ms over 138 solved, `CLFF -s ALT` 82 ms over
-134), so a stage either wins almost immediately or was never going to. And
+20 s budget, giving `CLFF` the first 3–5 s covers 153 and 6 s to 15 s covers 155
+to 157, falling away again past that (154 at 16 s, 149 at 19 s, where `ADD` is
+left almost no time at all) — because both configurations solve in **80 ms
+median**
+when they solve at all (`ADD` 80 ms over 138 solved, `CLFF -s ALT` 82 ms over 134), so a
+stage either wins almost immediately or was never going to. And
 `ADD`'s failures are memory deaths where `CLFF`'s are timeouts — 214 of its 303
 unsolved runs die of memory against 11 of `CLFF`'s — which is what fixes the
 order: `ADD` must run **last**, or under `--stage-mem-mb`.

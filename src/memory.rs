@@ -88,6 +88,20 @@ impl OpenListBound {
 /// makes a stop sound in a way trimming the open list is not, and it is what a
 /// restart portfolio needs — a stage that ends has its queues freed for the
 /// next one rather than taking the process down with it.
+/// Which stop ended a search.
+///
+/// Both end it the same way — the search stops where it stands and reports the
+/// limit reached, having discarded nothing — but a run that spent its clock and
+/// one that spent its memory call for different fixes, so the two are reported
+/// apart wherever a human reads the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The wall-clock deadline: `--time-limit`, or one stage's share of it.
+    Deadline,
+    /// The resident-set ceiling: `--stage-mem-mb`.
+    Memory,
+}
+
 #[derive(Debug)]
 pub struct SearchStop {
     deadline: Option<Instant>,
@@ -114,26 +128,26 @@ impl SearchStop {
         })
     }
 
-    /// Whether the search should stop now, given how many nodes it has
-    /// expanded. The clock is read every call, since a read is cheap beside an
-    /// expansion and a late stop is a stage overrunning its share; the
+    /// Why the search should stop now, if it should, given how many nodes it
+    /// has expanded. The clock is read every call, since a read is cheap beside
+    /// an expansion and a late stop is a stage overrunning its share; the
     /// resident set comes from a file in `/proc` and is read only every
     /// [`CHECK_INTERVAL`] expansions.
-    pub fn expired(&mut self, expansions: usize) -> bool {
+    pub fn expired(&mut self, expansions: usize) -> Option<StopReason> {
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
-                return true;
+                return Some(StopReason::Deadline);
             }
         }
         if let Some(limit) = self.memory_kb {
             if expansions >= self.next_check {
                 self.next_check = expansions.saturating_add(CHECK_INTERVAL);
                 if resident_set_kb() > limit {
-                    return true;
+                    return Some(StopReason::Memory);
                 }
             }
         }
-        false
+        None
     }
 }
 
@@ -147,10 +161,12 @@ impl SearchStop {
 /// nothing — so the restart has to hand the pages back rather than merely drop
 /// the references to them.
 ///
-/// `malloc_trim` is what does that, and it has no portable equivalent: on any
-/// other target this is a no-op and `--stage-mem-mb` degrades to bounding the
-/// high-water mark of the run as a whole rather than of each stage.
-#[cfg(target_os = "linux")]
+/// `malloc_trim` is what does that, and it is a glibc extension with no
+/// portable equivalent — not even on Linux, where a musl target has no such
+/// symbol to link against. Anywhere else this is a no-op and `--stage-mem-mb`
+/// degrades to bounding the high-water mark of the run as a whole rather than
+/// of each stage.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn release_free_memory() {
     extern "C" {
         fn malloc_trim(pad: usize) -> i32;
@@ -163,7 +179,7 @@ pub fn release_free_memory() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn release_free_memory() {}
 
 /// Keeps the best `keep` entries of a heap and returns how many were dropped.
@@ -268,14 +284,14 @@ mod tests {
             ..Parameters::default()
         };
         let mut stop = SearchStop::new(&params).expect("a deadline builds a stop");
-        assert!(stop.expired(0));
+        assert_eq!(stop.expired(0), Some(StopReason::Deadline));
 
         let params = Parameters {
             deadline: Some(Instant::now() + std::time::Duration::from_secs(3600)),
             ..Parameters::default()
         };
         let mut stop = SearchStop::new(&params).expect("a deadline builds a stop");
-        assert!(!stop.expired(0));
+        assert_eq!(stop.expired(0), None);
     }
 
     #[test]
@@ -290,11 +306,15 @@ mod tests {
         // A stage gets its first interval of expansions before the resident
         // set is read at all, so a stage that starts above the bound still
         // searches rather than stopping where it stands.
-        assert!(!stop.expired(0));
-        assert!(!stop.expired(CHECK_INTERVAL - 1));
-        assert_eq!(stop.expired(CHECK_INTERVAL), resident_set_kb() > 1024);
+        assert_eq!(stop.expired(0), None);
+        assert_eq!(stop.expired(CHECK_INTERVAL - 1), None);
+        let over = resident_set_kb() > 1024;
+        assert_eq!(
+            stop.expired(CHECK_INTERVAL),
+            over.then_some(StopReason::Memory)
+        );
         // The next reading is a whole interval away again.
-        assert!(!stop.expired(CHECK_INTERVAL + 1));
+        assert_eq!(stop.expired(CHECK_INTERVAL + 1), None);
     }
 
     #[test]

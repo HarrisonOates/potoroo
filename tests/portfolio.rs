@@ -181,7 +181,7 @@ fn an_exhausted_search_space_ends_the_portfolio() {
     // An exhausted search space is an exact verdict: a second stage would only
     // search the same space again, so the first one is the last.
     let mut child = Command::new(env!("CARGO_BIN_EXE_potoroo"))
-        .args(["-v", "--stage", "ADD", "--stage", "ADDR"])
+        .args(["-v", "--stage", "ADD=60", "--stage", "ADDR"])
         .env_remove("POTOROO_STATS")
         .env("POTOROO_STATS_JSON", "1")
         .stdin(Stdio::piped())
@@ -214,16 +214,38 @@ fn an_exhausted_search_space_ends_the_portfolio() {
 fn a_stage_hands_its_memory_back_to_the_one_after_it() {
     // The regression this pins: dropping a stage's queues returns them to the
     // allocator, not to the kernel, so without an explicit release the second
-    // stage reads the first stage's peak as its own resident set and stops
-    // having expanded nothing. Thirty megabytes is well under what the first
-    // stage reaches on `gripper-20` and well over the process baseline, so the
-    // first stage must hit the bound and the second must survive it.
+    // stage reads the first stage's peak as its own resident set and stops at
+    // its first reading.
+    //
+    // The bound is derived rather than guessed. A first run measures what the
+    // configuration actually reaches on this machine, and the bound is set
+    // below that, so the test does not depend on `gripper-20` costing any
+    // particular number of megabytes — only on the two stages costing the same,
+    // which they must, being the same configuration on the same problem.
+    let probe = run(&[
+        "--time-limit",
+        "2",
+        "examples/gripper-domain.pddl",
+        "examples/gripper-20.pddl",
+    ]);
+    assert!(probe.status.success());
+    let probe_stderr = String::from_utf8(probe.stderr).expect("stderr is UTF-8");
+    let peak_mb = stat(&probe_stderr, "peak_rss_kb") / 1024;
+    assert!(
+        peak_mb >= 8,
+        "the probe never allocated enough to bound: {peak_mb} MB\n{probe_stderr}"
+    );
+    // Comfortably above the process baseline and comfortably below the peak, so
+    // a stage must search for a while before it trips and a stage that starts
+    // clean is not stopped straight away.
+    let bound = (peak_mb / 2).to_string();
+
     let output = run(&[
         "-v",
         "--stage-mem-mb",
-        "30",
+        &bound,
         "--stage",
-        "ADD",
+        "ADD=60",
         "--stage",
         "ADD",
         "examples/gripper-domain.pddl",
@@ -232,19 +254,20 @@ fn a_stage_hands_its_memory_back_to_the_one_after_it() {
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(
-        stderr.contains("Stage 1/2 finished: time limit reached"),
-        "the first stage should have hit the memory bound:\n{stderr}"
+        stderr.contains("Stage 1/2 finished: memory bound reached"),
+        "the first stage should have tripped the {bound} MB bound:\n{stderr}"
     );
     assert!(stderr.contains("Stage 2/2 started: ADD"), "{stderr}");
 
     // Both stages run the same configuration under the same bound, so the
-    // second should get as far as the first; anything near a single node means
-    // it was stopped by its predecessor's memory rather than by its own.
-    let generated = stage_generated(&stderr, "Stage 2/2 finished:");
+    // second must get about as far as the first. Before the fix it got one
+    // node; the margin here is wide enough that only a real handback passes it.
+    let first = stage_generated(&stderr, "Stage 1/2 finished:");
+    let second = stage_generated(&stderr, "Stage 2/2 finished:");
     assert!(
-        generated > 1000,
-        "the second stage expanded almost nothing, so the memory was never \
-         handed back: it generated {generated}\n{stderr}"
+        second * 2 > first,
+        "the second stage generated {second} against the first stage's {first}, \
+         so the memory was not handed back\n{stderr}"
     );
 }
 

@@ -735,10 +735,9 @@ pub struct SearchStats {
     pub max_queued: usize,
     /// Queued plans discarded by an open-list bound; see [`crate::memory`].
     pub dropped: usize,
-    /// Whether the search stopped because its wall-clock deadline or its
-    /// resident-set ceiling passed, rather than because it ran out of nodes or
-    /// of search space. See [`crate::memory::SearchStop`].
-    pub timed_out: bool,
+    /// Why the search stopped short, when a budget rather than the search
+    /// itself ended it. See [`crate::memory::SearchStop`].
+    pub stopped: Option<crate::memory::StopReason>,
     h_eval_nanos: u128,
 }
 
@@ -807,6 +806,49 @@ pub fn solve_with_context(
     let (outcome, mut stats) = planner.solve(params, progress);
     stats.pruned += planner.symmetry_skipped.get();
     Ok((outcome, stats))
+}
+
+/// Whether the finite-domain representation can run this heuristic at all,
+/// independently of any task.
+///
+/// The command line uses this to reject a configuration the moment it is
+/// parsed, alongside the mirror-image [`Heuristic::requires_fdr_pocl`] check:
+/// a `--stage` portfolio must not discover after its first stage has spent its
+/// share of the clock that its second names a heuristic this representation
+/// has never been able to evaluate.
+pub fn supports_heuristic(heuristic: &Heuristic) -> Result<(), Error> {
+    for term in heuristic.terms() {
+        if matches!(
+            term,
+            HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_)
+        ) {
+            return Err(Error::Unsupported(
+                "SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every one of these parameter sets can be searched over this
+/// task, without searching any of them.
+///
+/// The rest of what [`Planner::validate_params`] looks at is task-dependent —
+/// whether the LM-cut structure could be built at all, say — so a portfolio
+/// runs its whole sequence through this before starting the first stage. The
+/// tables a planner holds depend on the task, the action cost and the pruning
+/// rules, every one of which a portfolio's stages share, so one planner
+/// answers for all of them.
+pub fn validate_all(task: &Task, stages: &[Parameters]) -> Result<(), Error> {
+    let Some(first) = stages.first() else {
+        return Ok(());
+    };
+    let planner = Planner::with_action_cost(task, first.action_cost).with_pruning(first.prune);
+    for params in stages {
+        planner.validate_params(params)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1094,9 +1136,9 @@ impl<'a> Planner<'a> {
         let mut stats = SearchStats::default();
         let mut bound = crate::memory::OpenListBound::new(params);
         let mut stop = crate::memory::SearchStop::new(params);
-        // Whether time or memory ended the search. A stop is a restart, not a
-        // prune: nothing queued has been discarded.
-        let mut timed_out = false;
+        // Which budget ended the search, if one did. A stop is a restart, not
+        // a prune: nothing queued has been discarded.
+        let mut stopped: Option<crate::memory::StopReason> = None;
         // The stop is consulted wherever the loop takes another plan off a
         // queue, not only where it expands one: a complete plan that fails to
         // linearize pops its successor and goes round again without expanding
@@ -1106,7 +1148,7 @@ impl<'a> Planner<'a> {
             () => {
                 match stop.as_mut() {
                     Some(stop) => stop.expired(stats.nodes_visited),
-                    None => false,
+                    None => None,
                 }
             };
         }
@@ -1164,15 +1206,15 @@ impl<'a> Planner<'a> {
                         &mut expand_count,
                         &mut stats,
                     );
-                    if stop_expired!() {
-                        timed_out = true;
+                    if let Some(reason) = stop_expired!() {
+                        stopped = Some(reason);
                         break;
                     }
                     continue;
                 }
 
-                if stop_expired!() {
-                    timed_out = true;
+                if let Some(reason) = stop_expired!() {
+                    stopped = Some(reason);
                     break;
                 }
                 stats.nodes_visited += 1;
@@ -1353,7 +1395,7 @@ impl<'a> Planner<'a> {
                 }
             }
 
-            if timed_out {
+            if stopped.is_some() {
                 break;
             }
             if orders_left == 0 {
@@ -1370,8 +1412,8 @@ impl<'a> Planner<'a> {
 
         // Queues emptied by an open-list bound say nothing about solvability,
         // and neither does a search stopped part-way for time or memory.
-        stats.timed_out = timed_out;
-        if timed_out || limit_reached || stats.dropped > 0 {
+        stats.stopped = stopped;
+        if stopped.is_some() || limit_reached || stats.dropped > 0 {
             (Outcome::LimitReached, stats)
         } else {
             (Outcome::NoSolution, stats)
