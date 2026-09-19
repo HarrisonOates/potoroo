@@ -277,32 +277,31 @@ impl BinaryOrderings {
     /// predecessors; the initial step is not scheduled (it is implicitly at
     /// time 0).
     pub fn schedule(&self) -> (HashMap<usize, f32>, f32) {
-        let mut start_times: HashMap<usize, f32> = HashMap::new();
+        // In a transitive closure every predecessor has strictly more
+        // successors than its descendant. Sorting by that count therefore
+        // gives a topological order without recursion on the plan's depth.
+        let mut order: Vec<_> = (1..=self.high_id).collect();
+        order.sort_by_cached_key(|&id| {
+            std::cmp::Reverse(
+                self.succ[id - 1]
+                    .words
+                    .iter()
+                    .map(|w| w.count_ones() as usize)
+                    .sum::<usize>(),
+            )
+        });
+        let mut distances = vec![1.0f32; self.high_id];
         let mut max_dist = 0.0f32;
-        for i in 1..=self.high_id {
-            let ed = self.schedule_step(&mut start_times, i);
-            if ed > max_dist {
-                max_dist = ed;
-            }
-        }
-        (start_times, max_dist)
-    }
-
-    fn schedule_step(&self, start_times: &mut HashMap<usize, f32>, step_id: usize) -> f32 {
-        if let Some(&d) = start_times.get(&step_id) {
-            return d;
-        }
-        let mut sd = 1.0f32;
-        for j in 1..=self.high_id {
-            if step_id != j && self.ordered_before(j, step_id) {
-                let ed = 1.0 + self.schedule_step(start_times, j);
-                if ed > sd {
-                    sd = ed;
+        for &id in &order {
+            let distance = distances[id - 1];
+            max_dist = max_dist.max(distance);
+            for next in 1..=self.high_id {
+                if self.ordered_before(id, next) {
+                    distances[next - 1] = distances[next - 1].max(distance + 1.0);
                 }
             }
         }
-        start_times.insert(step_id, sd);
-        sd
+        ((1..=self.high_id).zip(distances).collect(), max_dist)
     }
 }
 
@@ -472,5 +471,33 @@ mod tests {
         orderings.set_before(1, 3);
         assert!(orderings.ordered_before(1, 3));
         assert!(!orderings.ordered_before(3, 1));
+    }
+
+    #[test]
+    fn a_deep_reverse_order_schedules_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let n = 2_000;
+                let mut orderings = BinaryOrderings {
+                    high_id: n,
+                    succ: Vec::new(),
+                };
+                for id in 1..=n {
+                    let mut row = Row::default();
+                    for predecessor in 1..id {
+                        row.set(predecessor - 1);
+                    }
+                    orderings.succ.push(Rc::new(row));
+                }
+                let (times, makespan) = orderings.schedule();
+                assert_eq!(makespan, n as f32);
+                for id in 1..=n {
+                    assert_eq!(times[&id], (n + 1 - id) as f32);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

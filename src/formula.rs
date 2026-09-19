@@ -310,21 +310,39 @@ impl Formula {
     /// Builds the conjunction of a list, flattening and simplifying. The empty
     /// conjunction is `True`.
     pub fn conjoin_all<I: IntoIterator<Item = Rc<Formula>>>(items: I) -> Rc<Formula> {
-        let mut acc = Rc::new(Formula::True);
+        let mut conjuncts = Vec::new();
         for f in items {
-            acc = Formula::and(acc, f);
+            if f.contradiction() {
+                return f;
+            }
+            if !f.tautology() {
+                Self::push_conjuncts(&mut conjuncts, &f);
+            }
         }
-        acc
+        match conjuncts.len() {
+            0 => Rc::new(Formula::True),
+            1 => conjuncts.pop().unwrap(),
+            _ => Rc::new(Formula::Conjunction(conjuncts)),
+        }
     }
 
     /// Builds the disjunction of a list, flattening and simplifying. The empty
     /// disjunction is `False`.
     pub fn disjoin_all<I: IntoIterator<Item = Rc<Formula>>>(items: I) -> Rc<Formula> {
-        let mut acc = Rc::new(Formula::False);
+        let mut disjuncts = Vec::new();
         for f in items {
-            acc = Formula::or(acc, f);
+            if f.tautology() {
+                return f;
+            }
+            if !f.contradiction() {
+                Self::push_disjuncts(&mut disjuncts, &f);
+            }
         }
-        acc
+        match disjuncts.len() {
+            0 => Rc::new(Formula::False),
+            1 => disjuncts.pop().unwrap(),
+            _ => Rc::new(Formula::Disjunction(disjuncts)),
+        }
     }
 
     /// Returns the negation, pushing it inward via De Morgan / quantifier

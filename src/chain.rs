@@ -16,6 +16,20 @@ pub struct Chain<T> {
     pub tail: Option<Rc<Chain<T>>>,
 }
 
+impl<T> Drop for Chain<T> {
+    fn drop(&mut self) {
+        // Releasing the last reference to a long search history must not
+        // recurse once per node. Stop as soon as another plan shares a suffix.
+        let mut tail = self.tail.take();
+        while let Some(node) = tail {
+            match Rc::try_unwrap(node) {
+                Ok(mut owned) => tail = owned.tail.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 impl<T> Chain<T> {
     pub fn new(head: T, tail: Option<Rc<Chain<T>>>) -> Rc<Chain<T>> {
         Rc::new(Chain { head, tail })
@@ -53,16 +67,22 @@ impl<T: PartialEq> Chain<T> {
 impl<T: PartialEq + Clone> Chain<T> {
     /// Returns a chain with the first occurrence of `x` removed, sharing the
     /// suffix after the removed element. If `x` is not present the elements
-    /// are unchanged (a fresh spine is built).
+    /// are unchanged and the original chain is shared.
     pub fn remove(self: &Rc<Self>, x: &T) -> Option<Rc<Chain<T>>> {
-        if self.head == *x {
-            self.tail.clone()
-        } else {
-            match &self.tail {
-                Some(t) => Some(Chain::new(self.head.clone(), t.remove(x))),
-                None => Some(self.clone()),
+        let mut prefix = Vec::new();
+        let mut current = Some(self.as_ref());
+        while let Some(node) = current {
+            if node.head == *x {
+                let mut result = node.tail.clone();
+                for head in prefix.into_iter().rev() {
+                    result = cons(head, result);
+                }
+                return result;
             }
+            prefix.push(node.head.clone());
+            current = node.tail.as_deref();
         }
+        Some(self.clone())
     }
 }
 
@@ -159,5 +179,25 @@ mod tests {
         let c = from_vec(&[1, 2, 3]);
         let removed = remove(&c, &9);
         assert_eq!(to_vec(&removed), vec![1, 2, 3]);
+        assert!(Rc::ptr_eq(c.as_ref().unwrap(), removed.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn long_chains_can_be_removed_and_dropped_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let mut c = None;
+                for i in 0..100_000 {
+                    c = cons(i, c);
+                }
+                let removed = remove(&c, &0);
+                assert_eq!(len(&removed), 99_999);
+                drop(c);
+                drop(removed);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

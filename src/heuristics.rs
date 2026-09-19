@@ -498,12 +498,15 @@ impl Heuristic {
 /// initial state, and combine as `g + weight*h` (`num_steps` committed plus the
 /// estimated remaining cost), matching the additive heuristic's shape.
 ///
-/// An unreachable compiled goal (FD reports infinite) or an FD error sinks the
-/// plan to `INFINITY` (it won't be expanded unless nothing better remains),
-/// matching how the ADD heuristic treats unreachable open conditions. Note: this
+/// An unreachable compiled goal (FD reports infinite) prunes the plan. An FD
+/// error disables this backend for the search and falls back to h = 0: failure
+/// to evaluate a heuristic says nothing about solvability. Note: this
 /// spawns an FD subprocess per evaluation — the dominant cost, as the paper
 /// notes; identical compiled problems are memoized in `crate::external`.
 fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuristic) -> f32 {
+    if ctx.failed_compile_backends.borrow().contains(&backend) {
+        return plan.cost() as f32;
+    }
     // Ground search: take the fast path — ground the task ourselves into FDR and
     // invoke only the `downward` C++ binary, skipping FD's Python translator
     // (~95% of the per-node cost). Lifted search: emit PDDL and run the full
@@ -519,8 +522,9 @@ fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuris
         Ok(HResult::Finite(h)) => plan.cost() as f32 + weight * h,
         Ok(HResult::Infinite) => f32::INFINITY,
         Err(e) => {
-            eprintln!("COMPILE heuristic: Fast Downward error: {e}");
-            f32::INFINITY
+            ctx.failed_compile_backends.borrow_mut().insert(backend);
+            eprintln!("COMPILE heuristic: Fast Downward error: {e}; using h=0 for this backend for the rest of this search");
+            plan.cost() as f32
         }
     }
 }

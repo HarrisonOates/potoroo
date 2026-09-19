@@ -1091,6 +1091,7 @@ impl<'a> Planner<'a> {
         mut progress: Option<&mut dyn FnMut(SearchProgress)>,
     ) -> (Outcome, SearchStats) {
         let search_started = Instant::now();
+        let mut progress_memory = crate::memory::ProgressMemory::default();
         let n_orders = params.flaw_orders.len();
         let inf = f32::INFINITY;
         let alg = params.search_algorithm;
@@ -1323,8 +1324,9 @@ impl<'a> Planner<'a> {
                     }
                 }
                 if let Some(report) = progress.as_deref_mut() {
+                    let elapsed = search_started.elapsed();
                     report(SearchProgress {
-                        elapsed: search_started.elapsed(),
+                        elapsed,
                         nodes_generated: stats.nodes_generated,
                         nodes_visited: stats.nodes_visited,
                         queued,
@@ -1332,7 +1334,7 @@ impl<'a> Planner<'a> {
                         h_eval_ms: stats.h_eval_ms,
                         pruned: stats.pruned,
                         dropped: stats.dropped,
-                        resident_kb: crate::memory::resident_set_kb(),
+                        resident_kb: progress_memory.sample(elapsed),
                         current_steps: plan.num_steps(),
                         current_open_conditions: plan.num_open_conditions(),
                         current_threats: plan.threats.len(),
@@ -1395,6 +1397,9 @@ impl<'a> Planner<'a> {
                 }
             }
 
+            if current_plan.is_none() && stopped.is_none() {
+                stopped = stop_expired!();
+            }
             if stopped.is_some() {
                 break;
             }
@@ -2359,6 +2364,12 @@ impl<'a> Planner<'a> {
             (*expand_count).is_multiple_of(2)
         };
         loop {
+            if params
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return (None, 0.0);
+            }
             let use_secondary = alt_use_secondary
                 || (is_dual && *boost_budget == 0 && {
                     *expand_count += 1;

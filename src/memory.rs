@@ -6,12 +6,33 @@
 //! may retain freed memory. These limits are disabled by default.
 
 use std::collections::BinaryHeap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::params::Parameters;
 
 /// Generated nodes between resident-set readings.
 const CHECK_INTERVAL: usize = 1024;
+
+/// Progress callbacks run for every expansion. Sampling /proc for every
+/// callback can dominate fast searches even when the CLI prints once a second.
+#[derive(Default)]
+pub(crate) struct ProgressMemory {
+    last: Option<Duration>,
+    resident_kb: u64,
+}
+
+impl ProgressMemory {
+    pub(crate) fn sample(&mut self, elapsed: Duration) -> u64 {
+        if self
+            .last
+            .is_none_or(|last| elapsed.saturating_sub(last) >= Duration::from_millis(100))
+        {
+            self.resident_kb = resident_set_kb();
+            self.last = Some(elapsed);
+        }
+        self.resident_kb
+    }
+}
 
 /// How far the open list may overflow its capacity before it is trimmed
 /// back, as a divisor: trimming a tenth at a time makes the cost amortised

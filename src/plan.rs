@@ -1526,8 +1526,27 @@ fn add_goal(
                     new_bindings.push(Binding::new(var, var_id, term, term_id, is_eq));
                 }
             }
-            Formula::Exists { body, .. } => {
-                goals.push(body.clone());
+            Formula::Exists { params, body } => {
+                // Each occurrence needs its own witnesses, including copies
+                // made by a surrounding forall. Record even unused witnesses:
+                // an empty type or inconsistent inequalities must not pass as
+                // a complete plan simply because no literal mentions them.
+                let mut subst = HashMap::new();
+                for &param in params {
+                    let ty = ctx.var_type(param, step_id);
+                    if ctx.compatible_objects(ty).is_empty() {
+                        return false;
+                    }
+                    let var = fresh_for(ctx, &mut subst, param, step_id);
+                    new_bindings.push(Binding::new(
+                        var,
+                        step_id,
+                        Term::Variable(var),
+                        step_id,
+                        true,
+                    ));
+                }
+                goals.push(body.substitute(&subst));
             }
             Formula::Forall { params, body } => {
                 // Universal base: instantiate the body over all type-compatible
@@ -1535,7 +1554,8 @@ fn add_goal(
                 let expanded = ctx.universal_base(params, body, step_id);
                 goals.push(expanded);
             }
-            Formula::True | Formula::False => {}
+            Formula::True => {}
+            Formula::False => return false,
         }
     }
     true

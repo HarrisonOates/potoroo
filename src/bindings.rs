@@ -529,6 +529,19 @@ pub struct Bindings {
 type AddedVarsets = (Option<Rc<Chain<Varset>>>, usize, usize);
 
 impl Bindings {
+    /// Variables participating in constraints, including witnesses that occur
+    /// only in (in)equalities rather than in an action's parameter list.
+    pub(crate) fn constrained_variables(&self) -> Vec<StepVariable> {
+        let mut variables = Vec::new();
+        for varset in chain::iter(&self.varsets) {
+            variables.extend(chain::iter(&varset.cd_set).copied());
+            variables.extend(chain::iter(&varset.ncd_set).copied());
+        }
+        variables.sort_unstable();
+        variables.dedup();
+        variables
+    }
+
     pub fn empty() -> Rc<Bindings> {
         Rc::new(Bindings::default())
     }

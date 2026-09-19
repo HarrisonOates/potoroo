@@ -428,16 +428,23 @@ const SIBLING_TYPE_PROBLEM: &str = r#"
 #[test]
 fn sibling_refinements_do_not_share_each_others_parameter_types() {
     let (domain, problem) = lower(SIBLING_TYPE_DOMAIN, SIBLING_TYPE_PROBLEM);
-    let params = Parameters {
-        heuristic: Heuristic::parse("ADD").unwrap(),
-        search_limits: vec![10_000],
-        ..Parameters::default()
-    };
-    let context = SearchContext::new(&domain, &problem, &params);
-    let Outcome::Solved(solution) = plan(&context) else {
-        panic!("ADD must not rank a reachable sibling refinement as unreachable");
-    };
-    assert_eq!(solution.num_steps(), 1);
+    for search_algorithm in [
+        SearchAlgorithm::A,
+        SearchAlgorithm::LazyGbfs,
+        SearchAlgorithm::LazyGbfsDual,
+    ] {
+        let params = Parameters {
+            search_algorithm,
+            heuristic: Heuristic::parse("ADD").unwrap(),
+            search_limits: vec![10_000],
+            ..Parameters::default()
+        };
+        let context = SearchContext::new(&domain, &problem, &params);
+        let Outcome::Solved(solution) = plan(&context) else {
+            panic!("ADD must not rank a reachable sibling refinement as unreachable");
+        };
+        assert_eq!(solution.num_steps(), 1);
+    }
 }
 
 /// `(not (WALL ?c))` over an unbound `?c`, where `WALL` is static: it can only

@@ -991,6 +991,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             "w" => {
                 let v = required_value!();
                 params.weight = v.parse().map_err(|_| format!("invalid weight `{v}`"))?;
+                if !params.weight.is_finite() || params.weight < 0.0 {
+                    return Err(format!(
+                        "invalid weight `{v}`: expected a finite non-negative number"
+                    ));
+                }
             }
             other => return Err(format!("unknown option `-{other}`")),
         }
