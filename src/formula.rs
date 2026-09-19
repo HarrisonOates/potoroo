@@ -56,7 +56,7 @@ impl Literal {
     /// Whether `self`, read as an effect literal, could possibly affect the
     /// link condition `other`: the sign and predicate test that
     /// [`Bindings::affects`](crate::bindings::Bindings::affects) makes before it
-    /// unifies. Two positive literals never interfere, and unification fails
+    /// unifies. Equal signs never interfere, and unification fails
     /// outright on different predicates, so this is necessary for `affects` --
     /// never the other way round, which is why it only ever skips work.
     ///
@@ -64,7 +64,7 @@ impl Literal {
     /// link, so it stays to inline field reads.
     #[inline]
     pub fn may_affect(&self, other: &Literal) -> bool {
-        (self.negative() || other.negative()) && self.atom().predicate == other.atom().predicate
+        (self.negative() != other.negative()) && self.atom().predicate == other.atom().predicate
     }
 
     /// Lifts this literal into a formula.
@@ -418,6 +418,13 @@ pub(crate) fn atom_separator(a1: &Atom, a2: &Atom) -> Option<Rc<Formula>> {
     }
     let mut disj: Option<Rc<Formula>> = None;
     for (&t1, &t2) in a1.terms.iter().zip(a2.terms.iter()) {
+        // Both atoms belong to the same action scope. Identical variables,
+        // like identical objects, cannot separate them. In particular a
+        // delete paired with the identical add must get the literal False,
+        // so it is not mistaken for a threat to another step's causal link.
+        if t1 == t2 {
+            continue;
+        }
         match (t1, t2) {
             (Term::Object(o1), Term::Object(o2)) => {
                 if o1 != o2 {
@@ -476,6 +483,40 @@ mod tests {
     }
 
     #[test]
+    fn atom_separator_omits_identical_arguments() {
+        let x = Term::Variable(Variable(0));
+        let y = Term::Variable(Variable(1));
+        let a = Atom {
+            predicate: Predicate(0),
+            terms: vec![x, y],
+        };
+        assert!(atom_separator(&a, &a).unwrap().contradiction());
+        let b = Atom {
+            terms: vec![x, x],
+            ..a.clone()
+        };
+        assert!(matches!(atom_separator(&a, &b).unwrap().as_ref(),
+            Formula::Inequality { left, right, .. } if *left == y && *right == x));
+    }
+
+    #[test]
+    fn binding_contradictions_preserve_variable_scope() {
+        let bindings = crate::bindings::Bindings::empty();
+        let x = Term::Variable(Variable(0));
+        let local = Formula::inequality(x, x);
+        assert!(bindings.contradicts(&local, 1));
+        let cross_step = Rc::new(Formula::Inequality {
+            left: x,
+            left_id: Some(1),
+            right: x,
+            right_id: Some(2),
+        });
+        assert!(!bindings.contradicts(&cross_step, 1));
+        assert!(bindings.contradicts(&Formula::and(local.clone(), cross_step.clone()), 1));
+        assert!(!bindings.contradicts(&Formula::or(local, cross_step), 1));
+    }
+
+    #[test]
     fn conjunction_flattens() {
         let inner = Formula::and(atom(0), atom(1));
         let outer = Formula::and(inner, atom(2));
@@ -506,38 +547,64 @@ mod tests {
         }
     }
 
-    /// `may_affect` guards the threat scan's call to `Bindings::affects`, so it
-    /// must never be false where `affects` would be true. `affects` unifies the
-    /// two atoms unless both literals are positive, and unification fails on
-    /// different predicates -- so enumerate the sign and predicate combinations
-    /// and check the implication holds in each.
+    /// Check the threat definition independently of either implementation:
+    /// opposite signs and matching atoms are required, including for deletes.
     #[test]
-    fn may_affect_admits_everything_affects_accepts() {
-        let a = Atom {
-            predicate: Predicate(0),
-            terms: vec![Term::Object(Object(0))],
+    fn affects_requires_opposite_signs_and_matching_atoms() {
+        use crate::bindings::{Bindings, StepVarTypes, TypeContext};
+        use crate::terms::TermTable;
+        use crate::types::{Type, Types, OBJECT};
+        struct ObjectVariables;
+        impl StepVarTypes for ObjectVariables {
+            fn var_type(&self, _: Variable, _: usize) -> Type {
+                OBJECT
+            }
+        }
+        let types = Types::new();
+        let mut objects = TermTable::new();
+        objects.add_object("a", OBJECT);
+        objects.add_object("b", OBJECT);
+        let constants = TermTable::new();
+        let ctx = TypeContext {
+            types: &types,
+            objects: &objects,
+            constants: &constants,
+            step_vars: &ObjectVariables,
         };
-        let b = Atom {
-            predicate: Predicate(1),
-            terms: vec![Term::Object(Object(0))],
-        };
-        let pos_a = Literal::Atom(a.clone());
-        let neg_a = Literal::Negation(a);
-        let pos_b = Literal::Atom(b.clone());
-        let neg_b = Literal::Negation(b);
-
-        // Opposite or both-negative signs on a shared predicate: the scan must
-        // go on to unify.
-        assert!(neg_a.may_affect(&pos_a));
-        assert!(pos_a.may_affect(&neg_a));
-        assert!(neg_a.may_affect(&neg_a));
-        // Two positives never interfere, whatever the predicate.
-        assert!(!pos_a.may_affect(&pos_a));
-        assert!(!pos_a.may_affect(&pos_b));
-        // Different predicates cannot unify, whatever the signs.
-        assert!(!neg_a.may_affect(&pos_b));
-        assert!(!pos_a.may_affect(&neg_b));
-        assert!(!neg_a.may_affect(&neg_b));
+        let bindings = Bindings::empty();
+        for left_negative in [false, true] {
+            for right_negative in [false, true] {
+                for right_predicate in [0, 1] {
+                    for right_object in [0, 1] {
+                        let left = Atom {
+                            predicate: Predicate(0),
+                            terms: vec![Term::Object(Object(0))],
+                        };
+                        let right = Atom {
+                            predicate: Predicate(right_predicate),
+                            terms: vec![Term::Object(Object(right_object))],
+                        };
+                        let left = if left_negative {
+                            Literal::Negation(left)
+                        } else {
+                            Literal::Atom(left)
+                        };
+                        let right = if right_negative {
+                            Literal::Negation(right)
+                        } else {
+                            Literal::Atom(right)
+                        };
+                        let opposite_predicate =
+                            left_negative != right_negative && right_predicate == 0;
+                        assert_eq!(left.may_affect(&right), opposite_predicate);
+                        assert_eq!(
+                            bindings.affects(&ctx, &left, 1, &right, 2),
+                            opposite_predicate && right_object == 0
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

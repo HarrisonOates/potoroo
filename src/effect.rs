@@ -49,6 +49,17 @@ impl Effect {
     pub fn conditional(&self) -> bool {
         !self.condition.tautology()
     }
+
+    /// Whether this effect may still threaten a link. Binding refinements can
+    /// cancel a delete against a same-step add after the threat was recorded.
+    pub(crate) fn threat_possible(
+        &self,
+        bindings: &crate::bindings::Bindings,
+        step: usize,
+    ) -> bool {
+        !bindings.contradicts(&self.link_condition, step)
+            && !bindings.contradicts(&self.condition, step)
+    }
 }
 
 /// Strengthens an action's effects by computing their `link_condition`s, so an

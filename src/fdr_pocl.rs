@@ -1915,13 +1915,23 @@ impl<'a> Planner<'a> {
                 if !self.open_matches(criterion, plan, open, local_consumer) {
                     continue;
                 }
-                let refinements = self.open_refinement_count(plan, open);
+                // Most criteria only need eligibility, not the exact count.
+                // ZLIFO's zero/one tests can stop at one/two; unrestricted
+                // LIFO needs no supporter walk at all.
+                let refinements = if matches!(criterion.order, OrderType::Lr | OrderType::Mr) {
+                    self.open_refinement_count(plan, open)
+                } else if criterion.max_refinements < i32::MAX {
+                    self.open_refinement_count_up_to(plan, open, criterion.max_refinements + 1)
+                } else {
+                    0
+                };
                 if refinements > criterion.max_refinements {
                     continue;
                 }
-                let has_new = self.achievers.contains_key(&open.condition)
-                    || self.derived_supports.contains_key(&open.condition);
-                let has_reuse = self.has_reuse(plan, open);
+                let has_new = criterion.order == OrderType::New
+                    && (self.achievers.contains_key(&open.condition)
+                        || self.derived_supports.contains_key(&open.condition));
+                let has_reuse = criterion.order == OrderType::Reuse && self.has_reuse(plan, open);
                 let estimate = if let Some(estimates) = &relaxed {
                     match criterion.order {
                         OrderType::Lw | OrderType::Mw => {
@@ -2014,6 +2024,78 @@ impl<'a> Planner<'a> {
     }
 
     fn open_refinement_count(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
+        self.open_refinement_count_up_to(plan, open, i32::MAX)
+    }
+
+    /// Exactly min(full_count, cap). Every fresh template contributes even if
+    /// later feasibility checks might reject its child, just as in the full
+    /// count. Reaching the cap makes scanning reusable occurrences unnecessary.
+    fn open_refinement_count_up_to(
+        &self,
+        plan: &PartialPlan,
+        open: &OpenCondition,
+        cap: i32,
+    ) -> i32 {
+        let count = self.count_open_supporters(plan, open, cap);
+        #[cfg(test)]
+        assert_eq!(
+            count,
+            self.open_refinement_count_reference(plan, open).min(cap)
+        );
+        count
+    }
+
+    fn count_open_supporters(&self, plan: &PartialPlan, open: &OpenCondition, cap: i32) -> i32 {
+        debug_assert!(cap > 0);
+        let mut count = 0;
+        if let Some(supports) = self.derived_supports.get(&open.condition) {
+            for support in supports {
+                if self.support_requirements_possible(plan, open.consumer, support) {
+                    count += 1;
+                    if count == cap {
+                        break;
+                    }
+                }
+            }
+            return count;
+        }
+        count = i32::from(self.task.initial[open.condition.variable] == open.condition.value);
+        if let Some(achievers) = self.achievers.get(&open.condition) {
+            count = count.saturating_add(i32::try_from(achievers.len()).unwrap_or(i32::MAX));
+            if count >= cap {
+                return cap;
+            }
+            for step in plan.steps() {
+                if !plan.orderings.possibly_before(
+                    step.id,
+                    StepTime::AtEnd,
+                    open.consumer,
+                    StepTime::AtStart,
+                ) {
+                    continue;
+                }
+                for achiever in achievers {
+                    if achiever.operator == step.operator
+                        && !plan.effect_cannot_fire(self.task, step, achiever.effect)
+                        && self.support_requirements_possible(
+                            plan,
+                            step.id,
+                            &self.task.operators[step.operator].effects[achiever.effect].conditions,
+                        )
+                    {
+                        count += 1;
+                        if count == cap {
+                            return cap;
+                        }
+                    }
+                }
+            }
+        }
+        count.min(cap)
+    }
+
+    #[cfg(test)]
+    fn open_refinement_count_reference(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
         if let Some(supports) = self.derived_supports.get(&open.condition) {
             return i32::try_from(
                 supports
@@ -2119,7 +2201,7 @@ impl<'a> Planner<'a> {
                 break;
             }
             let forced = plan.open_conditions().find_map(|open| {
-                let count = self.open_refinement_count(&plan, open);
+                let count = self.open_refinement_count_up_to(&plan, open, 2);
                 (count <= 1).then(|| (open.clone(), count))
             });
             let Some((open, count)) = forced else {
@@ -3526,7 +3608,17 @@ mod tests {
     #[test]
     fn parsed_flaw_orders_drive_fdr_refinement() {
         let task = travel_task();
-        for order in ["LCFR", "ZLIFO", "MC"] {
+        for order in [
+            "STATIC",
+            "LCFR",
+            "ZLIFO",
+            "MC",
+            "MW",
+            "UCPOP-LC",
+            "{n,s}MR/{o}MR",
+            "{n,s}LIFO/{o}REUSE",
+            "DUNF-GEN",
+        ] {
             let params = Parameters {
                 flaw_orders: vec![FlawSelectionOrder::parse(order).unwrap()],
                 search_limits: vec![1_000],

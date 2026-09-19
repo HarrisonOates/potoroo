@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use crate::chain::{self, Chain};
 use crate::fasthash::FastMap;
-use crate::formula::Literal;
+use crate::formula::{Formula, Literal};
 use crate::terms::{Object, Term, TermTable, Variable};
 use crate::types::{Type, Types};
 
@@ -700,6 +700,42 @@ impl Bindings {
         }
     }
 
+    /// A conservative proof that a scoped formula is false in this binding
+    /// snapshot. Unknown literals and quantified bodies remain possible.
+    pub(crate) fn contradicts(&self, formula: &Formula, step: usize) -> bool {
+        match formula {
+            Formula::False => true,
+            Formula::Inequality {
+                left,
+                left_id,
+                right,
+                right_id,
+            } => self.terms_equal(
+                *left,
+                left_id.unwrap_or(step),
+                *right,
+                right_id.unwrap_or(step),
+            ),
+            Formula::Equality {
+                left,
+                left_id,
+                right,
+                right_id,
+            } => {
+                match (
+                    self.binding(*left, left_id.unwrap_or(step)),
+                    self.binding(*right, right_id.unwrap_or(step)),
+                ) {
+                    (Term::Object(a), Term::Object(b)) => a != b,
+                    _ => false,
+                }
+            }
+            Formula::Conjunction(parts) => parts.iter().any(|p| self.contradicts(p, step)),
+            Formula::Disjunction(parts) => parts.iter().all(|p| self.contradicts(p, step)),
+            _ => false,
+        }
+    }
+
     /// Whether equating two terms is consistent. Used to prove that two
     /// symbolic invariant members must be distinct, including explicit
     /// inequalities and disjoint types, without assigning either variable.
@@ -763,14 +799,10 @@ impl Bindings {
         l2: &Literal,
         id2: usize,
     ) -> bool {
-        // A negation affects a positive literal when their atoms unify; the
-        // signs are opposite by construction, so go straight to the atoms.
-        match l1 {
-            Literal::Negation(a) => self.unify_atoms(ctx, mgu, l2.atom(), id2, a, id1),
-            Literal::Atom(_) => match l2 {
-                Literal::Negation(a) => self.unify_atoms(ctx, mgu, a, id2, l1.atom(), id1),
-                Literal::Atom(_) => false,
-            },
+        match (l1, l2) {
+            (Literal::Negation(a), Literal::Atom(b)) => self.unify_atoms(ctx, mgu, b, id2, a, id1),
+            (Literal::Atom(a), Literal::Negation(b)) => self.unify_atoms(ctx, mgu, b, id2, a, id1),
+            _ => false,
         }
     }
 

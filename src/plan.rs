@@ -339,17 +339,21 @@ impl Plan {
     fn handle_unsafe(&self, ctx: &SearchContext, plans: &mut Vec<Rc<Plan>>, unsafe_: &Unsafe) {
         let link = &unsafe_.link;
         let mut unifier: Vec<Binding> = Vec::new();
-        let placement_admits = self.orderings.possibly_not_after(
-            link.from_id,
-            link.effect_time,
-            unsafe_.step_id,
-            StepTime::AtEnd,
-        ) && self.orderings.possibly_not_before(
-            link.to_id,
-            link.condition_time.end_time(),
-            unsafe_.step_id,
-            StepTime::AtEnd,
-        );
+        let placement_admits = unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id)
+            && self.orderings.possibly_not_after(
+                link.from_id,
+                link.effect_time,
+                unsafe_.step_id,
+                StepTime::AtEnd,
+            )
+            && self.orderings.possibly_not_before(
+                link.to_id,
+                link.condition_time.end_time(),
+                unsafe_.step_id,
+                StepTime::AtEnd,
+            );
         let affected = placement_admits
             && self.bindings.affects_mgu(
                 &ctx.type_ctx(),
@@ -399,8 +403,8 @@ impl Plan {
     }
 
     /// The goal whose achievement separates `unsafe_`: the disjunction of the
-    /// inequalities that would break the threatening unifier, plus — for a
-    /// conditional effect — the negation of its guard (confrontation).
+    /// inequalities that would break the threatening unifier, plus the
+    /// negation of its strengthened guard (confrontation).
     ///
     /// Shared by [`Self::separate`] and [`Self::separate_count`] so a refinement
     /// is never counted on a different formula from the one it produces. The
@@ -435,11 +439,15 @@ impl Plan {
                 }
             }
         }
-        // Conditional effect condition (negated) — only when the effect is
-        // conditional. For a universally-quantified effect, wrap the negated
-        // condition in a fresh-variable `forall` so that *no* instance of the
-        // effect fires.
-        let effect_cond = &unsafe_.effect.condition;
+        // The strengthened guard includes cancellation by a same-step add.
+        // Confrontation may therefore resolve a delete by equating its arguments
+        // with that add, or by establishing the restoring add's condition.
+        // For a universally-quantified effect, wrap the negated guard in a
+        // fresh-variable `forall` so that no instance of the effect fires.
+        let effect_cond = Formula::and(
+            unsafe_.effect.condition.clone(),
+            unsafe_.effect.link_condition.clone(),
+        );
         if !effect_cond.tautology() {
             let cond_goal = if unsafe_.effect.parameters.is_empty() {
                 effect_cond.negation()
@@ -1067,9 +1075,12 @@ impl Plan {
         let lt2 = link.condition_time.end_time();
         let et = StepTime::AtEnd;
         let mut unifier: Vec<Binding> = Vec::new();
-        if self
-            .orderings
-            .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+        if unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id)
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
             && self
                 .orderings
                 .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
@@ -1164,9 +1175,13 @@ impl Plan {
         let lt2 = link.condition_time.end_time();
         let et = StepTime::AtEnd;
         let mut unifier: Vec<Binding> = Vec::new();
-        let affected = self
-            .orderings
-            .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+        let possible = unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id);
+        let affected = possible
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
             && self
                 .orderings
                 .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
@@ -1178,7 +1193,8 @@ impl Plan {
                 &link.condition,
                 link.to_id,
             );
-        let e_deleting = !affected
+        let e_deleting = possible
+            && !affected
             && self
                 .orderings
                 .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
@@ -1660,7 +1676,7 @@ pub fn link_threats(
                 if !classical && !effect_e_deletes(ctx, bindings, e, s.id, link) {
                     continue;
                 }
-                if e.link_condition.contradiction() {
+                if !e.threat_possible(bindings, s.id) {
                     continue;
                 }
                 if !classical
@@ -1718,7 +1734,7 @@ pub fn step_threats(
                 if !classical && !effect_e_deletes(ctx, bindings, e, step.id, l) {
                     continue;
                 }
-                if e.link_condition.contradiction() {
+                if !e.threat_possible(bindings, step.id) {
                     continue;
                 }
                 if !classical

@@ -501,13 +501,18 @@ The flaw-selection order (`-f`) controls which open flaw the planner chooses to 
 | `UCPOP-LC-MC` | `{n,s}LIFO/{o}LR/{o}MR` |
 | `DSEP-LIFO` | `{n}LIFO/{o}LIFO/{s}LIFO` — non-separable threats, then open conditions, then separable threats |
 | `DSEP-LC` | `{n}LIFO/{o}LR/{s}LIFO` |
-| `ZLIFO` | Complex ZLIFO order (Haslum & Geffner 2000) |
+| `ZLIFO` | `{n}LIFO/{o}0LIFO/{o}1NEW/{o}LIFO/{s}LIFO` — non-separable threats, zero- then single-supporter open conditions, remaining open conditions, separable threats |
 | `LCFR` | Least-cost-first with reuse |
 | `LCFR-LOC` | LCFR, prefer open conditions |
 | `LCFR-CONF` | LCFR, prefer threatened conditions |
 | `MC` | Most-cost first |
 | `MW` | Most-work first |
 | `LC_ADD`, `MC_ADD`, `LW_ADD`, `MW_ADD` | Cost/work variants using the ADD heuristic |
+
+`-f ZLIFO` selects flaws within a plan; `-h ADD/LIFO` breaks ties between
+queued plans. They can be used together and have different performance effects.
+See the ZLIFO measurements for
+comparisons with STATIC and the pruning combinations.
 
 ### DSL syntax
 

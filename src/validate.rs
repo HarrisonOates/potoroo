@@ -300,52 +300,35 @@ fn link_supported(plan: &Plan, ctx: &SearchContext, link: &Link) -> bool {
 /// Without this, every confronted conditional effect reads as an unresolved
 /// threat and valid plans are reported invalid — `briefcase-world` resolves
 /// `(when (in p) ...)` exactly this way.
-fn effect_confronted(
-    plan: &Plan,
-    ctx: &SearchContext,
-    effect: &crate::effect::Effect,
-    step_id: usize,
-) -> bool {
-    if effect.condition.tautology() {
-        return false;
-    }
-    let mut guard = Vec::new();
-    collect_literals(&effect.condition, &mut guard);
-    if guard.is_empty() {
-        return false;
-    }
-    let type_ctx = ctx.type_ctx();
-    for link in chain::iter(&plan.links) {
-        if link.to_id != step_id {
-            continue;
-        }
-        // One falsified conjunct is enough: the guard is a conjunction, so the
-        // effect cannot fire.
-        if guard.iter().any(|literal| {
-            plan.bindings
-                .affects(&type_ctx, &link.condition, link.to_id, literal, step_id)
-        }) {
+fn effect_confronted(plan: &Plan, effect: &crate::effect::Effect, step_id: usize) -> bool {
+    fn disproved(plan: &Plan, formula: &crate::formula::Formula, step: usize) -> bool {
+        use crate::formula::Formula;
+        if plan.bindings.contradicts(formula, step) {
             return true;
         }
-    }
-    false
-}
-
-/// Collects the literals of a conjunctive guard. Anything else (a disjunction,
-/// a quantifier) contributes nothing, which keeps the check conservative: an
-/// unrecognised guard is treated as able to fire.
-fn collect_literals(formula: &crate::formula::Formula, out: &mut Vec<Literal>) {
-    use crate::formula::Formula;
-    match formula {
-        Formula::Atom(atom) => out.push(Literal::Atom(atom.clone())),
-        Formula::Negation(atom) => out.push(Literal::Negation(atom.clone())),
-        Formula::Conjunction(conjuncts) => {
-            for conjunct in conjuncts {
-                collect_literals(conjunct, out);
+        match formula {
+            Formula::Conjunction(parts) => parts.iter().any(|p| disproved(plan, p, step)),
+            Formula::Disjunction(parts) => parts.iter().all(|p| disproved(plan, p, step)),
+            Formula::Atom(atom) | Formula::Negation(atom) => {
+                let negative = matches!(formula, Formula::Negation(_));
+                chain::iter(&plan.links).any(|link| {
+                    let other = link.condition.atom();
+                    link.to_id == step
+                        && link.condition.negative() != negative
+                        && atom.predicate == other.predicate
+                        && atom.terms.len() == other.terms.len()
+                        && atom
+                            .terms
+                            .iter()
+                            .zip(&other.terms)
+                            .all(|(&a, &b)| plan.bindings.terms_equal(a, step, b, link.to_id))
+                })
             }
+            // Quantified guards require instance-wise evidence.
+            _ => false,
         }
-        _ => {}
     }
+    disproved(plan, &effect.condition, step_id) || disproved(plan, &effect.link_condition, step_id)
 }
 
 fn link_threatened_by(plan: &Plan, ctx: &SearchContext, link: &Link) -> Option<usize> {
@@ -366,13 +349,13 @@ fn link_threatened_by(plan: &Plan, ctx: &SearchContext, link: &Link) -> Option<u
         for e in s.action.effects.iter() {
             // A contradictory link condition means the effect can never fire in a
             // way that clobbers, so it is not a real threat.
-            if e.link_condition.contradiction() {
+            if !e.threat_possible(bindings, s.id) {
                 continue;
             }
             // Nor is a conditional effect the plan has already committed
             // against: confrontation resolves the threat without ordering the
             // step anywhere.
-            if effect_confronted(plan, ctx, e, s.id) {
+            if effect_confronted(plan, e, s.id) {
                 continue;
             }
             let et = StepTime::AtEnd;

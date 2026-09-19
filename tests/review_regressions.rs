@@ -13,7 +13,12 @@ fn solve(domain: &str, problem: &str, params: Parameters) -> Outcome {
     };
     let problem = lower_problem(&p, &domain).unwrap();
     bind_action_costs(&mut domain, &problem).unwrap();
-    plan(&SearchContext::new(&domain, &problem, &params))
+    let ctx = SearchContext::new(&domain, &problem, &params);
+    let outcome = plan(&ctx);
+    if let Outcome::Solved(solution) = &outcome {
+        potoroo::validate::is_valid_solution(solution, &ctx).unwrap();
+    }
+    outcome
 }
 
 fn params() -> Parameters {
@@ -436,4 +441,85 @@ fn tiny_tasks_agree_with_exhaustive_state_search() {
         solved > 30,
         "exercise successful replay as well as dead ends"
     );
+}
+
+/// PDDL applies deletes before adds: a same-step add preserves the fact.
+/// Exercise both syntactic identity and cancellation discovered by bindings or
+/// by confrontation of the restoring add's guard. Real deletes remain threats.
+#[test]
+fn restored_deletes_do_not_create_bogus_threats() {
+    use potoroo::heuristics::FlawSelectionOrder;
+    for (parameters, extra_precondition, restore, guard, solvable) in [
+        ("?x - item", "", "(available ?x)", "", true),
+        ("?x ?y - item", "(= ?x ?y)", "(available ?y)", "", true),
+        ("?x ?y - item", "", "(available ?y)", "", true),
+        (
+            "?x ?y - item",
+            "(= ?x ?y)",
+            "(when (guard) (available ?y))",
+            "(guard)",
+            true,
+        ),
+        (
+            "?x - item",
+            "",
+            "(when (guard) (available ?x))",
+            "(guard)",
+            true,
+        ),
+        ("?x - item", "", "", "", false),
+        ("?x - item", "", "(when (guard) (available ?x))", "", false),
+    ] {
+        let mut domain = String::from(
+            "(define (domain preserve)
+            (:requirements :adl :typing) (:types item)
+            (:predicates (available ?x - item) (guard) (first) (second))",
+        );
+        for name in ["first", "second"] {
+            domain.push_str(&format!(
+                "
+(:action {name} :parameters ({parameters})
+                :precondition (and (available ?x) {extra_precondition})
+                :effect (and (not (available ?x)) {restore} ({name})))"
+            ));
+        }
+        domain.push(')');
+        let problem = format!(
+            "(define (problem p) (:domain preserve)
+            (:objects a - item) (:init (available a) {guard})
+            (:goal (and (first) (second))))"
+        );
+        for order in ["STATIC", "ZLIFO", "LCFR"] {
+            for ground_actions in [false, true] {
+                for mask in 0..32 {
+                    let search_params = Parameters {
+                        ground_actions,
+                        flaw_orders: vec![FlawSelectionOrder::parse(order).unwrap()],
+                        heuristic: Heuristic::parse("ADD").unwrap(),
+                        prune: potoroo::pruning::PruneOptions {
+                            cutset: mask & 1 != 0,
+                            edelete: mask & 2 != 0,
+                            disjunctive: mask & 4 != 0,
+                            supporters: mask & 8 != 0,
+                            symbolic: mask & 16 != 0,
+                            ..Default::default()
+                        },
+                        ..params()
+                    };
+                    let result = solve(&domain, &problem, search_params);
+                    let detail = format!(
+                        "{order}, ground={ground_actions}, mask={mask}: {domain} {problem}"
+                    );
+                    match result {
+                        Outcome::Solved(plan) => {
+                            assert!(solvable, "false solution: {detail}");
+                            assert_eq!(plan.num_steps(), 2, "{detail}");
+                        }
+                        Outcome::NoSolution => assert!(!solvable, "false dead end: {detail}"),
+                        Outcome::LimitReached => panic!("tiny task exceeded limit: {detail}"),
+                    }
+                }
+            }
+        }
+    }
 }
