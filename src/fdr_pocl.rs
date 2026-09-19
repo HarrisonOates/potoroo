@@ -725,6 +725,8 @@ pub struct SearchStats {
     pub h_evals: usize,
     pub h_eval_ms: u128,
     pub pruned: usize,
+    /// Forced support refinements performed without allocating a queue entry.
+    pub supporter_forced: usize,
     pub max_steps: usize,
     pub max_open_conditions: usize,
     pub max_threats: usize,
@@ -869,6 +871,8 @@ struct Planner<'a> {
     action_cost: ActionCost,
     /// Shared mutex table for e-deletion, installed on the initial plan.
     edelete: Option<Rc<crate::cutset::FactMutexes>>,
+    /// Feasibility checks for the optional supporter propagation rule.
+    support_mutexes: Option<Rc<crate::cutset::FactMutexes>>,
     /// Whether threats are resolved by posting a disjunction instead of by
     /// splitting the plan.
     disjunctive: bool,
@@ -969,6 +973,7 @@ impl<'a> Planner<'a> {
             lmcut,
             action_cost,
             edelete: None,
+            support_mutexes: None,
             disjunctive: false,
             fact_graph: None,
             minimality: false,
@@ -1054,6 +1059,26 @@ impl<'a> Planner<'a> {
     fn with_pruning(mut self, prune: crate::pruning::PruneOptions) -> Self {
         if prune.edelete {
             self.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(self.task)));
+        }
+        if prune.supporters {
+            let mutexes = self
+                .edelete
+                .clone()
+                .unwrap_or_else(|| Rc::new(crate::cutset::FactMutexes::new(self.task)));
+            // Preconditions and the selected effect's guards must hold in one
+            // state. Remove globally impossible supporter templates once.
+            for achievers in self.achievers.values_mut() {
+                achievers.retain(|achiever| {
+                    let required: Vec<_> = self.effect_requirements[achiever.operator]
+                        [achiever.effect]
+                        .iter()
+                        .copied()
+                        .filter(|fact| !self.task.is_derived_variable(fact.variable))
+                        .collect();
+                    !mutexes.inconsistent(&required)
+                });
+            }
+            self.support_mutexes = Some(mutexes);
         }
         self.disjunctive = prune.disjunctive;
         if prune.recursion {
@@ -1148,7 +1173,9 @@ impl<'a> Planner<'a> {
         macro_rules! stop_expired {
             () => {
                 match stop.as_mut() {
-                    Some(stop) => stop.expired(stats.nodes_visited),
+                    Some(stop) => {
+                        stop.expired(stats.nodes_visited.saturating_add(stats.supporter_forced))
+                    }
                     None => None,
                 }
             };
@@ -1238,6 +1265,33 @@ impl<'a> Planner<'a> {
                 let children = self.refinements(&plan, &params.flaw_orders[current_order]);
                 let order_index = current_order;
                 for mut child in children {
+                    if params.prune.supporters {
+                        if let Some(reason) = stop_expired!() {
+                            stopped = Some(reason);
+                            break;
+                        }
+                        let remaining = params.search_limits[order_index]
+                            .saturating_sub(generated_per_order[order_index])
+                            .saturating_sub(1);
+                        let before = stats.supporter_forced;
+                        let propagated =
+                            self.propagate_supporters(child, params, remaining, &mut stats);
+                        let forced = stats.supporter_forced - before;
+                        // A refinement still consumes the node budget when its
+                        // queue entry is elided. Otherwise a small node limit
+                        // could hide thousands of recursive action insertions.
+                        stats.nodes_generated += forced;
+                        generated_per_order[order_index] += forced;
+                        if let Some(reason) = stop_expired!() {
+                            stopped = Some(reason);
+                            break;
+                        }
+                        let Some(propagated) = propagated else {
+                            stats.pruned += 1;
+                            continue;
+                        };
+                        child = propagated;
+                    }
                     if let Some(mutexes) = &cutset_mutexes {
                         if crate::cutset::has_inconsistent_cutset(&child, self.task, mutexes) {
                             stats.pruned += 1;
@@ -1315,6 +1369,9 @@ impl<'a> Planner<'a> {
                     }
                 }
 
+                if stopped.is_some() {
+                    break;
+                }
                 let queued = queues.iter().map(BinaryHeap::len).sum();
                 stats.max_queued = stats.max_queued.max(queued);
                 if let Some(bound) = bound.as_mut() {
@@ -1429,7 +1486,10 @@ impl<'a> Planner<'a> {
         if let Some(supports) = self.derived_supports.get(&open.condition) {
             return supports
                 .iter()
-                .map(|support| {
+                .filter_map(|support| {
+                    if !self.support_requirements_possible(plan, open.consumer, support) {
+                        return None;
+                    }
                     let mut child = plan.clone();
                     child.remove_open(&open);
                     for &condition in support {
@@ -1438,7 +1498,7 @@ impl<'a> Planner<'a> {
                             condition,
                         });
                     }
-                    child
+                    Some(child)
                 })
                 .collect();
         }
@@ -1523,6 +1583,9 @@ impl<'a> Planner<'a> {
         consumer: usize,
     ) -> Option<PartialPlan> {
         let condition = open.condition;
+        if !self.support_requirements_possible(plan, producer, effect_conditions) {
+            return None;
+        }
         let orderings = plan.orderings.refine(Ordering::new(
             producer,
             StepTime::AtEnd,
@@ -1952,7 +2015,15 @@ impl<'a> Planner<'a> {
 
     fn open_refinement_count(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
         if let Some(supports) = self.derived_supports.get(&open.condition) {
-            return i32::try_from(supports.len()).unwrap_or(i32::MAX);
+            return i32::try_from(
+                supports
+                    .iter()
+                    .filter(|support| {
+                        self.support_requirements_possible(plan, open.consumer, support)
+                    })
+                    .count(),
+            )
+            .unwrap_or(i32::MAX);
         }
         let mut count =
             i32::from(self.task.initial[open.condition.variable] == open.condition.value);
@@ -1971,6 +2042,13 @@ impl<'a> Planner<'a> {
                             .filter(|achiever| {
                                 achiever.operator == step.operator
                                     && !plan.effect_cannot_fire(self.task, step, achiever.effect)
+                                    && self.support_requirements_possible(
+                                        plan,
+                                        step.id,
+                                        &self.task.operators[step.operator].effects
+                                            [achiever.effect]
+                                            .conditions,
+                                    )
                             })
                             .count() as i32,
                     );
@@ -1978,6 +2056,86 @@ impl<'a> Planner<'a> {
             }
         }
         count
+    }
+
+    /// A supporter's newly required guards cannot contradict the step's
+    /// existing pre-state commitments. Derived facts are expanded separately;
+    /// no claim about their truth is inferred from this base-fact test.
+    fn support_requirements_possible(
+        &self,
+        plan: &PartialPlan,
+        step: usize,
+        required: &[Fact],
+    ) -> bool {
+        let Some(mutexes) = &self.support_mutexes else {
+            return true;
+        };
+        for (i, &fact) in required.iter().enumerate() {
+            if self.task.is_derived_variable(fact.variable) {
+                continue;
+            }
+            if required[i + 1..].iter().any(|&other| {
+                !self.task.is_derived_variable(other.variable) && mutexes.mutex(fact, other)
+            }) {
+                return false;
+            }
+            if plan
+                .open_conditions()
+                .filter(|open| open.consumer == step)
+                .map(|open| open.condition)
+                .chain(
+                    plan.links()
+                        .filter(|link| link.consumer == step)
+                        .map(|link| link.condition),
+                )
+                .any(|other| {
+                    !self.task.is_derived_variable(other.variable) && mutexes.mutex(fact, other)
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Compress forced support choices into one queued refinement. The count
+    /// includes every future action template as well as reusable occurrences,
+    /// so "only one reusable step" never silently forbids a new occurrence.
+    /// Counts are recomputed after each choice: adding a step can create new
+    /// reuse alternatives for other conditions. A bounded batch and deadline
+    /// check keep a recursive unique supporter from monopolizing the search.
+    fn propagate_supporters(
+        &self,
+        mut plan: PartialPlan,
+        params: &Parameters,
+        remaining: usize,
+        stats: &mut SearchStats,
+    ) -> Option<PartialPlan> {
+        for _ in 0..remaining.min(16) {
+            if params
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
+            let forced = plan.open_conditions().find_map(|open| {
+                let count = self.open_refinement_count(&plan, open);
+                (count <= 1).then(|| (open.clone(), count))
+            });
+            let Some((open, count)) = forced else {
+                break;
+            };
+            if count == 0 {
+                return None;
+            }
+            let mut refinements = self.resolve_open(&plan, open);
+            debug_assert!(refinements.len() <= 1, "support count missed a refinement");
+            plan = refinements.pop()?;
+            stats.supporter_forced += 1;
+            #[cfg(test)]
+            assert_eq!(plan.threats(self.task), plan.rediscover_threats(self.task));
+        }
+        Some(plan)
     }
 
     fn has_reuse(&self, plan: &PartialPlan, open: &OpenCondition) -> bool {
@@ -2821,6 +2979,188 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn supporter_propagation_preserves_the_only_route_and_its_cost() {
+        let task = travel_task();
+        let params = Parameters {
+            prune: crate::pruning::PruneOptions::parse("supporters").unwrap(),
+            ..Default::default()
+        };
+        let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+        let Outcome::Solved(solution) = outcome else {
+            panic!("the two-drive route is reachable")
+        };
+        assert_eq!(solution.operators, vec![0, 1]);
+        assert_eq!(solution.plan.cost(), 2);
+        assert!(stats.supporter_forced > 0);
+    }
+
+    #[test]
+    fn supporter_propagation_keeps_fresh_occurrences_as_alternatives_to_reuse() {
+        let mut task = travel_task();
+        task.goals = vec![Fact::new(0, 1)];
+        let planner = Planner::new(&task)
+            .with_pruning(crate::pruning::PruneOptions::parse("supporters").unwrap());
+        let mut plan = PartialPlan::initial(&task);
+        plan.orderings = plan
+            .orderings
+            .refine_with_step(
+                Ordering::new(1, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                1,
+            )
+            .unwrap();
+        plan.push_step(Step { id: 1, operator: 0 });
+        plan.next_step_id = 2;
+        // Both a fresh drive occurrence and the already committed one can
+        // support the goal. Uniqueness of its action type does not force reuse.
+        assert_eq!(
+            planner.open_refinement_count(&plan, plan.open_conditions().next().unwrap()),
+            2
+        );
+        let mut stats = SearchStats::default();
+        let result = planner
+            .propagate_supporters(plan, &Parameters::default(), 16, &mut stats)
+            .unwrap();
+        assert_eq!(result.num_links(), 0);
+        assert_eq!(stats.supporter_forced, 0);
+    }
+
+    #[test]
+    fn recursive_forced_support_yields_and_obeys_a_deadline() {
+        let mut task = travel_task();
+        task.goals = vec![Fact::new(0, 1)];
+        task.operators.truncate(1);
+        task.operators[0].effects[0].pre = Some(1);
+        let planner = Planner::new(&task)
+            .with_pruning(crate::pruning::PruneOptions::parse("supporters").unwrap());
+        let mut stats = SearchStats::default();
+        let plan = planner
+            .propagate_supporters(
+                PartialPlan::initial(&task),
+                &Parameters::default(),
+                16,
+                &mut stats,
+            )
+            .unwrap();
+        assert!(plan.num_steps() > 0 && plan.num_steps() <= 16);
+        assert!(plan.num_open_conditions() > 0);
+        let expired = Parameters {
+            deadline: Some(Instant::now()),
+            ..Default::default()
+        };
+        let mut stats = SearchStats::default();
+        let result = planner
+            .propagate_supporters(PartialPlan::initial(&task), &expired, 16, &mut stats)
+            .unwrap();
+        assert_eq!(result.num_steps(), 0);
+        assert_eq!(stats.supporter_forced, 0);
+    }
+
+    #[test]
+    fn forced_refinements_consume_the_search_node_budget() {
+        let mut task = travel_task();
+        task.goals = vec![Fact::new(0, 1)];
+        task.operators.truncate(1);
+        task.operators[0].effects[0].pre = Some(1);
+        let params = Parameters {
+            search_algorithm: SearchAlgorithm::Bfs,
+            search_limits: vec![20],
+            prune: crate::pruning::PruneOptions::parse("supporters").unwrap(),
+            ..Default::default()
+        };
+        let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+        assert!(matches!(outcome, Outcome::LimitReached));
+        assert!(stats.nodes_generated <= 20);
+        assert!(stats.supporter_forced > 0);
+    }
+
+    #[test]
+    fn forced_refinements_advance_memory_limit_sampling() {
+        if crate::memory::resident_set_kb() < 1024 {
+            return;
+        }
+        let mut task = travel_task();
+        task.goals = vec![Fact::new(0, 1)];
+        task.operators.truncate(1);
+        task.operators[0].effects[0].pre = Some(1);
+        let params = Parameters {
+            search_algorithm: SearchAlgorithm::Bfs,
+            search_limits: vec![2000],
+            memory_stop_mb: Some(1),
+            prune: crate::pruning::PruneOptions::parse("supporters").unwrap(),
+            ..Default::default()
+        };
+        let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+        assert!(matches!(outcome, Outcome::LimitReached));
+        assert_eq!(stats.stopped, Some(crate::memory::StopReason::Memory));
+        assert!(stats.nodes_generated < 2000);
+    }
+
+    #[test]
+    fn cutsets_include_committed_guards_without_spanning_links() {
+        let task = conditional_task();
+        let mutexes = crate::cutset::FactMutexes::new(&task);
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 1 });
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(1, 0),
+        });
+        // Supporting the other requirement does not stop it being a pre-state
+        // commitment. Neither link spans any step in this partial plan.
+        plan.push_link(CausalLink {
+            producer: INIT_ID,
+            consumer: 1,
+            condition: Fact::new(1, 1),
+            effect: None,
+        });
+        assert!(crate::cutset::has_inconsistent_cutset(
+            &plan, &task, &mutexes
+        ));
+    }
+
+    #[test]
+    fn cutsets_check_cross_variable_commitments_but_separate_step_states() {
+        let mut task = conditional_task();
+        task.initial = vec![0, 1];
+        task.mutex_groups = vec![vec![Fact::new(0, 0), Fact::new(1, 0)]];
+        let mutexes = crate::cutset::FactMutexes::new(&task);
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 1 });
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(0, 0),
+        });
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(1, 0),
+        });
+        assert!(crate::cutset::has_inconsistent_cutset(
+            &plan, &task, &mutexes
+        ));
+        // The same requirements at different action occurrences can coexist.
+        plan.remove_open(&OpenCondition {
+            consumer: 1,
+            condition: Fact::new(1, 0),
+        });
+        plan.push_step(Step { id: 2, operator: 0 });
+        plan.push_open(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(1, 0),
+        });
+        assert!(!crate::cutset::has_inconsistent_cutset(
+            &plan, &task, &mutexes
+        ));
+        // Requiring x=0 before an action that produces x=1 is also valid.
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(1, 1),
+        });
+        assert!(!crate::cutset::has_inconsistent_cutset(
+            &plan, &task, &mutexes
+        ));
+    }
 
     fn travel_task() -> Task {
         Task {

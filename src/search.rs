@@ -933,16 +933,36 @@ fn pop_next(
 ///
 /// The rules are checked cheapest first, so an expensive one only runs on plans
 /// the cheap ones kept. Each is sound on its own terms; see `crate::pruning`.
-fn discarded_by_pruning(ctx: &SearchContext, plan: &Plan) -> bool {
+///
+/// `parent` is the plan `plan` was refined from. `cutset` reads it to extend
+/// the parent's ground facts instead of resolving the whole plan again.
+fn discarded_by_pruning(ctx: &SearchContext, parent: Option<&Plan>, plan: &Plan) -> bool {
     let options = ctx.params.prune;
     if options.params && violates_parameter_domains(ctx, plan) {
         return true;
     }
-    if options.cutset {
+    if options.cutset || options.symbolic {
         let mutexes = ctx.lifted_mutexes();
-        if crate::cutset::lifted::may_apply(plan, &mutexes)
-            && crate::cutset::lifted::has_inconsistent_cutset(ctx, plan, &mutexes)
+        let discard = (options.symbolic || crate::cutset::lifted::may_apply(plan, &mutexes))
+            && crate::cutset::lifted::has_inconsistent_cutset(ctx, plan, &mutexes, parent);
+        // The incremental rule must discard exactly what the one-pass form it
+        // replaced discarded: a verdict gained is a refinable plan thrown away,
+        // and a verdict lost is pruning quietly switched off. Under test every
+        // generated node is put to both.
+        #[cfg(test)]
         {
+            let reference = crate::cutset::lifted::may_apply(plan, &mutexes)
+                && crate::cutset::lifted::reference::has_inconsistent_cutset(plan, &mutexes);
+            if options.symbolic {
+                assert!(
+                    !reference || discard,
+                    "symbolic cutsets lost a ground conflict"
+                );
+            } else {
+                assert_eq!(discard, reference, "incremental cutset state diverged");
+            }
+        }
+        if discard {
             return true;
         }
     }
@@ -1312,7 +1332,7 @@ fn plan_impl(
                 // Opt-in literature pruning rules (`-p`). Each discards a plan
                 // it has proved unrefinable or provably non-minimal; all are
                 // off unless asked for. See `crate::pruning`.
-                if prune_options.any() && discarded_by_pruning(ctx, &new_plan) {
+                if prune_options.any() && discarded_by_pruning(ctx, Some(&plan), &new_plan) {
                     ctx.pruned.set(ctx.pruned.get() + 1);
                     continue;
                 }

@@ -116,6 +116,7 @@ pub struct GroupKey {
 /// The lifted mutex groups of a domain and problem.
 #[derive(Debug, Default)]
 pub struct LiftedMutexes {
+    pub(crate) cutset_cache: std::cell::RefCell<crate::cutset::lifted::Cache>,
     groups: Vec<MutexGroup>,
     /// `(group index, part index)` pairs per predicate, so a query only looks at
     /// groups that could cover the atom.
@@ -125,6 +126,15 @@ pub struct LiftedMutexes {
     /// its input, so settling a pair with one hash lookup rather than a walk
     /// over groups and parts is most of that scan's cost.
     co_occurring: HashSet<(Predicate, Predicate)>,
+    /// Dense ids for the [`GroupKey`]s seen so far, handed out on first sight.
+    ///
+    /// The cutset rule buckets a node's facts by sorting them on their group
+    /// instance, and a `GroupKey` is 20 bytes where an id is 4: one id per
+    /// distinct instance turns that sort into one over `u32` pairs, and lets a
+    /// plan's cached instances be stored four times smaller. Ids are exact —
+    /// equal keys share an id and distinct keys never do — so the buckets are
+    /// the same buckets, only cheaper to find and in a different order.
+    key_ids: std::cell::RefCell<crate::fasthash::FastMap<GroupKey, u32>>,
 }
 
 impl LiftedMutexes {
@@ -216,6 +226,8 @@ impl LiftedMutexes {
             groups,
             by_predicate,
             co_occurring,
+            key_ids: Default::default(),
+            cutset_cache: Default::default(),
         }
     }
 
@@ -274,6 +286,71 @@ impl LiftedMutexes {
         false
     }
 
+    /// Proves a mutex without requiring every term to be ground. The two
+    /// atoms must necessarily name the same group instance and distinct facts.
+    /// Possible unification of invariant parameters is not enough.
+    pub(crate) fn symbolic_mutex(
+        &self,
+        bindings: &crate::bindings::Bindings,
+        ctx: &crate::bindings::TypeContext,
+        left: (&Atom, usize),
+        right: (&Atom, usize),
+    ) -> bool {
+        let (a, ai) = left;
+        let (b, bi) = right;
+        if !self.may_pair(a.predicate, b.predicate) {
+            return false;
+        }
+        let matches =
+            |part: &Part, atom: &Atom, step: usize, assignment: &mut [Option<(Term, usize)>]| {
+                if part.predicate != atom.predicate || part.slots.len() != atom.terms.len() {
+                    return false;
+                }
+                for (slot, &term) in part.slots.iter().zip(&atom.terms) {
+                    match *slot {
+                        Slot::Counted => {}
+                        Slot::Const(object) => {
+                            if !bindings.terms_equal(term, step, Term::Object(object), 0) {
+                                return false;
+                            }
+                        }
+                        Slot::Param(index) => match assignment[index] {
+                            Some((other, other_step)) => {
+                                if !bindings.terms_equal(term, step, other, other_step) {
+                                    return false;
+                                }
+                            }
+                            None => assignment[index] = Some((term, step)),
+                        },
+                    }
+                }
+                true
+            };
+        for &(group_id, ap) in &self.by_predicate[&a.predicate] {
+            let group = &self.groups[group_id];
+            if group.arity > Self::MAX_KEY_ARITY {
+                continue;
+            }
+            for &(other_group, bp) in &self.by_predicate[&b.predicate] {
+                if other_group != group_id {
+                    continue;
+                }
+                let mut assignment = [None; Self::MAX_KEY_ARITY];
+                if matches(&group.parts[ap], a, ai, &mut assignment)
+                    && matches(&group.parts[bp], b, bi, &mut assignment)
+                    && (a.predicate != b.predicate
+                        || a.terms
+                            .iter()
+                            .zip(&b.terms)
+                            .any(|(&x, &y)| !bindings.terms_can_equal(ctx, x, ai, y, bi)))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Largest invariant arity a [`GroupKey`] can hold. A group wider than this
     /// yields no key, which loses a mutex and never invents one.
     pub const MAX_KEY_ARITY: usize = 4;
@@ -319,6 +396,25 @@ impl LiftedMutexes {
             if complete && !out.contains(&key) {
                 out.push(key);
             }
+        }
+    }
+
+    /// The group instances an atom belongs to, as dense ids, appended to `out`.
+    ///
+    /// Exactly [`Self::group_keys`] with each key replaced by an id unique to
+    /// it, so a caller that only ever asks whether two facts are in the same
+    /// instance can compare and sort `u32`s. `scratch` is the caller's key
+    /// buffer, reused so this allocates nothing.
+    pub fn group_key_ids(&self, atom: &Atom, scratch: &mut Vec<GroupKey>, out: &mut Vec<u32>) {
+        scratch.clear();
+        self.group_keys(atom, scratch);
+        if scratch.is_empty() {
+            return;
+        }
+        let mut ids = self.key_ids.borrow_mut();
+        for key in scratch.drain(..) {
+            let next = ids.len() as u32;
+            out.push(*ids.entry(key).or_insert(next));
         }
     }
 
@@ -712,6 +808,208 @@ mod tests {
                 .iter()
                 .any(|group| group.len() > 1 && group.predicates() == want)
         }
+    }
+
+    #[test]
+    fn symbolic_mutex_requires_entailed_keys_and_distinct_members() {
+        use crate::bindings::{Binding, Bindings};
+        use crate::params::Parameters;
+        use crate::search::SearchContext;
+        let fixture = Fixture::new(TRAVEL_DOMAIN, TRAVEL_PROBLEM);
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&fixture.domain, &fixture.problem, &params);
+        let drive = &fixture.domain.actions[0];
+        let action = &ctx
+            .literal_achievers(&Literal::Atom(fixture.atom("at", &["truck", "a"])))
+            .unwrap()[0]
+            .0;
+        ctx.register_step(1, action);
+        ctx.register_step(2, action);
+        let [v, from, to] = drive.parameters[..] else {
+            panic!("drive parameters")
+        };
+        let atom = |location| Atom {
+            predicate: fixture.predicate("at"),
+            terms: vec![Term::Variable(v), location],
+        };
+        let a = atom(fixture.object("a"));
+        let b = atom(fixture.object("b"));
+        let mutexes = fixture.mutexes();
+        let empty = Bindings::empty();
+        assert!(mutexes.symbolic_mutex(&empty, &ctx.type_ctx(), (&a, 1), (&b, 1)));
+        assert!(!mutexes.symbolic_mutex(&empty, &ctx.type_ctx(), (&a, 1), (&a, 1)));
+        // Identical variable indices in different occurrences are independent.
+        assert!(!mutexes.symbolic_mutex(&empty, &ctx.type_ctx(), (&a, 1), (&b, 2)));
+        let alias = empty
+            .add(
+                &ctx.type_ctx(),
+                &[Binding::new(v, 1, Term::Variable(v), 2, true)],
+                false,
+            )
+            .unwrap();
+        assert!(mutexes.symbolic_mutex(&alias, &ctx.type_ctx(), (&a, 1), (&b, 2)));
+        let x = atom(Term::Variable(from));
+        let y = atom(Term::Variable(to));
+        // Different variable names do not prove distinct facts.
+        assert!(!mutexes.symbolic_mutex(&empty, &ctx.type_ctx(), (&x, 1), (&y, 1)));
+        let unequal = empty
+            .add(
+                &ctx.type_ctx(),
+                &[Binding::new(from, 1, Term::Variable(to), 1, false)],
+                false,
+            )
+            .unwrap();
+        assert!(mutexes.symbolic_mutex(&unequal, &ctx.type_ctx(), (&x, 1), (&y, 1)));
+    }
+
+    #[test]
+    fn symbolic_mutex_verdicts_hold_for_every_consistent_grounding() {
+        use crate::bindings::{Binding, Bindings};
+        use crate::params::Parameters;
+        use crate::search::SearchContext;
+        let fixture = Fixture::new(
+            TRAVEL_DOMAIN,
+            "(define (problem p) (:domain travel)
+             (:objects a b c - loc truck car - vehicle)
+             (:init (at truck a) (at car a) (road a b) (road b c))
+             (:goal (at truck c)))",
+        );
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&fixture.domain, &fixture.problem, &params);
+        let action = &ctx
+            .literal_achievers(&Literal::Atom(fixture.atom("at", &["truck", "a"])))
+            .unwrap()[0]
+            .0;
+        ctx.register_step(1, action);
+        ctx.register_step(2, action);
+        let [vehicle, location, _] = fixture.domain.actions[0].parameters[..] else {
+            panic!("drive parameters")
+        };
+        let atom = Atom {
+            predicate: fixture.predicate("at"),
+            terms: vec![Term::Variable(vehicle), Term::Variable(location)],
+        };
+        let mutexes = fixture.mutexes();
+        let mut proven = 0;
+        let mut unknown = 0;
+        for key_relation in [None, Some(true), Some(false)] {
+            for value_relation in [None, Some(true), Some(false)] {
+                for pinned in 0..3 {
+                    let mut constraints = Vec::new();
+                    for (variable, relation) in
+                        [(vehicle, key_relation), (location, value_relation)]
+                    {
+                        if let Some(equal) = relation {
+                            constraints.push(Binding::new(
+                                variable,
+                                1,
+                                Term::Variable(variable),
+                                2,
+                                equal,
+                            ));
+                        }
+                    }
+                    if pinned > 0 {
+                        constraints.push(Binding::new(
+                            vehicle,
+                            1,
+                            fixture.object("truck"),
+                            0,
+                            true,
+                        ));
+                    }
+                    if pinned > 1 {
+                        constraints.push(Binding::new(location, 1, fixture.object("a"), 0, true));
+                    }
+                    let bindings = Bindings::empty()
+                        .add(&ctx.type_ctx(), &constraints, false)
+                        .unwrap();
+                    let symbolic =
+                        mutexes.symbolic_mutex(&bindings, &ctx.type_ctx(), (&atom, 1), (&atom, 2));
+                    if symbolic {
+                        proven += 1;
+                    } else {
+                        unknown += 1;
+                    }
+                    let mut feasible = 0;
+                    for first_vehicle in ["truck", "car"] {
+                        for second_vehicle in ["truck", "car"] {
+                            for first_location in ["a", "b", "c"] {
+                                for second_location in ["a", "b", "c"] {
+                                    let assignment = [
+                                        Binding::new(
+                                            vehicle,
+                                            1,
+                                            fixture.object(first_vehicle),
+                                            0,
+                                            true,
+                                        ),
+                                        Binding::new(
+                                            vehicle,
+                                            2,
+                                            fixture.object(second_vehicle),
+                                            0,
+                                            true,
+                                        ),
+                                        Binding::new(
+                                            location,
+                                            1,
+                                            fixture.object(first_location),
+                                            0,
+                                            true,
+                                        ),
+                                        Binding::new(
+                                            location,
+                                            2,
+                                            fixture.object(second_location),
+                                            0,
+                                            true,
+                                        ),
+                                    ];
+                                    if bindings.add(&ctx.type_ctx(), &assignment, false).is_none() {
+                                        continue;
+                                    }
+                                    feasible += 1;
+                                    if symbolic {
+                                        assert!(mutexes.mutex(
+                                            &fixture.atom("at", &[first_vehicle, first_location]),
+                                            &fixture.atom("at", &[second_vehicle, second_location]),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(feasible > 0, "do not validate a verdict vacuously");
+                }
+            }
+        }
+        assert!(proven > 0 && unknown > 0);
+    }
+
+    #[test]
+    fn symbolic_cutset_rejects_an_unbound_existential_contradiction() {
+        use crate::params::Parameters;
+        use crate::search::SearchContext;
+        let fixture = Fixture::new(
+            TRAVEL_DOMAIN,
+            "(define (problem p) (:domain travel) (:objects a b - loc truck - vehicle)
+             (:init (at truck a) (road a b))
+             (:goal (exists (?v - vehicle) (and (at ?v a) (at ?v b)))))",
+        );
+        let params = Parameters {
+            prune: crate::pruning::PruneOptions::parse("symbolic").unwrap(),
+            ..Default::default()
+        };
+        let ctx = SearchContext::new(&fixture.domain, &fixture.problem, &params);
+        let plan = crate::plan::Plan::make_initial_plan(&ctx).unwrap();
+        let mutexes = ctx.lifted_mutexes();
+        assert!(!crate::cutset::lifted::reference::has_inconsistent_cutset(
+            &plan, &mutexes
+        ));
+        assert!(crate::cutset::lifted::has_inconsistent_cutset(
+            &ctx, &plan, &mutexes, None
+        ));
     }
 
     const TRAVEL_DOMAIN: &str = r#"

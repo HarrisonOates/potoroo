@@ -12,6 +12,13 @@ pub struct PruneOptions {
     /// lifted mutex groups instead. See [`crate::cutset`] and
     /// [`crate::lifted_mutex`].
     pub cutset: bool,
+    /// Prove lifted cutset mutexes while some terms remain variables. Includes
+    /// the ground cutset check; opt-in separately because symbolic checks cost
+    /// more and can change the search order.
+    pub symbolic: bool,
+    /// FDR supporter feasibility checks and bounded propagation of forced
+    /// support choices, before allocating queue entries.
+    pub supporters: bool,
     /// e-deletion: extend threats from "deletes the protected fact" to "cannot
     /// hold beside it", using the same mutexes as `cutset`. See
     /// [`crate::fdr_pocl`] for the finite-domain reading and
@@ -40,6 +47,8 @@ impl PruneOptions {
     pub fn all() -> Self {
         PruneOptions {
             cutset: true,
+            symbolic: true,
+            supporters: true,
             edelete: true,
             disjunctive: true,
             params: true,
@@ -52,6 +61,8 @@ impl PruneOptions {
     /// Whether any rule is enabled — lets callers skip per-node setup entirely.
     pub fn any(self) -> bool {
         self.cutset
+            || self.symbolic
+            || self.supporters
             || self.edelete
             || self.disjunctive
             || self.params
@@ -85,6 +96,8 @@ impl PruneOptions {
                 }
                 "none" => options = PruneOptions::default(),
                 "cutset" => options.cutset = on,
+                "symbolic" => options.symbolic = on,
+                "supporters" => options.supporters = on,
                 "edelete" | "e-deletion" | "edeletion" => options.edelete = on,
                 "disjunctive" | "disjunctions" => options.disjunctive = on,
                 "params" | "parameters" | "param-domains" => options.params = on,
@@ -94,7 +107,7 @@ impl PruneOptions {
                 other => {
                     return Err(format!(
                         "unknown pruning rule `{other}` (expected cutset, edelete, \
-                         disjunctive, params, recursion, minimality, symmetry, all or none)"
+                         symbolic, supporters, disjunctive, params, recursion, minimality, symmetry, all or none)"
                     ))
                 }
             }
@@ -110,12 +123,12 @@ impl PruneOptions {
         if self.params {
             names.push("params");
         }
+        if self.symbolic {
+            names.push("symbolic");
+        }
         names
     }
 
-    /// Enabled rules that only ever fire on the finite-domain representation.
-    /// Naming them lets `-v` say so rather than let a lifted run pay for `-p
-    /// all` and quietly get nothing from three of its six rules.
     /// Rules that need ground steps: they cannot fire on the lifted
     /// representation, where a step's arguments are still variables.
     pub fn ground_only(self) -> Vec<&'static str> {
@@ -126,10 +139,14 @@ impl PruneOptions {
         names
     }
 
+    /// Rules implemented only for the finite-domain representation.
     pub fn finite_domain_only(self) -> Vec<&'static str> {
         let mut names = Vec::new();
         if self.disjunctive {
             names.push("disjunctive");
+        }
+        if self.supporters {
+            names.push("supporters");
         }
         names
     }
@@ -139,6 +156,12 @@ impl PruneOptions {
         let mut names = Vec::new();
         if self.cutset {
             names.push("cutset");
+        }
+        if self.symbolic {
+            names.push("symbolic");
+        }
+        if self.supporters {
+            names.push("supporters");
         }
         if self.edelete {
             names.push("edelete");
@@ -187,6 +210,8 @@ mod tests {
             options.names(),
             vec![
                 "cutset",
+                "symbolic",
+                "supporters",
                 "edelete",
                 "disjunctive",
                 "params",

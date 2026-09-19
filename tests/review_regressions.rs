@@ -238,8 +238,7 @@ fn tiny_tasks_agree_with_exhaustive_state_search() {
         let mut optimum = None;
         while let Some(state) = queue.pop_front() {
             if satisfies(state, &goal) {
-                optimum = Some(distances[state]);
-                break;
+                optimum.get_or_insert(distances[state]);
             }
             for op in &ops {
                 if !satisfies(state, &op.pre) {
@@ -310,7 +309,19 @@ fn tiny_tasks_agree_with_exhaustive_state_search() {
                     values: vec!["false".into(), "true".into()],
                 })
                 .collect(),
-            mutex_groups: vec![],
+            // Infer sound cross-variable mutexes from the complete reachable
+            // state set, independently of the planner's invariant machinery.
+            mutex_groups: (0..6)
+                .flat_map(|a| (a + 1..6).map(move |b| (a, b)))
+                .filter(|&(a, b)| {
+                    a / 2 != b / 2
+                        && (0..8).all(|state| {
+                            distances[state] == usize::MAX
+                                || !satisfies(state, &[(a / 2, a % 2 != 0), (b / 2, b % 2 != 0)])
+                        })
+                })
+                .map(|(a, b)| vec![Fact::new(a / 2, a % 2), Fact::new(b / 2, b % 2)])
+                .collect(),
             initial: (0..3).map(|f| (initial >> f) & 1).collect(),
             goals: goal.iter().copied().map(fact).collect(),
             operators: ops
@@ -339,72 +350,85 @@ fn tiny_tasks_agree_with_exhaustive_state_search() {
             SearchAlgorithm::LazyGbfs,
             SearchAlgorithm::LazyGbfsDual,
         ] {
-            let search_params = Parameters {
-                search_algorithm,
-                heuristic: Heuristic::parse("ADD").unwrap(),
-                search_limits: vec![200],
-                ..params()
-            };
-            let (fdr_outcome, _) =
-                potoroo::fdr_pocl::solve_with_params(&task, &search_params).unwrap();
-            match fdr_outcome {
-                potoroo::fdr_pocl::Outcome::Solved(solution) => {
-                    let minimum = optimum
-                        .unwrap_or_else(|| panic!("FDR case {case}: solved an impossible task"));
-                    if search_algorithm == SearchAlgorithm::Bfs {
-                        assert_eq!(solution.plan.num_steps(), minimum, "FDR case {case}");
-                    }
-                    let mut state = initial;
-                    for index in solution.operators {
-                        let op = &ops[index];
-                        assert!(
-                            satisfies(state, &op.pre),
-                            "FDR case {case}: inapplicable operator"
-                        );
-                        let old = state;
-                        for &(guard, fact, value) in &op.effects {
-                            if guard.is_none_or(|g| satisfies(old, &[g])) {
-                                if value {
-                                    state |= 1 << fact;
-                                } else {
-                                    state &= !(1 << fact);
+            for mask in 0..32 {
+                let prune = potoroo::pruning::PruneOptions {
+                    cutset: mask & 1 != 0,
+                    supporters: mask & 8 != 0,
+                    symbolic: mask & 16 != 0,
+                    edelete: mask & 2 != 0,
+                    disjunctive: mask & 4 != 0,
+                    ..Default::default()
+                };
+                let search_params = Parameters {
+                    prune,
+                    search_algorithm,
+                    heuristic: Heuristic::parse("ADD").unwrap(),
+                    search_limits: vec![200],
+                    ..params()
+                };
+                let (fdr_outcome, _) =
+                    potoroo::fdr_pocl::solve_with_params(&task, &search_params).unwrap();
+                match fdr_outcome {
+                    potoroo::fdr_pocl::Outcome::Solved(solution) => {
+                        let minimum = optimum.unwrap_or_else(|| {
+                            panic!("FDR case {case}: solved an impossible task")
+                        });
+                        if search_algorithm == SearchAlgorithm::Bfs {
+                            assert_eq!(solution.plan.num_steps(), minimum, "FDR case {case}");
+                        }
+                        let mut state = initial;
+                        for index in solution.operators {
+                            let op = &ops[index];
+                            assert!(
+                                satisfies(state, &op.pre),
+                                "FDR case {case}: inapplicable operator"
+                            );
+                            let old = state;
+                            for &(guard, fact, value) in &op.effects {
+                                if guard.is_none_or(|g| satisfies(old, &[g])) {
+                                    if value {
+                                        state |= 1 << fact;
+                                    } else {
+                                        state &= !(1 << fact);
+                                    }
                                 }
                             }
                         }
+                        assert!(satisfies(state, &goal), "FDR case {case}: goal not reached");
                     }
-                    assert!(satisfies(state, &goal), "FDR case {case}: goal not reached");
-                }
-                potoroo::fdr_pocl::Outcome::NoSolution => {
-                    assert!(optimum.is_none(), "FDR case {case}: false dead end")
-                }
-                potoroo::fdr_pocl::Outcome::LimitReached => {}
-            }
-            match solve(
-                &domain,
-                &problem,
-                Parameters {
-                    search_algorithm,
-                    heuristic: Heuristic::parse("ADD").unwrap(),
-                    ..params()
-                },
-            ) {
-                Outcome::Solved(plan) => {
-                    let minimum =
-                        optimum.unwrap_or_else(|| panic!("case {case}: solved an impossible task"));
-                    if search_algorithm == SearchAlgorithm::Bfs {
-                        assert_eq!(
-                            plan.num_steps(),
-                            minimum,
-                            "case {case}: BFS must minimize steps"
-                        );
+                    potoroo::fdr_pocl::Outcome::NoSolution => {
+                        assert!(optimum.is_none(), "FDR case {case}: false dead end")
                     }
-                    solved += 1;
+                    potoroo::fdr_pocl::Outcome::LimitReached => {}
                 }
-                Outcome::NoSolution => assert!(
-                    optimum.is_none(),
-                    "case {case}: rejected a solvable task ({search_algorithm:?})"
-                ),
-                Outcome::LimitReached => {}
+                match solve(
+                    &domain,
+                    &problem,
+                    Parameters {
+                        search_algorithm,
+                        prune,
+                        heuristic: Heuristic::parse("ADD").unwrap(),
+                        ..params()
+                    },
+                ) {
+                    Outcome::Solved(plan) => {
+                        let minimum = optimum
+                            .unwrap_or_else(|| panic!("case {case}: solved an impossible task"));
+                        if search_algorithm == SearchAlgorithm::Bfs {
+                            assert_eq!(
+                                plan.num_steps(),
+                                minimum,
+                                "case {case}: BFS must minimize steps"
+                            );
+                        }
+                        solved += 1;
+                    }
+                    Outcome::NoSolution => assert!(
+                        optimum.is_none(),
+                        "case {case}: rejected a solvable task ({search_algorithm:?})"
+                    ),
+                    Outcome::LimitReached => {}
+                }
             }
         }
     }

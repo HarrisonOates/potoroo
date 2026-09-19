@@ -527,14 +527,17 @@ Custom orders can be written in the flaw-selection DSL:
 ## Pruning rules
 
 VHPOP discards a partial plan only when its ordering constraints cycle or its
-binding constraints become unsatisfiable, and Potoroo inherited that. Four
-further rules from the plan-space literature are implemented and selected with
+binding constraints become unsatisfiable, and Potoroo inherited that. Further
+rules and propagation mechanisms are implemented and selected with
 `-p`, as a comma-separated list; `all` enables everything and a leading `no-`
-turns one off, so `-p all,no-minimality` is the three cheap rules.
+turns one off. All rules remain off by default; `all` is an experimental
+combination, not a recommendation that every rule helps on every task.
 
 | Rule | Source | Representation | What it discards |
 |---|---|---|---|
 | `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | every representation | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. Finite-domain search takes its mutexes from the translator; lifted and ground search synthesise **lifted mutex groups** from the schemas (see below). |
+| `symbolic` | Lifted cutset propagation | lifted and ground | Includes `cutset` and also proves mutexes before all terms are objects. Invariant keys must be equal under the bindings and facts must be provably distinct; possible unification alone never justifies pruning. Separate opt-in because these checks can be expensive. |
+| `supporters` | Supporter feasibility and forced-choice propagation | `--fdr-pocl` | Filters impossible joint effect guards and checks guards against committed step conditions. Empty supporter sets reject a branch; unique choices propagate in batches of at most 16 without queue entries. Fresh action occurrences remain alternatives to reuse. Forced refinements consume the node budget and are reported as `supporter_forced` in JSON statistics. |
 | `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | every representation | Extends threats from "deletes the protected fact" to "cannot hold beside it". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. Sound and it fires, but see the note below before enabling it. |
 | `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
@@ -543,7 +546,7 @@ turns one off, so `-p all,no-minimality` is the three cheap rules.
 | `symmetry` | Fox & Long, IJCAI-99 (object symmetry), read for plan space | ground and `--fdr-pocl` | An achiever that introduces an **interchangeable object** other than the first unused one of its class. Two objects are interchangeable when swapping them leaves the initial state, the cost functions and the goal unchanged; a plan mentions an object only through its steps' arguments, so while it mentions neither, the child introducing the second has a renamed sibling introducing the first. Solution-preserving up to renaming, for any heuristic. Lifted steps carry no arguments yet, so it is inert there. |
 
 ```bash
-# The three finite-domain rules, which are also the three cheapest
+# A finite-domain rule combination to evaluate on the intended workload
 potoroo --fdr-pocl -p cutset,edelete,disjunctive -h LMCUT domain.pddl problem.pddl
 
 # Everything, on the default lifted search
@@ -565,9 +568,13 @@ and is zero unless `disjunctive` is on.
 
 ### Runtime cost
 
-Measured at a fixed generated-node budget, so every configuration does the same
-amount of search and the difference is the rule's own price. Median of seven
-runs; `us/node` is per generated node.
+The historical measurements below predate the bounded cutset cache and the
+`symbolic` and `supporters` options. They use a fixed generated-node budget;
+pruning can still change expansions, rejected candidates, and search order, so
+the differences include those effects as well as checking cost. Values are
+medians of seven runs; `us/node` is per generated node. See the
+pruning follow-up for current paired
+measurements, corpus coverage, and the combined-pruning investigation.
 
 | Rule | `hanoi-3` | `fixit` | `logistics-a` | `gripper-6` |
 |---|---|---|---|---|
@@ -593,11 +600,12 @@ is the only kind there is. On `hanoi-3`, `minimality` rejects 3224 plans under
 `--fdr-pocl` against 15 on the lifted representation, and on `logistics-a`
 `recursion` prunes enough to pay for itself twice over.
 
-The three finite-domain rules are close to free: they share one mutex table built
-at setup and test a handful of facts per step, and where the heuristic dominates
-(`logistics-a`, at 120 us/node under `LMCUT`) they are inside the noise. `params`
-partly pays for itself by skipping the heuristic evaluation on every instance it
-rejects — 17% fewer `h` evaluations on `logistics-a`.
+The overhead of `cutset`, `edelete`, and `disjunctive` was small on these
+finite-domain LMCUT runs, where heuristic evaluation dominated. This does not
+generalize to cheaper heuristics such as ADD; the follow-up measurements show
+substantial checking costs on some tasks. `params` partly pays for itself by
+skipping the heuristic evaluation on every instance it rejects — 17% fewer `h`
+evaluations on `logistics-a` in the historical measurement.
 
 `recursion` and `minimality` are the expensive pair, because both walk the plan's
 causal-link structure on every generated node. They were 4-7x worse still before

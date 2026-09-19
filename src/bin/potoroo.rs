@@ -127,6 +127,7 @@ struct RunStats {
     h_evals: usize,
     h_eval_ms: u128,
     pruned: usize,
+    supporter_forced: usize,
     max_steps: usize,
     max_open_conditions: usize,
     max_threats: usize,
@@ -143,6 +144,7 @@ impl RunStats {
         self.h_evals += stage.h_evals;
         self.h_eval_ms += stage.h_eval_ms;
         self.pruned += stage.pruned;
+        self.supporter_forced += stage.supporter_forced;
         self.max_steps = self.max_steps.max(stage.max_steps);
         self.max_open_conditions = self.max_open_conditions.max(stage.max_open_conditions);
         self.max_threats = self.max_threats.max(stage.max_threats);
@@ -160,6 +162,7 @@ impl From<potoroo::search::SearchStats> for RunStats {
             h_evals: stats.h_evals,
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
+            supporter_forced: 0,
             max_steps: stats.max_steps,
             max_open_conditions: stats.max_open_conditions,
             max_threats: stats.max_threats,
@@ -179,6 +182,7 @@ impl From<potoroo::fdr_pocl::SearchStats> for RunStats {
             h_evals: stats.h_evals,
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
+            supporter_forced: stats.supporter_forced,
             max_steps: stats.max_steps,
             max_open_conditions: stats.max_open_conditions,
             max_threats: stats.max_threats,
@@ -363,7 +367,7 @@ fn run() -> Result<ExitCode, String> {
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
-                     \"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
+                     \"supporter_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
@@ -378,6 +382,7 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_steps,
                     stats.max_open_conditions,
                     stats.max_threats,
+                    stats.supporter_forced,
                     stats.max_disjunctions,
                     stats.max_queued,
                     stats.dropped,
@@ -1198,8 +1203,9 @@ fn print_help() {
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
          \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
          \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
-         \x20 -p, --prune=RULES          opt-in pruning: cutset, edelete, disjunctive, params,\n\
-         \x20                            recursion, minimality, symmetry, all, none (default none)\n\
+         \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, edelete,\n\
+         \x20                            disjunctive, params, recursion, minimality, symmetry, all, none\n\
+         \x20                            (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20     --stage=SPEC           restart-portfolio stage HEURISTIC[@SEARCH][=SECS];\n\
          \x20                            repeatable, run in order, @SEARCH defaults to -s and\n\

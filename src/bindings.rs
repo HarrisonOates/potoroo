@@ -676,6 +676,51 @@ impl Bindings {
         term
     }
 
+    /// Equality already entailed by the bindings, rather than equality that
+    /// could be imposed by a future refinement. Variable scope is essential:
+    /// the same schema variable in two occurrences need not denote one object.
+    pub(crate) fn terms_equal(
+        &self,
+        left: Term,
+        left_step: usize,
+        right: Term,
+        right_step: usize,
+    ) -> bool {
+        let left = self.binding(left, left_step);
+        let right = self.binding(right, right_step);
+        match (left, right) {
+            (Term::Object(a), Term::Object(b)) => a == b,
+            (Term::Variable(a), Term::Variable(b)) => {
+                (a == b && left_step == right_step)
+                    || self
+                        .find_var_node(a, left_step)
+                        .is_some_and(|(_, node)| node.head.includes_var(b, right_step))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether equating two terms is consistent. Used to prove that two
+    /// symbolic invariant members must be distinct, including explicit
+    /// inequalities and disjoint types, without assigning either variable.
+    pub(crate) fn terms_can_equal(
+        &self,
+        ctx: &TypeContext,
+        left: Term,
+        left_step: usize,
+        right: Term,
+        right_step: usize,
+    ) -> bool {
+        let left = self.binding(left, left_step);
+        let right = self.binding(right, right_step);
+        let binding = match (left, right) {
+            (Term::Object(a), Term::Object(b)) => return a == b,
+            (Term::Variable(v), term) => Binding::new(v, left_step, term, right_step, true),
+            (term, Term::Variable(v)) => Binding::new(v, right_step, term, left_step, true),
+        };
+        self.try_add(ctx, &[binding]).is_some()
+    }
+
     /// Returns the possible objects for a step variable (its type-compatible
     /// objects minus any object excluded via non-codesignation).
     pub fn domain(&self, ctx: &TypeContext, var: Variable, step_id: usize) -> BTreeSet<Object> {
