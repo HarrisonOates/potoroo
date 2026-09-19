@@ -407,10 +407,12 @@ impl PartialPlan {
     ///   (unit propagation) and drop the disjunction;
     /// * **both** impossible means the plan has no completion.
     ///
-    /// Returns `false` when the plan is inconsistent and must be discarded.
-    fn propagate_disjunctions(&mut self) -> bool {
+    /// Returns whether propagation added an ordering, or `Err(())` when the
+    /// plan is inconsistent and must be discarded.
+    fn propagate_disjunctions(&mut self) -> Result<bool, ()> {
+        let mut ordering_changed = false;
         if self.disjunctions.is_empty() {
-            return true;
+            return Ok(ordering_changed);
         }
         loop {
             let mut forced: Option<(usize, usize)> = None;
@@ -422,7 +424,7 @@ impl PartialPlan {
                     (OrderingStatus::Entailed, _) | (_, OrderingStatus::Entailed) => {
                         discharged = Some(index);
                     }
-                    (OrderingStatus::Impossible, OrderingStatus::Impossible) => return false,
+                    (OrderingStatus::Impossible, OrderingStatus::Impossible) => return Err(()),
                     (OrderingStatus::Impossible, _) => {
                         forced = Some(disjunction.demote);
                         discharged = Some(index);
@@ -436,7 +438,7 @@ impl PartialPlan {
                 break;
             }
             let Some(index) = discharged else {
-                return true;
+                return Ok(ordering_changed);
             };
             let disjunctions = Rc::make_mut(&mut self.disjunctions);
             disjunctions.remove(index);
@@ -447,9 +449,10 @@ impl PartialPlan {
                     after,
                     StepTime::AtEnd,
                 )) else {
-                    return false;
+                    return Err(());
                 };
                 self.orderings = orderings;
+                ordering_changed = true;
             }
         }
     }
@@ -470,32 +473,26 @@ impl PartialPlan {
 
     /// Drops disjunctions standing for threats that are no longer active. The
     /// constraint was only ever posted to disarm that threat, so keeping it
-    /// would over-constrain the plan.
-    fn retain_live_disjunctions(&mut self, task: &Task) {
-        if self.disjunctions.is_empty() {
+    /// would over-constrain the plan. Called only after retaining active threats,
+    /// whose sorted cache already supplies the liveness test.
+    fn retain_live_disjunctions(&mut self) {
+        let live = |disjunction: &OrderingDisjunction| {
+            self.threats
+                .binary_search_by_key(&disjunction.threat, threat_key)
+                .is_ok()
+        };
+        let Some(first_dead) = self.disjunctions.iter().position(|d| !live(d)) else {
             return;
-        }
-        let live: Vec<OrderingDisjunction> = self
-            .disjunctions
-            .iter()
-            .filter(|disjunction| {
-                self.threats
-                    .iter()
-                    .any(|threat| threat_key(threat) == disjunction.threat)
-                    && self.threat_active(
-                        task,
-                        &Threat {
-                            link: disjunction.threat.0,
-                            step: disjunction.threat.1,
-                            effect: disjunction.threat.2,
-                        },
-                    )
-            })
-            .cloned()
-            .collect();
-        if live.len() != self.disjunctions.len() {
-            self.disjunctions = Rc::new(live);
-        }
+        };
+        let mut retained = Vec::with_capacity(self.disjunctions.len() - 1);
+        retained.extend_from_slice(&self.disjunctions[..first_dead]);
+        retained.extend(
+            self.disjunctions[first_dead + 1..]
+                .iter()
+                .filter(|d| live(d))
+                .cloned(),
+        );
+        self.disjunctions = Rc::new(retained);
     }
 
     fn can_be_inside(&self, step_id: usize, link: &CausalLink) -> bool {
@@ -553,30 +550,35 @@ impl PartialPlan {
         if self.disjunctions.is_empty() {
             return true;
         }
-        self.retain_live_disjunctions(task);
-        if !self.propagate_disjunctions() {
+        self.retain_live_disjunctions();
+        let Ok(ordering_changed) = self.propagate_disjunctions() else {
             return false;
+        };
+        // Guards and steps do not change during propagation. Only a new
+        // ordering can invalidate the threats we just checked.
+        if ordering_changed {
+            self.retain_active_threats(task);
+            self.retain_live_disjunctions();
         }
-        // Propagation can add orderings, which can in turn retire threats.
-        self.retain_active_threats(task);
-        self.retain_live_disjunctions(task);
         true
     }
 
     fn retain_active_threats(&mut self, task: &Task) {
-        if self
+        let Some(first_dead) = self
             .threats
             .iter()
-            .all(|threat| self.threat_active(task, threat))
-        {
+            .position(|threat| !self.threat_active(task, threat))
+        else {
             return;
-        }
-        let active = self
-            .threats
-            .iter()
-            .filter(|threat| self.threat_active(task, threat))
-            .cloned()
-            .collect();
+        };
+        let mut active = Vec::with_capacity(self.threats.len() - 1);
+        active.extend_from_slice(&self.threats[..first_dead]);
+        active.extend(
+            self.threats[first_dead + 1..]
+                .iter()
+                .filter(|threat| self.threat_active(task, threat))
+                .copied(),
+        );
         self.threats = Rc::new(active);
     }
 
@@ -3827,6 +3829,216 @@ mod tests {
         let (outcome, stats) = solve_with_params(&task, &params).unwrap();
         assert!(matches!(outcome, Outcome::Solved(_)));
         assert!(stats.nodes_generated > 1);
+    }
+
+    #[test]
+    fn settling_retires_constraints_after_guard_and_ordering_changes() {
+        let mut task = shared_effect_task();
+        for name in ["guard-a", "guard-b"] {
+            task.variables.push(Variable {
+                name: name.into(),
+                values: vec!["off".into(), "on".into()],
+            });
+            task.initial.push(0);
+        }
+        task.operators.push(Operator {
+            name: "conditional-breaker".into(),
+            cost: 1,
+            prevail: vec![],
+            effects: vec![
+                Effect {
+                    conditions: vec![Fact::new(2, 0)],
+                    variable: 0,
+                    pre: None,
+                    post: 0,
+                },
+                Effect {
+                    conditions: vec![Fact::new(3, 0)],
+                    variable: 0,
+                    pre: None,
+                    post: 0,
+                },
+                Effect {
+                    conditions: vec![Fact::new(3, 0)],
+                    variable: 1,
+                    pre: None,
+                    post: 0,
+                },
+            ],
+        });
+        task.operators.push(Operator {
+            name: "consume".into(),
+            cost: 1,
+            prevail: task.goals.clone(),
+            effects: vec![],
+        });
+        let mut orderings = Rc::new(BinaryOrderings::new());
+        for step in 1..=3 {
+            orderings = orderings
+                .refine_with_step(
+                    Ordering::new(step, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                    step,
+                )
+                .unwrap();
+        }
+        orderings = orderings
+            .refine(Ordering::new(1, StepTime::AtEnd, 3, StepTime::AtStart))
+            .unwrap();
+        let mut plan = PartialPlan::assemble(
+            (1..=3)
+                .map(|id| Step {
+                    id,
+                    operator: id - 1,
+                })
+                .collect(),
+            (0..2)
+                .map(|variable| CausalLink {
+                    producer: 1,
+                    consumer: 3,
+                    condition: Fact::new(variable, 1),
+                    effect: Some(variable),
+                })
+                .collect(),
+            vec![],
+            orderings,
+            vec![],
+            3,
+            4,
+        );
+        plan.add_step_threats(&task, 2);
+        assert_eq!(
+            plan.threats.len(),
+            3,
+            "distinct conditional threats must survive"
+        );
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+        let planner = Planner::new(&task)
+            .with_pruning(crate::pruning::PruneOptions::parse("disjunctive").unwrap());
+        let mut child = planner.post_disjunction(&plan, &plan.threats[0]).unwrap();
+        assert_eq!(child.pending_disjunctions(), 1);
+        assert_eq!(
+            child
+                .threats
+                .iter()
+                .filter(|t| child.threat_covered(t))
+                .count(),
+            1
+        );
+        // Forcing promotion must trigger a new threat sweep: all three
+        // assignments are now outside both protected intervals.
+        let mut forced = child.clone();
+        forced.orderings = forced
+            .orderings
+            .refine(Ordering::new(1, StepTime::AtEnd, 2, StepTime::AtStart))
+            .unwrap();
+        assert!(forced.settle(&task));
+        assert!(is_ordered_before(&forced.orderings, 3, 2));
+        assert!(forced.threats.is_empty());
+        assert_eq!(forced.pending_disjunctions(), 0);
+        assert_eq!(forced.threats(&task), forced.rediscover_threats(&task));
+
+        // A different protected interval is not covered by this constraint.
+        let mut different_interval = child.clone();
+        different_interval.push_link(CausalLink {
+            producer: 1,
+            consumer: GOAL_ID,
+            condition: Fact::new(0, 1),
+            effect: Some(0),
+        });
+        assert!(!different_interval.threat_covered(&Threat {
+            step: 2,
+            effect: 0,
+            link: 2
+        }));
+
+        // A later commitment disables only the source effect. Keeping the
+        // constraint would silently remove the other effects' valid
+        // confrontation alternatives; dropping the other threats would miss
+        // their still-live assignments.
+        child.push_open(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(2, 1),
+        });
+        assert!(child.settle(&task));
+        assert_eq!(child.pending_disjunctions(), 0);
+        assert_eq!(child.threats.len(), 2);
+        assert!(child.threats.iter().all(|t| !child.threat_covered(t)));
+        assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        let alternatives = planner.resolve_threat(&child, &child.threats[0]);
+        assert_eq!(
+            alternatives.len(),
+            2,
+            "confrontation and a ordering remain possible"
+        );
+        assert!(
+            alternatives[0].threats.is_empty(),
+            "disabling guard-b resolves both remaining effects"
+        );
+        assert_eq!(alternatives[1].pending_disjunctions(), 1);
+        let splits = planner.split_disjunction(&alternatives[1], 0);
+        assert_eq!(splits.len(), 2);
+        for resolved in splits {
+            assert!(resolved.threats.is_empty());
+            assert_eq!(resolved.pending_disjunctions(), 0);
+            assert!(
+                is_ordered_before(&resolved.orderings, 2, 1)
+                    || is_ordered_before(&resolved.orderings, 3, 2)
+            );
+        }
+    }
+
+    #[test]
+    fn two_conditional_threats_keep_both_confrontations_under_combined_pruning() {
+        let mut task = breaker_task();
+        task.variables.push(Variable {
+            name: "second-mode".into(),
+            values: vec!["unsafe".into(), "safe".into()],
+        });
+        task.initial.push(0);
+        task.operators[1].effects.push(Effect {
+            conditions: vec![Fact::new(4, 0)],
+            variable: 0,
+            pre: None,
+            post: 0,
+        });
+        task.operators.push(Operator {
+            name: "make-second-safe".into(),
+            cost: 1,
+            prevail: vec![],
+            effects: vec![Effect {
+                conditions: vec![],
+                variable: 4,
+                pre: Some(0),
+                post: 1,
+            }],
+        });
+        for order in ["STATIC", "ZLIFO"] {
+            for mask in 0..32 {
+                let params = Parameters {
+                    search_algorithm: SearchAlgorithm::Bfs,
+                    flaw_orders: vec![FlawSelectionOrder::parse(order).unwrap()],
+                    search_limits: vec![2_000],
+                    prune: crate::pruning::PruneOptions {
+                        cutset: mask & 1 != 0,
+                        edelete: mask & 2 != 0,
+                        disjunctive: mask & 4 != 0,
+                        supporters: mask & 8 != 0,
+                        h2: mask & 16 != 0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let (outcome, _) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("lost a necessary confrontation: {order}, mask {mask}");
+                };
+                assert_eq!(solution.plan.cost(), 4, "{order}, mask {mask}");
+                let run = solution.operators.iter().position(|&op| op == 1).unwrap();
+                for preparation in [0, 2, 3] {
+                    assert!(solution.operators[..run].contains(&preparation));
+                }
+            }
+        }
     }
 
     #[test]

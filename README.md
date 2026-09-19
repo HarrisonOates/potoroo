@@ -590,6 +590,10 @@ bounded evaluation and
 axiom projection follow-up for validation,
 measurements and limitations. Defaults remain unchanged.
 
+The threat-maintenance follow-up
+evaluates redundant threat processing and reduces repeated cache maintenance
+while preserving search order.
+
 ### Runtime cost
 
 The historical measurements below predate the bounded cutset cache and the

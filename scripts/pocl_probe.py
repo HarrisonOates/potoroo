@@ -28,7 +28,7 @@ import time
 METRICS = [
     "solved", "plan_len", "plan_cost", "nodes_generated", "nodes_visited",
     "pruned", "supporter_forced", "h_evals", "h_eval_ms", "wall_ms",
-    "peak_rss_kb", "max_queued", "h2_status", "h2_runs", "h2_completed",
+    "peak_rss_kb", "max_queued", "max_threats", "max_disjunctions", "h2_status", "h2_runs", "h2_completed",
     "h2_work", "h2_ms", "h2_max_mutex_pairs", "h2_max_new_mutex_pairs", "h2_max_unreachable_facts",
     "h2_supporters_removed", "h2_max_projected_variables",
 ]
