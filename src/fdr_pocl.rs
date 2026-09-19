@@ -137,6 +137,9 @@ pub struct PartialPlan {
     open_conditions: Option<Rc<Chain<OpenCondition>>>,
     num_open_conditions: usize,
     pub orderings: Rc<BinaryOrderings>,
+    /// Potential conflicts under the concrete orderings and effect guards.
+    /// A posted disjunction leaves its source here until an ordering or guard
+    /// commitment resolves it; `threat_covered` excludes that source from selection.
     threats: Rc<Vec<Threat>>,
     /// Conditional effects `(step, effect)` that a confrontation refinement has
     /// committed never to fire. Sorted, so membership is a binary search.
@@ -228,6 +231,7 @@ impl PartialPlan {
     }
 
     pub fn complete(&self, _task: &Task) -> bool {
+        // Covered threats still witness unresolved ordering disjunctions.
         self.num_open_conditions == 0 && self.threats.is_empty()
     }
 
@@ -3829,6 +3833,87 @@ mod tests {
         let (outcome, stats) = solve_with_params(&task, &params).unwrap();
         assert!(matches!(outcome, Outcome::Solved(_)));
         assert!(stats.nodes_generated > 1);
+    }
+
+    #[test]
+    fn ordering_repairs_retire_every_reason_for_the_same_threat() {
+        let mut task = travel_task();
+        // A protects location=lyon until B. T both requires paris and assigns
+        // nice, giving two different reasons for the same ordering obligation.
+        task.operators[1].name = "drive truck paris nice".into();
+        task.operators[1].effects[0].pre = Some(0);
+        task.operators.push(Operator {
+            name: "consume-at-lyon".into(),
+            prevail: vec![Fact::new(0, 1)],
+            effects: vec![],
+            cost: 1,
+        });
+        let mut orderings = Rc::new(BinaryOrderings::new());
+        for step in 1..=3 {
+            orderings = orderings
+                .refine_with_step(
+                    Ordering::new(step, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                    step,
+                )
+                .unwrap();
+        }
+        orderings = orderings
+            .refine(Ordering::new(1, StepTime::AtEnd, 3, StepTime::AtStart))
+            .unwrap();
+        let mut plan = PartialPlan::assemble(
+            (1..=3)
+                .map(|id| Step {
+                    id,
+                    operator: id - 1,
+                })
+                .collect(),
+            vec![CausalLink {
+                producer: 1,
+                consumer: 3,
+                condition: Fact::new(0, 1),
+                effect: Some(0),
+            }],
+            vec![],
+            orderings,
+            vec![],
+            3,
+            4,
+        );
+        plan.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(&task)));
+        plan.add_step_threats(&task, 2);
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+        assert_eq!(plan.threats.len(), 2);
+        assert_eq!(plan.threats[0].effect, 0);
+        assert_eq!(plan.threats[1].effect, NO_EFFECT);
+
+        let immediate = Planner::new(&task);
+        let deferred = Planner::new(&task)
+            .with_pruning(crate::pruning::PruneOptions::parse("disjunctive").unwrap());
+        for threat in plan.threats.iter() {
+            let posted = deferred.post_disjunction(&plan, threat).unwrap();
+            assert!(!posted.complete(&task));
+            assert_eq!(posted.pending_disjunctions(), 1);
+            assert!(posted.threat_covered(threat));
+            assert_eq!(posted.threats(&task), posted.rediscover_threats(&task));
+
+            // Promotion and demotion, either immediate or deferred, retire
+            // BOTH reasons regardless of which reason was selected.
+            for children in [
+                immediate.resolve_threat(&plan, threat),
+                deferred.split_disjunction(&posted, 0),
+            ] {
+                assert_eq!(children.len(), 2);
+                for child in children {
+                    assert!(child.threats.is_empty());
+                    assert_eq!(child.pending_disjunctions(), 0);
+                    assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+                    assert!(
+                        is_ordered_before(&child.orderings, 2, 1)
+                            || is_ordered_before(&child.orderings, 3, 2)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
