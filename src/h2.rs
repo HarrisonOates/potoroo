@@ -5,8 +5,9 @@
 //! effect guards are relaxed to pairwise compatibility. This over-approximates
 //! real reachability: only pairs still absent at a fixed point are mutexes.
 //! Conditional assignments can produce facts but only unconditional assignments
-//! rule out persistence. Axioms are skipped because their reset/closure semantics
-//! need a different transition model. No incomplete fixed point is published.
+//! rule out persistence. Axiom tasks are projected onto ordinary facts: derived
+//! requirements are dropped, and no pair involving a derived fact is disproved.
+//! No incomplete fixed point is published.
 //! Declared mutex groups constrain the relaxation itself, allowing their
 //! consequences to propagate through operators as well as pruning search.
 
@@ -21,6 +22,7 @@ pub enum Status {
     Complete,
     FactLimit,
     WorkLimit,
+    /// Legacy status retained for callers; axiom tasks now use projection.
     Axioms,
     InvalidTask,
     Deadline,
@@ -60,6 +62,8 @@ pub struct Stats {
     pub mutex_pairs: usize,
     /// Proven cross-variable pairs not already in a declared mutex group.
     pub new_mutex_pairs: usize,
+    /// Derived variables ignored by the conservative base-fact projection.
+    pub projected_variables: usize,
     pub unreachable_facts: usize,
     pub supporters_removed: usize,
 }
@@ -184,9 +188,6 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
     stats: &mut Stats,
 ) -> Result<Reachability, Status> {
     budget.charge(0)?;
-    if !task.axioms.is_empty() {
-        return Err(Status::Axioms);
-    }
     let mut offsets = vec![0usize];
     let mut facts = Vec::new();
     for (variable, v) in task.variables.iter().enumerate() {
@@ -215,6 +216,18 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
     if task.initial.len() != task.variables.len() {
         return Err(Status::InvalidTask);
     }
+    let mut derived = vec![false; task.variables.len()];
+    for axiom in &task.axioms {
+        budget.charge(2)?;
+        index(Fact::new(axiom.variable, axiom.pre))?;
+        index(Fact::new(axiom.variable, axiom.post))?;
+        for &condition in &axiom.conditions {
+            budget.charge(1)?;
+            index(condition)?;
+        }
+        derived[axiom.variable] = true;
+    }
+    stats.projected_variables = derived.iter().filter(|&&d| d).count();
     let size = facts.len();
     let cells = size.checked_mul(size).ok_or(Status::FactLimit)?;
     budget.charge(2 * cells.div_ceil(64))?;
@@ -222,6 +235,17 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
         size,
         bits: vec![0; cells.div_ceil(64)],
     };
+    // Keep the existing global fact indices without adding a branch to every
+    // search-time lookup. Any pair touching a derived variable is unknown:
+    // closure can reset or establish its value independently of base effects.
+    for (a, fact) in facts.iter().enumerate() {
+        if derived[fact.variable] {
+            for b in 0..size {
+                budget.charge(1)?;
+                table.insert(a, b);
+            }
+        }
+    }
     // This scratch table is discarded before search. Charging every group
     // member/pair keeps dense or repeated groups inside the same work cap.
     let mut forbidden = Reachability {
@@ -236,7 +260,7 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
             for &right in &group[i + 1..] {
                 budget.charge(1)?;
                 let b = index(right)?;
-                if a != b {
+                if a != b && !derived[left.variable] && !derived[right.variable] {
                     forbidden.insert(a, b);
                 }
             }
@@ -244,9 +268,15 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
     }
     for (v, &value) in task.initial.iter().enumerate() {
         let a = index(Fact::new(v, value))?;
+        if derived[v] {
+            continue;
+        }
         for (w, &other) in task.initial[..=v].iter().enumerate() {
             budget.charge(1)?;
             let b = index(Fact::new(w, other))?;
+            if derived[w] {
+                continue;
+            }
             if forbidden.reachable(a, b) {
                 // A claimed mutex contradicted by the initial state cannot be
                 // used to derive additional proofs.
@@ -261,16 +291,24 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
         let mut pre = Vec::new();
         for &fact in &op.prevail {
             budget.charge(1)?;
-            pre.push(index(fact)?);
+            let p = index(fact)?;
+            if !derived[fact.variable] {
+                pre.push(p);
+            }
         }
         let mut unconditional = Vec::new();
         for effect in &op.effects {
             budget.charge(2)?;
             index(effect.assignment())?;
             if let Some(value) = effect.pre {
-                pre.push(index(Fact::new(effect.variable, value))?);
+                let p = index(Fact::new(effect.variable, value))?;
+                if !derived[effect.variable] {
+                    pre.push(p);
+                }
             }
-            if effect.conditions.is_empty() {
+            // Test the ORIGINAL guard. Dropping a derived guard must never
+            // turn a conditional write into a guaranteed overwrite.
+            if effect.conditions.is_empty() && !derived[effect.variable] {
                 unconditional.push(effect.assignment());
             }
         }
@@ -282,14 +320,19 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
             let mut required = pre.clone();
             for &guard in &effect.conditions {
                 budget.charge(1)?;
-                required.push(index(guard)?);
+                let p = index(guard)?;
+                if !derived[guard.variable] {
+                    required.push(p);
+                }
             }
             required.sort_unstable();
             required.dedup();
-            rules.push(Rule {
-                required,
-                post: index(effect.assignment())?,
-            });
+            if !derived[effect.variable] {
+                rules.push(Rule {
+                    required,
+                    post: index(effect.assignment())?,
+                });
+            }
         }
         operators.push(Operator {
             rules,
@@ -507,7 +550,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn incomplete_tables_and_axiom_tasks_publish_no_mutexes() {
+    fn incomplete_tables_publish_no_mutexes() {
         let mut task = resource_task();
         let (_, complete) = compute(&task, Limits::default(), |_| None);
         for work in [0, 1, 10, complete.work / 2, complete.work - 1] {
@@ -544,15 +587,221 @@ pub(crate) mod tests {
             assert_eq!(stats.status.stopped(), Some(reason));
             assert!(stats.work >= 1024);
         }
-        task.axioms.push(crate::fdr::Axiom {
-            conditions: vec![],
-            variable: 1,
-            pre: 0,
-            post: 1,
-        });
+    }
+
+    pub(crate) fn axiom_resource_task() -> Task {
+        let mut task = resource_task();
+        for variable in 3..5 {
+            task.variables.push(Variable {
+                name: format!("derived-{variable}"),
+                values: vec!["true".into(), "false".into()],
+            });
+            // The raw initial value is deliberately stale: closure makes both
+            // variables true, then consuming the resource resets them to false.
+            task.initial.push(1);
+            task.axioms.push(crate::fdr::Axiom {
+                conditions: vec![if variable == 3 {
+                    Fact::new(0, 1)
+                } else {
+                    Fact::new(3, 0)
+                }],
+                variable,
+                pre: 1,
+                post: 0,
+            });
+        }
+        for op in &mut task.operators {
+            op.prevail.push(Fact::new(4, 0));
+        }
+        task
+    }
+
+    #[test]
+    fn axiom_projection_proves_base_conflicts_and_never_derived_conflicts() {
+        let task = axiom_resource_task();
         let (table, stats) = compute(&task, Limits::default(), |_| None);
-        assert!(table.is_none());
-        assert_eq!(stats.status, Status::Axioms);
+        assert_eq!(stats.status, Status::Complete);
+        assert_eq!(stats.projected_variables, 2);
+        let table = table.unwrap();
+        assert!(!table.reachable(3, 5));
+        for derived in 6..10 {
+            for other in 0..10 {
+                assert!(table.reachable(derived, other));
+                assert!(table.reachable(other, derived));
+            }
+        }
+        let (_, base_stats) = compute(&resource_task(), Limits::default(), |_| None);
+        assert_eq!(stats.mutex_pairs, base_stats.mutex_pairs);
+        assert_eq!(stats.unreachable_facts, base_stats.unreachable_facts);
+        // A resource stop or work cap must still discard ALL proofs, even
+        // after completing the projection and most of the fixed point.
+        for work in [0, 25, stats.work / 2, stats.work - 1] {
+            let (table, partial) = compute(
+                &task,
+                Limits {
+                    work,
+                    ..Limits::default()
+                },
+                |_| None,
+            );
+            assert!(table.is_none());
+            assert_eq!(partial.status, Status::WorkLimit);
+            assert_eq!(
+                (
+                    partial.mutex_pairs,
+                    partial.new_mutex_pairs,
+                    partial.unreachable_facts
+                ),
+                (0, 0, 0)
+            );
+        }
+        for reason in [StopReason::Deadline, StopReason::Memory] {
+            let (table, stopped) = compute(&task, Limits::default(), |_| Some(reason));
+            assert!(table.is_none());
+            assert_eq!(stopped.status.stopped(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn dropping_a_derived_guard_does_not_make_an_overwrite_unconditional() {
+        let mut task = resource_task();
+        task.initial = vec![0, 1, 1];
+        task.axioms.push(crate::fdr::Axiom {
+            conditions: vec![Fact::new(0, 1)],
+            variable: 2,
+            pre: 1,
+            post: 0,
+        });
+        task.operators.truncate(1);
+        task.operators[0].effects = vec![
+            Effect {
+                conditions: vec![],
+                variable: 0,
+                pre: None,
+                post: 1,
+            },
+            Effect {
+                conditions: vec![Fact::new(2, 0)],
+                variable: 1,
+                pre: None,
+                post: 0,
+            },
+        ];
+        // The derived guard is false in the source state. The real successor
+        // is [1, 1, 0], so v1=1 MUST persist alongside the new v0=1.
+        let (table, stats) = compute(&task, Limits::default(), |_| None);
+        assert_eq!(stats.status, Status::Complete);
+        assert!(table.unwrap().reachable(1, 3));
+    }
+
+    #[test]
+    fn projected_pairs_survive_an_independent_axiom_reset_and_closure_oracle() {
+        let mut rng = 419u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng as usize
+        };
+        for case in 0..128 {
+            let mut task = axiom_resource_task();
+            let definition: Vec<_> = (0..4).map(|_| next() % 2).collect();
+            task.axioms[0].conditions =
+                vec![Fact::new(0, definition[0]), Fact::new(1, definition[1])];
+            task.axioms[1].conditions =
+                vec![Fact::new(3, definition[2]), Fact::new(2, definition[3])];
+            // Independent Boolean evaluation, deliberately not close_axioms:
+            // both derived values are recomputed after EVERY base transition.
+            let close = |state: &mut Vec<usize>| {
+                state[3] = usize::from(!(state[0] == definition[0] && state[1] == definition[1]));
+                state[4] = usize::from(!(state[3] == definition[2] && state[2] == definition[3]));
+            };
+            task.initial = (0..5).map(|_| next() % 2).collect();
+            task.operators.clear();
+            for op in 0..6 {
+                let mut effects = vec![];
+                for variable in 0..3 {
+                    if next() % 2 == 0 {
+                        effects.push(Effect {
+                            conditions: (0..next() % 3)
+                                .map(|_| Fact::new(next() % 5, next() % 2))
+                                .collect(),
+                            variable,
+                            pre: (next() % 3 == 0).then(|| next() % 2),
+                            post: next() % 2,
+                        });
+                    }
+                }
+                task.operators.push(Operator {
+                    name: format!("a{op}"),
+                    cost: 1,
+                    effects,
+                    prevail: (0..next() % 3)
+                        .map(|_| Fact::new(next() % 5, next() % 2))
+                        .collect(),
+                });
+            }
+            let mut initial = task.initial.clone();
+            close(&mut initial);
+            let mut reached = std::collections::HashSet::from([initial.clone()]);
+            let mut queue = std::collections::VecDeque::from([initial]);
+            while let Some(state) = queue.pop_front() {
+                for op in &task.operators {
+                    if !op.prevail.iter().all(|p| state[p.variable] == p.value)
+                        || !op
+                            .effects
+                            .iter()
+                            .all(|e| e.pre.is_none_or(|p| state[e.variable] == p))
+                    {
+                        continue;
+                    }
+                    let mut successor = state.clone();
+                    for e in &op.effects {
+                        if e.conditions.iter().all(|p| state[p.variable] == p.value) {
+                            successor[e.variable] = e.post;
+                        }
+                    }
+                    close(&mut successor);
+                    if reached.insert(successor.clone()) {
+                        queue.push_back(successor);
+                    }
+                }
+            }
+            for declared in [false, true] {
+                if declared {
+                    // Include both base and derived facts in declared groups.
+                    // Raw initial derived values may contradict valid groups;
+                    // only their base-base pairs may constrain the projection.
+                    task.mutex_groups = (0..10)
+                        .flat_map(|a| (a + 1..10).map(move |b| (a, b)))
+                        .filter(|&(a, b)| {
+                            a / 2 != b / 2
+                                && reached
+                                    .iter()
+                                    .all(|s| s[a / 2] != a % 2 || s[b / 2] != b % 2)
+                        })
+                        .map(|(a, b)| vec![Fact::new(a / 2, a % 2), Fact::new(b / 2, b % 2)])
+                        .collect();
+                }
+                let (table, stats) = compute(&task, Limits::default(), |_| None);
+                assert_eq!(
+                    stats.status,
+                    Status::Complete,
+                    "case {case}, declared {declared}"
+                );
+                let table = table.unwrap();
+                for state in &reached {
+                    for a in 0..5 {
+                        for b in 0..5 {
+                            assert!(
+                                table.reachable(a * 2 + state[a], b * 2 + state[b]),
+                                "false mutex, case {case}, declared {declared}: {state:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

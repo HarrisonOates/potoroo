@@ -160,6 +160,10 @@ impl RunStats {
         self.h2.elapsed_ms += stage.h2.elapsed_ms;
         self.h2.mutex_pairs = self.h2.mutex_pairs.max(stage.h2.mutex_pairs);
         self.h2.new_mutex_pairs = self.h2.new_mutex_pairs.max(stage.h2.new_mutex_pairs);
+        self.h2.projected_variables = self
+            .h2
+            .projected_variables
+            .max(stage.h2.projected_variables);
         self.h2.unreachable_facts = self.h2.unreachable_facts.max(stage.h2.unreachable_facts);
         self.h2.supporters_removed += stage.h2.supporters_removed;
         self.max_steps = self.max_steps.max(stage.max_steps);
@@ -392,7 +396,7 @@ fn run() -> Result<ExitCode, String> {
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
                      \"supporter_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\
                      \"h2_status\":\"{}\",\"h2_runs\":{},\"h2_completed\":{},\"h2_work\":{},\"h2_ms\":{},\
-                     \"h2_max_mutex_pairs\":{},\"h2_max_new_mutex_pairs\":{},\"h2_max_unreachable_facts\":{},\"h2_supporters_removed\":{},\
+                     \"h2_max_mutex_pairs\":{},\"h2_max_new_mutex_pairs\":{},\"h2_max_projected_variables\":{},\"h2_max_unreachable_facts\":{},\"h2_supporters_removed\":{},\
                      \"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
@@ -419,6 +423,7 @@ fn run() -> Result<ExitCode, String> {
                     stats.h2.elapsed_ms,
                     stats.h2.mutex_pairs,
                     stats.h2.new_mutex_pairs,
+                    stats.h2.projected_variables,
                     stats.h2.unreachable_facts,
                     stats.h2.supporters_removed,
                     outcome_label(status),
@@ -827,11 +832,11 @@ fn print_search_summary(status: &str, wall_ms: u128, stats: &RunStats) {
     );
     if stats.h2_runs > 0 {
         eprintln!(
-            "Pair reachability: {} | completed {}/{} stages | {} ms | {} work | at most {} mutex pairs ({} beyond declared groups), {} unreachable facts per stage | {} supporter templates removed across stages",
+            "Pair reachability: {} | completed {}/{} stages | {} ms | {} work | at most {} mutex pairs ({} beyond declared groups), {} unreachable facts, {} projected derived variables per stage | {} supporter templates removed across stages",
             stats.h2.status.as_str(), stats.h2_completed, stats.h2_runs,
             stats.h2.elapsed_ms, stats.h2.work, stats.h2.mutex_pairs,
             stats.h2.new_mutex_pairs,
-            stats.h2.unreachable_facts, stats.h2.supporters_removed,
+            stats.h2.unreachable_facts, stats.h2.projected_variables, stats.h2.supporters_removed,
         );
     }
 }
@@ -1286,6 +1291,7 @@ mod tests {
             elapsed_ms: 2,
             mutex_pairs: 7,
             new_mutex_pairs: 2,
+            projected_variables: 4,
             unreachable_facts: 3,
             supporters_removed: 4,
         }));
@@ -1295,6 +1301,7 @@ mod tests {
             elapsed_ms: 3,
             mutex_pairs: 7,
             new_mutex_pairs: 2,
+            projected_variables: 1,
             unreachable_facts: 3,
             supporters_removed: 4,
         }));
@@ -1310,6 +1317,7 @@ mod tests {
         assert_eq!((total.h2.work, total.h2.elapsed_ms), (250, 6));
         assert_eq!((total.h2.mutex_pairs, total.h2.unreachable_facts), (7, 3));
         assert_eq!(total.h2.new_mutex_pairs, 2);
+        assert_eq!(total.h2.projected_variables, 4);
         assert_eq!(total.h2.supporters_removed, 8);
         let parsed = cli(&["--fdr-pocl", "-p", "all,no-h2"]);
         assert!(!parsed.params.prune.h2);

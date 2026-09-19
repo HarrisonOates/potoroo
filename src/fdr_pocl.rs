@@ -3156,6 +3156,51 @@ mod tests {
     }
 
     #[test]
+    fn h2_axiom_projection_preserves_derived_goals_with_all_pruning_combinations() {
+        let mut task = crate::h2::tests::axiom_resource_task();
+        for mask in 0..16 {
+            let params = Parameters {
+                search_algorithm: SearchAlgorithm::Bfs,
+                search_limits: vec![200],
+                prune: crate::pruning::PruneOptions {
+                    h2: true,
+                    cutset: mask & 1 != 0,
+                    edelete: mask & 2 != 0,
+                    disjunctive: mask & 4 != 0,
+                    supporters: mask & 8 != 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            task.goals = vec![Fact::new(1, 1), Fact::new(2, 1)];
+            let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+            assert!(matches!(outcome, Outcome::NoSolution), "mask {mask}");
+            assert_eq!(stats.nodes_generated, 0);
+            assert_eq!(stats.h2.status, crate::h2::Status::Complete);
+            assert_eq!(stats.h2.projected_variables, 2);
+
+            // Positive derived goal, already true after initial closure.
+            task.goals = vec![Fact::new(4, 0)];
+            let (outcome, _) = solve_with_params(&task, &params).unwrap();
+            let Outcome::Solved(solution) = outcome else {
+                panic!("initial derived goal lost, mask {mask}");
+            };
+            assert_eq!(solution.plan.cost(), 0);
+            for variable in 1..3 {
+                // The action needs the positive derived condition; afterward
+                // both levels of the axiom chain must reset to their defaults.
+                task.goals = vec![Fact::new(variable, 1), Fact::new(4, 1)];
+                let (outcome, _) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("derived reset goal lost, mask {mask}, variable {variable}");
+                };
+                assert_eq!(solution.operators, vec![variable - 1]);
+                assert_eq!(solution.plan.cost(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn h2_keeps_unreachable_fact_proofs_even_without_new_pairs() {
         let mut task = crate::h2::tests::resource_task();
         task.variables.truncate(1);

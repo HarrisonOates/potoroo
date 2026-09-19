@@ -30,7 +30,7 @@ METRICS = [
     "pruned", "supporter_forced", "h_evals", "h_eval_ms", "wall_ms",
     "peak_rss_kb", "max_queued", "h2_status", "h2_runs", "h2_completed",
     "h2_work", "h2_ms", "h2_max_mutex_pairs", "h2_max_new_mutex_pairs", "h2_max_unreachable_facts",
-    "h2_supporters_removed",
+    "h2_supporters_removed", "h2_max_projected_variables",
 ]
 FIELDS = [
     "run", "label", "revision", "binary_sha256", "family", "problem",

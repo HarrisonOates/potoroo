@@ -574,15 +574,20 @@ and is zero unless `disjunctive` is on.
 `h2` is bounded to 2,048 facts (a retained pair table of at most 512 KiB, plus
 up to 512 KiB of temporary storage for declared mutexes) and 5,000,000
 charged work units per search stage. Exceeding either cap discards the partial
-table and falls back to existing mutexes. Tasks with axioms also fall back;
-conditional effects are supported conservatively. A stage deadline or memory
-stop ends the stage without publishing partial proofs. JSON statistics report
+table and falls back to existing mutexes. Tasks with axioms are projected onto
+ordinary facts: derived requirements are ignored, and no new conflict involving
+a derived fact is inferred. The fact cap includes derived values. Conditional
+effects remain conditional even when their derived guards are ignored. A stage
+deadline or memory stop ends the stage without publishing partial proofs. JSON statistics report
 `h2_status`, runs/completions, work, time, proof counts and removed supporter
 templates. Across portfolio stages, work/time/removals add up and proof counts
 take the maximum. Declared mutexes constrain reachability during preprocessing;
-`h2_max_new_mutex_pairs` counts proved pairs beyond those groups. See the
+`h2_max_new_mutex_pairs` counts proved pairs beyond those groups, and
+`h2_max_projected_variables` reports the maximum number of ignored derived
+variables in a stage. See the
 pair-pruning implementation report and
-bounded evaluation for validation,
+bounded evaluation and
+axiom projection follow-up for validation,
 measurements and limitations. Defaults remain unchanged.
 
 ### Runtime cost
