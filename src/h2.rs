@@ -7,6 +7,8 @@
 //! Conditional assignments can produce facts but only unconditional assignments
 //! rule out persistence. Axioms are skipped because their reset/closure semantics
 //! need a different transition model. No incomplete fixed point is published.
+//! Declared mutex groups constrain the relaxation itself, allowing their
+//! consequences to propagate through operators as well as pruning search.
 
 use crate::fdr::{Fact, Task};
 use crate::memory::StopReason;
@@ -56,6 +58,8 @@ pub struct Stats {
     pub elapsed_ms: u128,
     /// Proven cross-variable pairs, including any already declared by the task.
     pub mutex_pairs: usize,
+    /// Proven cross-variable pairs not already in a declared mutex group.
+    pub new_mutex_pairs: usize,
     pub unreachable_facts: usize,
     pub supporters_removed: usize,
 }
@@ -163,6 +167,7 @@ pub(crate) fn compute(
         Err(status) => {
             stats.status = status;
             stats.mutex_pairs = 0;
+            stats.new_mutex_pairs = 0;
             stats.unreachable_facts = 0;
             None
         }
@@ -212,16 +217,42 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
     }
     let size = facts.len();
     let cells = size.checked_mul(size).ok_or(Status::FactLimit)?;
-    budget.charge(cells.div_ceil(64))?;
+    budget.charge(2 * cells.div_ceil(64))?;
     let mut table = Reachability {
         size,
         bits: vec![0; cells.div_ceil(64)],
     };
+    // This scratch table is discarded before search. Charging every group
+    // member/pair keeps dense or repeated groups inside the same work cap.
+    let mut forbidden = Reachability {
+        size,
+        bits: vec![0; cells.div_ceil(64)],
+    };
+    for group in &task.mutex_groups {
+        budget.charge(1)?;
+        for (i, &left) in group.iter().enumerate() {
+            budget.charge(1)?;
+            let a = index(left)?;
+            for &right in &group[i + 1..] {
+                budget.charge(1)?;
+                let b = index(right)?;
+                if a != b {
+                    forbidden.insert(a, b);
+                }
+            }
+        }
+    }
     for (v, &value) in task.initial.iter().enumerate() {
         let a = index(Fact::new(v, value))?;
         for (w, &other) in task.initial[..=v].iter().enumerate() {
             budget.charge(1)?;
-            table.insert(a, index(Fact::new(w, other))?);
+            let b = index(Fact::new(w, other))?;
+            if forbidden.reachable(a, b) {
+                // A claimed mutex contradicted by the initial state cannot be
+                // used to derive additional proofs.
+                return Err(Status::InvalidTask);
+            }
+            table.insert(a, b);
         }
     }
     let mut operators = Vec::new();
@@ -282,7 +313,10 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
                     if facts[a.post].variable == facts[b.post].variable {
                         continue;
                     }
-                    if table.reachable(a.post, b.post) || !budget.possible(&table, &b.required)? {
+                    if table.reachable(a.post, b.post)
+                        || forbidden.reachable(a.post, b.post)
+                        || !budget.possible(&table, &b.required)?
+                    {
                         continue;
                     }
                     let mut compatible = true;
@@ -303,6 +337,7 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
                     budget.charge(1)?;
                     if facts[a.post].variable == fact.variable
                         || table.reachable(a.post, c)
+                        || forbidden.reachable(a.post, c)
                         || !table.reachable(c, c)
                     {
                         continue;
@@ -344,6 +379,7 @@ fn compute_inner<F: FnMut(usize) -> Option<StopReason>>(
             budget.charge(1)?;
             if fact.variable != other.variable && !table.reachable(a, b) {
                 stats.mutex_pairs += 1;
+                stats.new_mutex_pairs += usize::from(!forbidden.reachable(a, b));
             }
         }
     }
@@ -411,6 +447,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn declared_mutexes_propagate_through_relaxed_conditional_effects() {
+        let mut task = resource_task();
+        task.variables.push(Variable {
+            name: "done".into(),
+            values: vec!["off".into(), "on".into()],
+        });
+        task.initial.push(0);
+        task.goals = vec![Fact::new(3, 1)];
+        // v0 is always on: each choice resets the other value. Conditional
+        // persistence alone over-approximates this and permits both choices.
+        task.operators = (1..3)
+            .map(|variable| Operator {
+                name: format!("choose-{variable}"),
+                cost: 1,
+                prevail: vec![],
+                effects: vec![
+                    Effect {
+                        conditions: vec![],
+                        variable,
+                        pre: None,
+                        post: 1,
+                    },
+                    Effect {
+                        conditions: vec![Fact::new(0, 1)],
+                        variable: 3 - variable,
+                        pre: None,
+                        post: 0,
+                    },
+                ],
+            })
+            .collect();
+        task.operators.push(Operator {
+            name: "requires-both".into(),
+            cost: 1,
+            prevail: vec![Fact::new(1, 1), Fact::new(2, 1)],
+            effects: vec![Effect {
+                conditions: vec![],
+                variable: 3,
+                pre: None,
+                post: 1,
+            }],
+        });
+        let (plain, _) = compute(&task, Limits::default(), |_| None);
+        assert!(plain.unwrap().reachable(7, 7));
+        task.mutex_groups = vec![vec![Fact::new(1, 1), Fact::new(2, 1)]];
+        let (constrained, stats) = compute(&task, Limits::default(), |_| None);
+        assert_eq!(stats.status, Status::Complete);
+        assert!(!constrained.unwrap().reachable(7, 7));
+        assert!(stats.new_mutex_pairs > 0);
+        assert_eq!(stats.mutex_pairs, stats.new_mutex_pairs + 1);
+
+        task.mutex_groups
+            .push(vec![Fact::new(1, 0), Fact::new(2, 0)]);
+        let (invalid, stats) = compute(&task, Limits::default(), |_| None);
+        assert!(invalid.is_none());
+        assert_eq!(stats.status, Status::InvalidTask);
+        assert_eq!((stats.mutex_pairs, stats.new_mutex_pairs), (0, 0));
+    }
+
+    #[test]
     fn incomplete_tables_and_axiom_tasks_publish_no_mutexes() {
         let mut task = resource_task();
         let (_, complete) = compute(&task, Limits::default(), |_| None);
@@ -420,6 +516,7 @@ pub(crate) mod tests {
             assert_eq!(stats.status, Status::WorkLimit);
             assert!(stats.work <= work);
             assert_eq!((stats.mutex_pairs, stats.unreachable_facts), (0, 0));
+            assert_eq!(stats.new_mutex_pairs, 0);
         }
         let (table, stats) = compute(
             &task,
@@ -530,6 +627,32 @@ pub(crate) mod tests {
                     }
                     if reached.insert(successor.clone()) {
                         queue.push_back(successor);
+                    }
+                }
+            }
+            // Supply a subset of independently proved mutexes. Constraining
+            // the relaxation must still preserve every exactly reachable pair.
+            task.mutex_groups = (0..6)
+                .flat_map(|a| (a + 1..6).map(move |b| (a, b)))
+                .filter(|&(a, b)| {
+                    a / 2 != b / 2
+                        && (a + b) % 2 == 0
+                        && reached
+                            .iter()
+                            .all(|state| state[a / 2] != a % 2 || state[b / 2] != b % 2)
+                })
+                .map(|(a, b)| vec![Fact::new(a / 2, a % 2), Fact::new(b / 2, b % 2)])
+                .collect();
+            let (constrained, stats) = compute(&task, Limits::default(), |_| None);
+            assert_eq!(stats.status, Status::Complete);
+            let constrained = constrained.unwrap();
+            for state in &reached {
+                for a in 0..3 {
+                    for b in 0..3 {
+                        assert!(
+                            constrained.reachable(a * 2 + state[a], b * 2 + state[b]),
+                            "false mutex after seeding declared groups, case {case}: {state:?}"
+                        );
                     }
                 }
             }

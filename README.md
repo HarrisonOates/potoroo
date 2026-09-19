@@ -571,16 +571,19 @@ and in `POTOROO_STATS_JSON` counts the plans they discard. `max_disjunctions` in
 the finite-domain JSON reports the peak number of deferred threat resolutions,
 and is zero unless `disjunctive` is on.
 
-`h2` is bounded to 2,048 facts (a pair table of at most 512 KiB) and 5,000,000
+`h2` is bounded to 2,048 facts (a retained pair table of at most 512 KiB, plus
+up to 512 KiB of temporary storage for declared mutexes) and 5,000,000
 charged work units per search stage. Exceeding either cap discards the partial
 table and falls back to existing mutexes. Tasks with axioms also fall back;
 conditional effects are supported conservatively. A stage deadline or memory
 stop ends the stage without publishing partial proofs. JSON statistics report
 `h2_status`, runs/completions, work, time, proof counts and removed supporter
 templates. Across portfolio stages, work/time/removals add up and proof counts
-take the maximum. See the pair-pruning implementation report
-for validation and limitations. Broader ZLIFO and IPC-budget comparisons remain
-deferred; no default has changed.
+take the maximum. Declared mutexes constrain reachability during preprocessing;
+`h2_max_new_mutex_pairs` counts proved pairs beyond those groups. See the
+pair-pruning implementation report and
+bounded evaluation for validation,
+measurements and limitations. Defaults remain unchanged.
 
 ### Runtime cost
 

@@ -1085,7 +1085,10 @@ impl<'a> Planner<'a> {
                 if stats.status.stopped().is_some() {
                     return self;
                 }
-                table
+                // A completed table that only rediscovers declared pairs adds
+                // no pruning power. Keep its statistics, but avoid retaining
+                // and querying a redundant matrix throughout the search.
+                table.filter(|_| stats.new_mutex_pairs > 0 || stats.unreachable_facts > 0)
             } else {
                 None
             };
@@ -3150,6 +3153,28 @@ mod tests {
                 assert_eq!(stats.h2.supporters_removed, 1);
             }
         }
+    }
+
+    #[test]
+    fn h2_keeps_unreachable_fact_proofs_even_without_new_pairs() {
+        let mut task = crate::h2::tests::resource_task();
+        task.variables.truncate(1);
+        task.initial = vec![0];
+        task.goals = vec![Fact::new(0, 1)];
+        task.operators.clear();
+        let params = Parameters {
+            prune: crate::pruning::PruneOptions::parse("h2").unwrap(),
+            ..Default::default()
+        };
+        let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+        assert!(matches!(outcome, Outcome::NoSolution));
+        assert_eq!(
+            stats.nodes_generated, 0,
+            "unreachable goal rejected before search"
+        );
+        assert_eq!(stats.h2.status, crate::h2::Status::Complete);
+        assert_eq!(stats.h2.new_mutex_pairs, 0);
+        assert_eq!(stats.h2.unreachable_facts, 1);
     }
 
     #[test]
