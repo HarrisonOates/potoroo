@@ -16,7 +16,8 @@ use crate::plan::GOAL_ID;
 /// Mutually exclusive fact pairs of a finite-domain task.
 ///
 /// Same-variable pairs are implicit (a SAS⁺ variable holds one value), so only
-/// the translator's declared `mutex_group`s need indexing.
+/// the translator's declared `mutex_group`s need indexing. An optional completed
+/// h² table adds proven unreachable facts and pairs.
 #[derive(Debug, Default)]
 pub struct FactMutexes {
     /// Group ids per fact, flattened: the groups containing fact `f` are
@@ -33,6 +34,7 @@ pub struct FactMutexes {
     /// beyond an operator's fixed preconditions. Keep the STRIPS fast path free
     /// of the extra commitment scan.
     additional_requirements: bool,
+    h2: Option<crate::h2::Reachability>,
 }
 
 impl FactMutexes {
@@ -76,6 +78,7 @@ impl FactMutexes {
             groups,
             var_base,
             cross_variable,
+            h2: None,
             additional_requirements: !task.axioms.is_empty()
                 || task.operators.iter().any(|operator| {
                     operator
@@ -84,6 +87,11 @@ impl FactMutexes {
                         .any(|effect| !effect.conditions.is_empty())
                 }),
         }
+    }
+
+    pub(crate) fn with_h2(mut self, table: Option<crate::h2::Reachability>) -> Self {
+        self.h2 = table;
+        self
     }
 
     /// Whether two distinct facts can never hold in the same state.
@@ -95,7 +103,7 @@ impl FactMutexes {
             // One SAS⁺ variable, two values.
             return true;
         }
-        if !self.cross_variable {
+        if !self.cross_variable && self.h2.is_none() {
             return false;
         }
         let (Some(a), Some(b)) = (
@@ -104,15 +112,23 @@ impl FactMutexes {
         ) else {
             return false;
         };
+        if self.h2.as_ref().is_some_and(|table| !table.reachable(a, b)) {
+            return true;
+        }
         let a_groups = &self.groups[self.offsets[a] as usize..self.offsets[a + 1] as usize];
         let b_groups = &self.groups[self.offsets[b] as usize..self.offsets[b + 1] as usize];
         a_groups.iter().any(|g| b_groups.contains(g))
     }
 
-    /// Whether a set of facts contains a mutex pair. `facts` is a cutset, which
-    /// stays small, so the quadratic scan is cheaper than building a set.
+    /// Whether a set contains an unreachable fact or a mutex pair. `facts` is a
+    /// cutset, which stays small, so the quadratic scan avoids building a set.
     pub fn inconsistent(&self, facts: &[Fact]) -> bool {
         for (i, &left) in facts.iter().enumerate() {
+            if self.h2.as_ref().is_some_and(|table| {
+                index_of(&self.var_base, left).is_some_and(|a| !table.reachable(a, a))
+            }) {
+                return true;
+            }
             for &right in &facts[i + 1..] {
                 if self.mutex(left, right) {
                     return true;

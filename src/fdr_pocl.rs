@@ -727,6 +727,7 @@ pub struct SearchStats {
     pub pruned: usize,
     /// Forced support refinements performed without allocating a queue entry.
     pub supporter_forced: usize,
+    pub h2: crate::h2::Stats,
     pub max_steps: usize,
     pub max_open_conditions: usize,
     pub max_threats: usize,
@@ -801,10 +802,11 @@ pub fn solve_with_context(
     symmetries: Option<&crate::symmetry::ObjectSymmetries>,
     progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> Result<(Outcome, SearchStats), Error> {
-    let planner = Planner::with_action_cost(task, params.action_cost)
-        .with_pruning(params.prune)
-        .with_symmetries(params.prune.symmetry.then_some(symmetries).flatten());
+    let planner = Planner::with_action_cost(task, params.action_cost);
     planner.validate_params(params)?;
+    let planner = planner
+        .with_pruning_params(params)
+        .with_symmetries(params.prune.symmetry.then_some(symmetries).flatten());
     let (outcome, mut stats) = planner.solve(params, progress);
     stats.pruned += planner.symmetry_skipped.get();
     Ok((outcome, stats))
@@ -846,7 +848,9 @@ pub fn validate_all(task: &Task, stages: &[Parameters]) -> Result<(), Error> {
     let Some(first) = stages.first() else {
         return Ok(());
     };
-    let planner = Planner::with_action_cost(task, first.action_cost).with_pruning(first.prune);
+    // Preflight checks configurations only. Do not spend a preprocessing
+    // budget here; the stage that searches owns its time and memory limits.
+    let planner = Planner::with_action_cost(task, first.action_cost);
     for params in stages {
         planner.validate_params(params)?;
     }
@@ -873,6 +877,8 @@ struct Planner<'a> {
     edelete: Option<Rc<crate::cutset::FactMutexes>>,
     /// Feasibility checks for the optional supporter propagation rule.
     support_mutexes: Option<Rc<crate::cutset::FactMutexes>>,
+    cutset_mutexes: Option<Rc<crate::cutset::FactMutexes>>,
+    h2: crate::h2::Stats,
     /// Whether threats are resolved by posting a disjunction instead of by
     /// splitting the plan.
     disjunctive: bool,
@@ -974,6 +980,8 @@ impl<'a> Planner<'a> {
             action_cost,
             edelete: None,
             support_mutexes: None,
+            cutset_mutexes: None,
+            h2: crate::h2::Stats::default(),
             disjunctive: false,
             fact_graph: None,
             minimality: false,
@@ -1054,31 +1062,61 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
-    /// Installs the mutex table e-deletion needs. Kept separate from
-    /// construction so the cost is paid only when `-p edelete` asks for it.
-    fn with_pruning(mut self, prune: crate::pruning::PruneOptions) -> Self {
-        if prune.edelete {
-            self.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(self.task)));
-        }
-        if prune.supporters {
-            let mutexes = self
-                .edelete
-                .clone()
-                .unwrap_or_else(|| Rc::new(crate::cutset::FactMutexes::new(self.task)));
-            // Preconditions and the selected effect's guards must hold in one
-            // state. Remove globally impossible supporter templates once.
-            for achievers in self.achievers.values_mut() {
-                achievers.retain(|achiever| {
-                    let required: Vec<_> = self.effect_requirements[achiever.operator]
-                        [achiever.effect]
-                        .iter()
-                        .copied()
-                        .filter(|fact| !self.task.is_derived_variable(fact.variable))
-                        .collect();
-                    !mutexes.inconsistent(&required)
-                });
+    #[cfg(test)]
+    fn with_pruning(self, prune: crate::pruning::PruneOptions) -> Self {
+        self.with_pruning_params(&Parameters {
+            prune,
+            ..Parameters::default()
+        })
+    }
+
+    /// Build one shared table for cutsets, e-deletion and supporter checks.
+    /// h² is optional and discards unfinished preprocessing results.
+    fn with_pruning_params(mut self, params: &Parameters) -> Self {
+        let prune = params.prune;
+        if prune.cutset || prune.edelete || prune.supporters || prune.h2 {
+            let table = if prune.h2 {
+                let mut stop = crate::memory::SearchStop::new(params);
+                let (table, stats) =
+                    crate::h2::compute(self.task, crate::h2::Limits::default(), |work| {
+                        stop.as_mut().and_then(|s| s.expired(work))
+                    });
+                self.h2 = stats;
+                if stats.status.stopped().is_some() {
+                    return self;
+                }
+                table
+            } else {
+                None
+            };
+            let mutexes = Rc::new(crate::cutset::FactMutexes::new(self.task).with_h2(table));
+            if prune.cutset || prune.h2 {
+                self.cutset_mutexes = Some(mutexes.clone());
             }
-            self.support_mutexes = Some(mutexes);
+            if prune.edelete {
+                self.edelete = Some(mutexes.clone());
+            }
+            if prune.supporters || prune.h2 {
+                // All applicability conditions and the selected effect's guards
+                // must coexist. Removing these templates preserves operator ids
+                // and still permits any number of fresh action occurrences.
+                for achievers in self.achievers.values_mut() {
+                    let before = achievers.len();
+                    achievers.retain(|achiever| {
+                        let required: Vec<_> = self.effect_requirements[achiever.operator]
+                            [achiever.effect]
+                            .iter()
+                            .copied()
+                            .filter(|fact| !self.task.is_derived_variable(fact.variable))
+                            .collect();
+                        !mutexes.inconsistent(&required)
+                    });
+                    if prune.h2 {
+                        self.h2.supporters_removed += before - achievers.len();
+                    }
+                }
+                self.support_mutexes = Some(mutexes);
+            }
         }
         self.disjunctive = prune.disjunctive;
         if prune.recursion {
@@ -1133,18 +1171,20 @@ impl<'a> Planner<'a> {
         let is_dual = alg == SearchAlgorithm::LazyGbfsDual;
         let is_alt = alg == SearchAlgorithm::Alt;
 
-        // Cutset mutex pruning (`-p cutset`): Fast Downward's SAS+ variables and
-        // declared mutex groups supply the mutexes this rule needs, so the
-        // finite-domain representation gets it for free. See `crate::cutset`.
-        let cutset_mutexes = params
-            .prune
-            .cutset
-            .then(|| crate::cutset::FactMutexes::new(self.task));
+        let mut stats = SearchStats {
+            h2: self.h2,
+            ..SearchStats::default()
+        };
+        if let Some(reason) = self.h2.status.stopped() {
+            stats.stopped = Some(reason);
+            return (Outcome::LimitReached, stats);
+        }
+        let cutset_mutexes = self.cutset_mutexes.as_deref();
         if let Some(mutexes) = &cutset_mutexes {
             // The goal step's pre-cutset is the task goals, and no link can span
             // the goal, so it is plan-independent: check it once.
             if crate::cutset::goals_inconsistent(self.task, mutexes) {
-                return (Outcome::NoSolution, SearchStats::default());
+                return (Outcome::NoSolution, stats);
             }
         }
 
@@ -1159,7 +1199,6 @@ impl<'a> Planner<'a> {
             Vec::new()
         };
         let mut generated_per_order = vec![0usize; n_orders];
-        let mut stats = SearchStats::default();
         let mut bound = crate::memory::OpenListBound::new(params);
         let mut stop = crate::memory::SearchStop::new(params);
         // Which budget ended the search, if one did. A stop is a restart, not
@@ -3061,6 +3100,73 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn h2_strengthens_combined_pruning_and_preserves_reachable_goals() {
+        let mut task = crate::h2::tests::resource_task();
+        // A syntactic achiever of the resource whose prerequisites are jointly
+        // impossible. Neither ordinary reachability nor declared mutexes see it.
+        task.operators.push(Operator {
+            name: "impossible-reset".into(),
+            cost: 1,
+            prevail: task.goals.clone(),
+            effects: vec![Effect {
+                conditions: vec![],
+                variable: 0,
+                pre: Some(0),
+                post: 1,
+            }],
+        });
+        for mask in 0..16 {
+            let params = Parameters {
+                search_algorithm: SearchAlgorithm::Bfs,
+                search_limits: vec![200],
+                prune: crate::pruning::PruneOptions {
+                    h2: true,
+                    cutset: mask & 1 != 0,
+                    edelete: mask & 2 != 0,
+                    disjunctive: mask & 4 != 0,
+                    supporters: mask & 8 != 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            task.goals = vec![Fact::new(1, 1), Fact::new(2, 1)];
+            let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+            assert!(matches!(outcome, Outcome::NoSolution), "mask {mask}");
+            assert_eq!(stats.nodes_generated, 0, "mutex goals rejected at root");
+            assert_eq!(stats.h2.status, crate::h2::Status::Complete);
+            assert!(stats.h2.mutex_pairs > 0);
+            assert_eq!(stats.h2.supporters_removed, 1);
+
+            for variable in 1..3 {
+                task.goals = vec![Fact::new(variable, 1)];
+                let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("reachable goal lost, mask {mask}, variable {variable}")
+                };
+                assert_eq!(solution.operators, vec![variable - 1]);
+                assert_eq!(solution.plan.cost(), 1);
+                assert_eq!(stats.h2.supporters_removed, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn h2_deadline_is_a_search_stop_not_a_proof_of_no_solution() {
+        let task = crate::h2::tests::resource_task();
+        let params = Parameters {
+            deadline: Some(Instant::now()),
+            prune: crate::pruning::PruneOptions::parse("h2").unwrap(),
+            ..Default::default()
+        };
+        let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+        assert!(matches!(outcome, Outcome::LimitReached));
+        assert_eq!(stats.stopped, Some(crate::memory::StopReason::Deadline));
+        assert_eq!(stats.h2.status, crate::h2::Status::Deadline);
+        assert_eq!(stats.h2.mutex_pairs, 0);
+        assert_eq!(stats.nodes_generated, 0);
+    }
 
     #[test]
     fn supporter_propagation_preserves_the_only_route_and_its_cost() {

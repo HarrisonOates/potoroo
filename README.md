@@ -543,6 +543,7 @@ combination, not a recommendation that every rule helps on every task.
 | `cutset` | Nguyen & Kambhampati, IJCAI-01, Prop. 1 | every representation | A plan whose pre- or post-cutset — a step's own conditions plus every link condition the orderings force to span it — contains a mutex pair. No linearisation of such a plan is executable. Finite-domain search takes its mutexes from the translator; lifted and ground search synthesise **lifted mutex groups** from the schemas (see below). |
 | `symbolic` | Lifted cutset propagation | lifted and ground | Includes `cutset` and also proves mutexes before all terms are objects. Invariant keys must be equal under the bindings and facts must be provably distinct; possible unification alone never justifies pruning. Separate opt-in because these checks can be expensive. |
 | `supporters` | Supporter feasibility and forced-choice propagation | `--fdr-pocl` | Filters impossible joint effect guards and checks guards against committed step conditions. Empty supporter sets reject a branch; unique choices propagate in batches of at most 16 without queue entries. Fresh action occurrences remain alternatives to reuse. Forced refinements consume the node budget and are reported as `supporter_forced` in JSON statistics. |
+| `h2` | Bounded pair reachability | `--fdr-pocl` | Proves additional unreachable facts and mutex pairs, then uses them in cutsets and supporter filtering. Includes those checks; forced propagation still requires `supporters`. With `edelete`, the same proofs also strengthen threats. Only a completed fixed point supplies proofs. |
 | `edelete` | Nguyen & Kambhampati, IJCAI-01, Def. 3 | every representation | Extends threats from "deletes the protected fact" to "cannot hold beside it". A step needing `location(truck) = lyon` threatens a link protecting `location(truck) = paris` even though it assigns nothing. Sound and it fires, but see the note below before enabling it. |
 | `disjunctive` | Nguyen & Kambhampati, IJCAI-01, §4.1 | `--fdr-pocl` | Not a pruning rule but a branching one: a threat is resolved by posting `(consumer ≺ step) ∨ (step ≺ producer)` on a single child and propagating, rather than splitting the plan in two. Remaining disjunctions are split only once nothing else is refinable. |
 | `params` | Gerevini & Schubert, JAIR 5 (1996), §§4–5 | lifted and ground | Two things. An action instance binding a parameter to a constant that cannot reach it, computed by propagating the initial conditions through the operator graph — this is the half that fires. And a *spurious threat*, whose unifier would have to put a parameter outside its domain or identify two parameters with disjoint domains; implemented, but no domain in `examples/` has parameter domains uneven enough to trigger it. |
@@ -562,14 +563,24 @@ potoroo -p all,no-recursion,no-minimality domain.pddl problem.pddl
 ```
 
 `-v` reports the active rules, and says which of them cannot fire for the chosen
-representation: `edelete` and `disjunctive` need finite-domain facts,
-and `params` has nothing to say about an already-ground SAS+ task. So `-p all`
-is `-p cutset,params,recursion,minimality` in lifted and ground mode, and
-`-p cutset,edelete,disjunctive,recursion,minimality` under `--fdr-pocl`.
+representation: `supporters`, `h2` and `disjunctive` require `--fdr-pocl`;
+`symbolic` and `params` apply to literal search. `edelete` works in every
+representation. `symmetry` applies to ground literal and finite-domain search.
 The `pruned` counter in the telemetry line
 and in `POTOROO_STATS_JSON` counts the plans they discard. `max_disjunctions` in
 the finite-domain JSON reports the peak number of deferred threat resolutions,
 and is zero unless `disjunctive` is on.
+
+`h2` is bounded to 2,048 facts (a pair table of at most 512 KiB) and 5,000,000
+charged work units per search stage. Exceeding either cap discards the partial
+table and falls back to existing mutexes. Tasks with axioms also fall back;
+conditional effects are supported conservatively. A stage deadline or memory
+stop ends the stage without publishing partial proofs. JSON statistics report
+`h2_status`, runs/completions, work, time, proof counts and removed supporter
+templates. Across portfolio stages, work/time/removals add up and proof counts
+take the maximum. See the pair-pruning implementation report
+for validation and limitations. Broader ZLIFO and IPC-budget comparisons remain
+deferred; no default has changed.
 
 ### Runtime cost
 

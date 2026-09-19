@@ -1061,9 +1061,8 @@ impl FlawSelectionOrder {
             let local = oc.step_id == local_id;
             let mut is_static: i32 = -1;
             let mut is_unsafe: i32 = -1;
-            let mut refinements: i32 = -1;
-            let mut addable: i32 = -1;
-            let mut reusable: i32 = -1;
+            let mut counts = None;
+
             let mut c = first_criterion;
             while c <= last_criterion {
                 let crit = &self.selection_criteria[c as usize];
@@ -1094,14 +1093,9 @@ impl FlawSelectionOrder {
                     || (crit.unsafe_open_cond && is_unsafe > 0);
                 if applies {
                     let within = crit.max_refinements == i32::MAX
-                        || plan.open_cond_refinements(
-                            ctx,
-                            &mut refinements,
-                            &mut addable,
-                            &mut reusable,
-                            oc,
-                            crit.max_refinements,
-                        );
+                        || counts
+                            .get_or_insert_with(|| crate::plan::OpenConditionCounts::new(plan, oc))
+                            .within(ctx, crit.max_refinements);
                     if within {
                         match crit.order {
                             OrderType::Lifo => {
@@ -1128,39 +1122,30 @@ impl FlawSelectionOrder {
                             }
                             OrderType::Lr => {
                                 let better = c < selection.criterion || {
-                                    plan.open_cond_refinements(
-                                        ctx,
-                                        &mut refinements,
-                                        &mut addable,
-                                        &mut reusable,
-                                        oc,
-                                        (selection.rank + 0.5) as i32 - 1,
-                                    )
+                                    counts
+                                        .get_or_insert_with(|| {
+                                            crate::plan::OpenConditionCounts::new(plan, oc)
+                                        })
+                                        .within(ctx, (selection.rank + 0.5) as i32 - 1)
                                 };
                                 if better {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
-                                    plan.open_cond_refinements(
-                                        ctx,
-                                        &mut refinements,
-                                        &mut addable,
-                                        &mut reusable,
-                                        oc,
-                                        i32::MAX,
-                                    );
+                                    let refinements = counts
+                                        .get_or_insert_with(|| {
+                                            crate::plan::OpenConditionCounts::new(plan, oc)
+                                        })
+                                        .exact(ctx);
                                     selection.rank = refinements as f32;
                                     last_criterion = if refinements == 0 { c - 1 } else { c };
                                 }
                             }
                             OrderType::Mr => {
-                                plan.open_cond_refinements(
-                                    ctx,
-                                    &mut refinements,
-                                    &mut addable,
-                                    &mut reusable,
-                                    oc,
-                                    i32::MAX,
-                                );
+                                let refinements = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .exact(ctx);
                                 if c < selection.criterion || refinements as f32 > selection.rank {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
@@ -1169,16 +1154,11 @@ impl FlawSelectionOrder {
                                 }
                             }
                             OrderType::New => {
-                                let has_new = if addable < 0 {
-                                    match oc.literal() {
-                                        Some(literal) => {
-                                            !plan.addable_steps(ctx, &mut addable, &literal, oc, 0)
-                                        }
-                                        None => false,
-                                    }
-                                } else {
-                                    addable > 0
-                                };
+                                let has_new = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .has_new(ctx);
                                 if has_new || c < selection.criterion {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
@@ -1186,20 +1166,11 @@ impl FlawSelectionOrder {
                                 }
                             }
                             OrderType::Reuse => {
-                                let has_reuse = if reusable < 0 {
-                                    match oc.literal() {
-                                        Some(literal) => !plan.reusable_steps(
-                                            ctx,
-                                            &mut reusable,
-                                            &literal,
-                                            oc,
-                                            0,
-                                        ),
-                                        None => false,
-                                    }
-                                } else {
-                                    reusable > 0
-                                };
+                                let has_reuse = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .has_reuse(ctx);
                                 if has_reuse || c < selection.criterion {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;

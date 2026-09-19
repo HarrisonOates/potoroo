@@ -28,6 +28,7 @@ pub mod fdr_pruning;
 pub mod flaws;
 pub mod formula;
 pub mod functions;
+pub mod h2;
 pub mod heuristics;
 pub(crate) mod instantiate;
 pub mod landmarks;

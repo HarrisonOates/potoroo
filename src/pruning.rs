@@ -19,6 +19,9 @@ pub struct PruneOptions {
     /// FDR supporter feasibility checks and bounded propagation of forced
     /// support choices, before allocating queue entries.
     pub supporters: bool,
+    /// Bounded h² preprocessing for FDR. Includes cutsets and supporter
+    /// feasibility filtering; forced propagation still requires `supporters`.
+    pub h2: bool,
     /// e-deletion: extend threats from "deletes the protected fact" to "cannot
     /// hold beside it", using the same mutexes as `cutset`. See
     /// [`crate::fdr_pocl`] for the finite-domain reading and
@@ -49,6 +52,7 @@ impl PruneOptions {
             cutset: true,
             symbolic: true,
             supporters: true,
+            h2: true,
             edelete: true,
             disjunctive: true,
             params: true,
@@ -63,6 +67,7 @@ impl PruneOptions {
         self.cutset
             || self.symbolic
             || self.supporters
+            || self.h2
             || self.edelete
             || self.disjunctive
             || self.params
@@ -98,6 +103,7 @@ impl PruneOptions {
                 "cutset" => options.cutset = on,
                 "symbolic" => options.symbolic = on,
                 "supporters" => options.supporters = on,
+                "h2" => options.h2 = on,
                 "edelete" | "e-deletion" | "edeletion" => options.edelete = on,
                 "disjunctive" | "disjunctions" => options.disjunctive = on,
                 "params" | "parameters" | "param-domains" => options.params = on,
@@ -107,7 +113,7 @@ impl PruneOptions {
                 other => {
                     return Err(format!(
                         "unknown pruning rule `{other}` (expected cutset, edelete, \
-                         symbolic, supporters, disjunctive, params, recursion, minimality, symmetry, all or none)"
+                         symbolic, supporters, h2, disjunctive, params, recursion, minimality, symmetry, all or none)"
                     ))
                 }
             }
@@ -148,6 +154,9 @@ impl PruneOptions {
         if self.supporters {
             names.push("supporters");
         }
+        if self.h2 {
+            names.push("h2");
+        }
         names
     }
 
@@ -162,6 +171,9 @@ impl PruneOptions {
         }
         if self.supporters {
             names.push("supporters");
+        }
+        if self.h2 {
+            names.push("h2");
         }
         if self.edelete {
             names.push("edelete");
@@ -212,6 +224,7 @@ mod tests {
                 "cutset",
                 "symbolic",
                 "supporters",
+                "h2",
                 "edelete",
                 "disjunctive",
                 "params",

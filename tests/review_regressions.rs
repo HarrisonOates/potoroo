@@ -359,7 +359,10 @@ fn tiny_tasks_agree_with_exhaustive_state_search() {
                 let prune = potoroo::pruning::PruneOptions {
                     cutset: mask & 1 != 0,
                     supporters: mask & 8 != 0,
+                    // Bit 16 selects the representation-specific extension:
+                    // symbolic mutexes for literals, pair reachability for FDR.
                     symbolic: mask & 16 != 0,
+                    h2: mask & 16 != 0,
                     edelete: mask & 2 != 0,
                     disjunctive: mask & 4 != 0,
                     ..Default::default()

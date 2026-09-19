@@ -128,6 +128,12 @@ struct RunStats {
     h_eval_ms: u128,
     pruned: usize,
     supporter_forced: usize,
+    // Preprocessing work/time/removals sum across stages; proof counts are
+    // maxima because stages can rediscover the same pairs. Status is the last
+    // enabled stage's, with run/completion counts showing partial completion.
+    h2: potoroo::h2::Stats,
+    h2_runs: usize,
+    h2_completed: usize,
     max_steps: usize,
     max_open_conditions: usize,
     max_threats: usize,
@@ -145,6 +151,16 @@ impl RunStats {
         self.h_eval_ms += stage.h_eval_ms;
         self.pruned += stage.pruned;
         self.supporter_forced += stage.supporter_forced;
+        self.h2_runs += stage.h2_runs;
+        self.h2_completed += stage.h2_completed;
+        if stage.h2_runs > 0 {
+            self.h2.status = stage.h2.status;
+        }
+        self.h2.work += stage.h2.work;
+        self.h2.elapsed_ms += stage.h2.elapsed_ms;
+        self.h2.mutex_pairs = self.h2.mutex_pairs.max(stage.h2.mutex_pairs);
+        self.h2.unreachable_facts = self.h2.unreachable_facts.max(stage.h2.unreachable_facts);
+        self.h2.supporters_removed += stage.h2.supporters_removed;
         self.max_steps = self.max_steps.max(stage.max_steps);
         self.max_open_conditions = self.max_open_conditions.max(stage.max_open_conditions);
         self.max_threats = self.max_threats.max(stage.max_threats);
@@ -163,6 +179,9 @@ impl From<potoroo::search::SearchStats> for RunStats {
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
             supporter_forced: 0,
+            h2: Default::default(),
+            h2_runs: 0,
+            h2_completed: 0,
             max_steps: stats.max_steps,
             max_open_conditions: stats.max_open_conditions,
             max_threats: stats.max_threats,
@@ -183,6 +202,9 @@ impl From<potoroo::fdr_pocl::SearchStats> for RunStats {
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
             supporter_forced: stats.supporter_forced,
+            h2: stats.h2,
+            h2_runs: usize::from(stats.h2.status != potoroo::h2::Status::Disabled),
+            h2_completed: usize::from(stats.h2.status == potoroo::h2::Status::Complete),
             max_steps: stats.max_steps,
             max_open_conditions: stats.max_open_conditions,
             max_threats: stats.max_threats,
@@ -367,7 +389,10 @@ fn run() -> Result<ExitCode, String> {
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
-                     \"supporter_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
+                     \"supporter_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\
+                     \"h2_status\":\"{}\",\"h2_runs\":{},\"h2_completed\":{},\"h2_work\":{},\"h2_ms\":{},\
+                     \"h2_max_mutex_pairs\":{},\"h2_max_unreachable_facts\":{},\"h2_supporters_removed\":{},\
+                     \"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
                     json_escape(&problem.name),
                     json_escape(&label),
                     solved,
@@ -386,6 +411,14 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_disjunctions,
                     stats.max_queued,
                     stats.dropped,
+                    stats.h2.status.as_str(),
+                    stats.h2_runs,
+                    stats.h2_completed,
+                    stats.h2.work,
+                    stats.h2.elapsed_ms,
+                    stats.h2.mutex_pairs,
+                    stats.h2.unreachable_facts,
+                    stats.h2.supporters_removed,
                     outcome_label(status),
                     peak_rss_kb(),
                 );
@@ -790,6 +823,14 @@ fn print_search_summary(status: &str, wall_ms: u128, stats: &RunStats) {
         stats.max_open_conditions,
         stats.max_threats,
     );
+    if stats.h2_runs > 0 {
+        eprintln!(
+            "Pair reachability: {} | completed {}/{} stages | {} ms | {} work | at most {} mutex pairs, {} unreachable facts per stage | {} supporter templates removed across stages",
+            stats.h2.status.as_str(), stats.h2_completed, stats.h2_runs,
+            stats.h2.elapsed_ms, stats.h2.work, stats.h2.mutex_pairs,
+            stats.h2.unreachable_facts, stats.h2.supporters_removed,
+        );
+    }
 }
 
 /// Peak resident set size in kilobytes from `/proc/self/status`.
@@ -1203,7 +1244,7 @@ fn print_help() {
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
          \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
          \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
-         \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, edelete,\n\
+         \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, h2, edelete,\n\
          \x20                            disjunctive, params, recursion, minimality, symmetry, all, none\n\
          \x20                            (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
@@ -1226,6 +1267,48 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_preprocessing_stats_preserve_work_and_proof_counts_across_stages() {
+        use potoroo::h2::{Stats, Status};
+        let stage = |h2| {
+            let mut stats = potoroo::fdr_pocl::SearchStats::default();
+            stats.h2 = h2;
+            RunStats::from(stats)
+        };
+        let mut total = RunStats::default();
+        total.add(&stage(Stats {
+            status: Status::Complete,
+            work: 100,
+            elapsed_ms: 2,
+            mutex_pairs: 7,
+            unreachable_facts: 3,
+            supporters_removed: 4,
+        }));
+        total.add(&stage(Stats {
+            status: Status::Complete,
+            work: 100,
+            elapsed_ms: 3,
+            mutex_pairs: 7,
+            unreachable_facts: 3,
+            supporters_removed: 4,
+        }));
+        total.add(&stage(Stats {
+            status: Status::WorkLimit,
+            work: 50,
+            elapsed_ms: 1,
+            ..Default::default()
+        }));
+        total.add(&RunStats::from(potoroo::search::SearchStats::default()));
+        assert_eq!((total.h2_runs, total.h2_completed), (3, 2));
+        assert_eq!(total.h2.status, Status::WorkLimit);
+        assert_eq!((total.h2.work, total.h2.elapsed_ms), (250, 6));
+        assert_eq!((total.h2.mutex_pairs, total.h2.unreachable_facts), (7, 3));
+        assert_eq!(total.h2.supporters_removed, 8);
+        let parsed = cli(&["--fdr-pocl", "-p", "all,no-h2"]);
+        assert!(!parsed.params.prune.h2);
+        assert!(cli(&["--fdr-pocl", "-p", "h2"]).params.prune.h2);
+    }
 
     fn cli(args: &[&str]) -> Cli {
         parse_args(args.iter().map(|arg| (*arg).to_string()))
