@@ -94,7 +94,7 @@ impl Default for Parameters {
     fn default() -> Self {
         Parameters {
             search_algorithm: SearchAlgorithm::A,
-            heuristic: Heuristic::parse("ADD").expect("ADD is a valid heuristic"),
+            heuristic: Heuristic::parse("ADD/LIFO").expect("ADD/LIFO is a valid heuristic"),
             action_cost: ActionCost::Task,
             weight: 1.0,
             flaw_orders: vec![

@@ -1,8 +1,8 @@
 //! Integration test: plan the Sussman anomaly with the additive `ADD`
 //! planning-graph heuristic in both lifted and ground modes, and compare the
-//! formatted plan body against the established golden files. `ADD` is the
-//! default, and `ADDR` yields the same optimal plan here, so the golden files
-//! are shared.
+//! formatted plan body against the established golden files. Explicit `ADD`,
+//! `ADDR`, and the default `ADD/LIFO` yield the same optimal plan here, so the
+//! golden files are shared.
 
 use std::fs;
 

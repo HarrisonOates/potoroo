@@ -43,7 +43,7 @@ struct Cli {
     files: Vec<String>,
     /// Effective flaw-order names, retained for readable telemetry.
     flaw_order_names: Vec<String>,
-    /// Effective `-h` value (default `ADD`). Used to label telemetry and the
+    /// Effective `-h` value (default `ADD/LIFO`). Used to label telemetry and the
     /// optional `POTOROO_STATS_JSON` output.
     heuristic_name: String,
     /// Raw `-s` value as given on the command line (default `A`). Included in the
@@ -892,7 +892,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut verbosity = 0u32;
     let mut fdr_pocl = false;
     let mut files = Vec::new();
-    let mut heuristic_name = String::from("ADD");
+    let mut heuristic_name = String::from("ADD/LIFO");
     let mut algorithm_name = String::from("A");
     // Track whether the user set these so repeated flags replace the defaults.
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
@@ -1248,7 +1248,7 @@ fn print_help() {
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
-         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD)\n\
+         \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD/LIFO)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
          \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
          \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
@@ -1331,9 +1331,9 @@ mod tests {
     }
 
     #[test]
-    fn literal_cli_uses_the_add_static_profile() {
+    fn literal_cli_uses_the_add_lifo_static_profile() {
         let cli = cli(&[]);
-        assert_eq!(cli.heuristic_name, "ADD");
+        assert_eq!(cli.heuristic_name, "ADD/LIFO");
         assert_eq!(cli.flaw_order_names, ["STATIC"]);
         assert_eq!(cli.params.search_algorithm, SearchAlgorithm::A);
         assert_eq!(cli.params.action_cost, ActionCost::Task);
@@ -1341,16 +1341,21 @@ mod tests {
     }
 
     #[test]
-    fn every_representation_defaults_to_add() {
-        assert_eq!(cli(&[]).heuristic_name, "ADD");
-        assert_eq!(cli(&["-g"]).heuristic_name, "ADD");
-        assert_eq!(cli(&["--fdr-pocl"]).heuristic_name, "ADD");
+    fn every_representation_defaults_to_add_lifo() {
+        assert_eq!(cli(&[]).heuristic_name, "ADD/LIFO");
+        assert_eq!(cli(&["-g"]).heuristic_name, "ADD/LIFO");
+        assert_eq!(cli(&["--fdr-pocl"]).heuristic_name, "ADD/LIFO");
     }
 
     #[test]
     fn an_explicit_heuristic_still_wins() {
-        assert_eq!(cli(&["-h", "ADDR"]).heuristic_name, "ADDR");
-        assert_eq!(cli(&["--fdr-pocl", "-h", "ADDR"]).heuristic_name, "ADDR");
+        for heuristic in ["ADDR", "ADD", "ADD/FIFO", "ADD/OC/LIFO"] {
+            assert_eq!(cli(&["-h", heuristic]).heuristic_name, heuristic);
+            assert_eq!(
+                cli(&["--fdr-pocl", "-h", heuristic]).heuristic_name,
+                heuristic
+            );
+        }
     }
 
     fn rejects(args: &[&str]) -> String {

@@ -166,10 +166,19 @@ potoroo --fdr-pocl -v examples/blocks-world-domain.pddl examples/sussman-anomaly
 
 ### Default search profile
 
-Potoroo defaults to lifted POCL, A* search, the additive `ADD` heuristic, task
-action costs, weight 1, and the `STATIC` flaw order. The same defaults apply to
-every representation. Any explicit `-h`, `-f`, `-s`, `-a`, or `-w` option
-overrides the corresponding default.
+Potoroo defaults to lifted POCL, A* search, the additive heuristic with LIFO
+queue ties (`ADD/LIFO`), task action costs, weight 1, and the `STATIC` flaw order.
+Equal scores prefer the newest generated plan. The same defaults apply to every
+representation. Any explicit `-h`, `-f`, `-s`, `-a`, or `-w` option overrides the
+corresponding default.
+
+An explicit `-h` replaces the whole ranking: use `-h ADD/FIFO` for FIFO ties,
+`-h ADD/OC/LIFO` to prefer fewer open conditions before recency, or `-h ADD`
+for the former ranking without a queue tie policy. Portfolio `--stage`
+heuristics are also used exactly as specified. BFS and the secondary FIFO queue
+of `LGBFS-D` retain their algorithm-specific ordering. The
+controlled coalescing evaluation
+motivated this choice; it does not establish that LIFO wins on every domain.
 
 `ADD` rather than VHPOP's reuse-aware `ADDR`: the reuse check scans every step
 and effect for every open condition, so its cost grows with plan size, and on
@@ -314,7 +323,7 @@ STATS {"problem":"...","heuristic":"...","ground":false,"solved":true,"plan_len"
 | `-f` | `--flaw-order` | ORDER | Flaw-selection order (see [Flaw orders](#flaw-selection-orders)) | `STATIC` |
 | — | `--fdr-pocl` | — | Ground POCL search over translated multi-valued SAS+ variables | off |
 | `-g` | `--ground-actions` | — | Plan with fully ground actions (required for `LPLAN`, `SAMPLE_FF`, `COMPILE*`) | lifted |
-| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD` |
+| `-h` | `--heuristic` | HEUR | Plan-ranking heuristic (see [Heuristics](#heuristics)) | `ADD/LIFO` |
 | `-l` | `--limit` | N or `unlimited` | Search-node expansion limit | unlimited |
 | — | `--max-queued` | N | Hold the open lists at N plans, discarding the worst (incomplete; see [Node size and memory](#node-size-and-memory)) | off |
 | — | `--mem-mb` | M | Hold the open lists so the resident set stays near M MB (incomplete; same section) | off |
@@ -353,7 +362,7 @@ These build an incremental Graphplan-style planning graph. Ground mode (`-g`) is
 
 | Name | Description |
 |------|-------------|
-| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **Default.** |
+| `ADD` | Additive heuristic: sum of cost-aware ADD values for all open conditions. `committed-cost + weight × h_add`. **Default with `LIFO` queue ties.** |
 | `ADD_COST` | ADD cost term only (no step count) |
 | `ADD_WORK` | ADD work: total operator count in the ADD relaxed plan |
 | `ADDR` | Additive heuristic with action reuse (VHPOP's `h^r_add`): only new operators count toward the estimate. Evaluation cost grows with plan size; see the note on defaults above. |
@@ -510,7 +519,8 @@ The flaw-selection order (`-f`) controls which open flaw the planner chooses to 
 | `LC_ADD`, `MC_ADD`, `LW_ADD`, `MW_ADD` | Cost/work variants using the ADD heuristic |
 
 `-f ZLIFO` selects flaws within a plan; `-h ADD/LIFO` breaks ties between
-queued plans. They can be used together and have different performance effects.
+queued plans (the default ranking). They can be used together and have different
+performance effects.
 See the ZLIFO measurements for
 comparisons with STATIC and the pruning combinations.
 
@@ -588,11 +598,17 @@ variables in a stage. See the
 pair-pruning implementation report and
 bounded evaluation and
 axiom projection follow-up for validation,
-measurements and limitations. Defaults remain unchanged.
+measurements and limitations. Pruning rules remain opt-in.
 
 The threat-maintenance follow-up
 evaluates redundant threat processing and reduces repeated cache maintenance
-while preserving search order.
+while preserving search order. Following the
+controlled evaluation,
+FDR threat coalescing is now enabled: one unavoidable reason represents all
+threats from the same step to the same link, and identical deferred ordering
+constraints are shared across threats. Conditional threats keep their distinct
+guard-disabling alternatives unless an unavoidable reason makes those repairs
+insufficient. See the adoption checks.
 
 ### Runtime cost
 

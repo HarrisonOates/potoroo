@@ -337,7 +337,24 @@ impl PartialPlan {
                 }
             }
         }
-        threats
+        // Independent full discovery followed by dominance filtering, rather
+        // than the incremental collector's early exits.
+        let mut coalesced = Vec::new();
+        for group in threats.chunk_by(|a, b| a.link == b.link && a.step == b.step) {
+            let unavoidable = group.iter().find(|threat| {
+                threat.effect == NO_EFFECT
+                    || task.operators[self.step(threat.step).unwrap().operator].effects
+                        [threat.effect]
+                        .conditions
+                        .is_empty()
+            });
+            if let Some(threat) = unavoidable {
+                coalesced.push(*threat);
+            } else {
+                coalesced.extend_from_slice(group);
+            }
+        }
+        coalesced
     }
 
     /// The committed step with the given id. Steps are only ever appended and
@@ -388,13 +405,21 @@ impl PartialPlan {
     }
 
     /// Whether a threat already has a disjunction standing for it, so flaw
-    /// selection must leave it alone.
+    /// selection must leave it alone. All reasons involving the same step and
+    /// link endpoints require the same ordering. The source threat stays in
+    /// the cache: if its conditional guard is disabled, settling retires its
+    /// disjunction and any remaining reasons become selectable again.
     fn threat_covered(&self, threat: &Threat) -> bool {
-        !self.disjunctions.is_empty()
-            && self
-                .disjunctions
-                .iter()
-                .any(|disjunction| disjunction.threat == threat_key(threat))
+        self.disjunctions.iter().any(|disjunction| {
+            if disjunction.threat.1 != threat.step {
+                return false;
+            }
+            if disjunction.threat.0 == threat.link {
+                return true;
+            }
+            let link = self.threatened_link(threat);
+            disjunction.promote.0 == link.consumer && disjunction.demote.1 == link.producer
+        })
     }
 
     pub(crate) fn pending_disjunctions(&self) -> usize {
@@ -586,6 +611,54 @@ impl PartialPlan {
         self.threats = Rc::new(active);
     }
 
+    /// Collect threats for one step/link pair. An unconditional effect or
+    /// conflicting precondition requires ordering the step outside the link,
+    /// which also resolves every conditional reason in this pair. Otherwise
+    /// retain each conditional effect's distinct guard-disabling alternative.
+    fn collect_link_threats(
+        &self,
+        task: &Task,
+        step: &Step,
+        link: &CausalLink,
+        link_index: usize,
+        additions: &mut Vec<Threat>,
+    ) {
+        if step.id == link.producer
+            || step.id == link.consumer
+            || !self.can_be_inside(step.id, link)
+        {
+            return;
+        }
+        let start = additions.len();
+        for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
+            if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
+                && !self.effect_cannot_fire(task, step, effect_index)
+            {
+                if effect.conditions.is_empty() {
+                    additions.truncate(start);
+                }
+                additions.push(Threat {
+                    step: step.id,
+                    effect: effect_index,
+                    link: link_index,
+                });
+                if effect.conditions.is_empty() {
+                    return;
+                }
+            }
+        }
+        if self.edelete.as_deref().is_some_and(|mutexes| {
+            precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes)
+        }) {
+            additions.truncate(start);
+            additions.push(Threat {
+                step: step.id,
+                effect: NO_EFFECT,
+                link: link_index,
+            });
+        }
+    }
+
     fn add_link_threats(&mut self, task: &Task, link_index: usize) {
         debug_assert_eq!(link_index + 1, self.num_links);
         let link = *self.threatened_link(&Threat {
@@ -596,32 +669,7 @@ impl PartialPlan {
         let link = &link;
         let mut additions = Vec::new();
         for step in self.steps() {
-            if step.id == link.producer
-                || step.id == link.consumer
-                || !self.can_be_inside(step.id, link)
-            {
-                continue;
-            }
-            for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
-                    && !self.effect_cannot_fire(task, step, effect_index)
-                {
-                    additions.push(Threat {
-                        step: step.id,
-                        effect: effect_index,
-                        link: link_index,
-                    });
-                }
-            }
-            if let Some(mutexes) = self.edelete.as_deref() {
-                if precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes) {
-                    additions.push(Threat {
-                        step: step.id,
-                        effect: NO_EFFECT,
-                        link: link_index,
-                    });
-                }
-            }
+            self.collect_link_threats(task, step, link, link_index, &mut additions);
         }
         // Steps were visited newest first; the cache is kept in discovery
         // order, which is ascending `(link, step, effect)`.
@@ -641,32 +689,7 @@ impl PartialPlan {
         let num_links = self.num_links;
         for (position, link) in self.links().enumerate() {
             let link_index = num_links - 1 - position;
-            if step.id == link.producer
-                || step.id == link.consumer
-                || !self.can_be_inside(step.id, link)
-            {
-                continue;
-            }
-            for (effect_index, effect) in task.operators[step.operator].effects.iter().enumerate() {
-                if effect_e_deletes(effect, link.condition, self.edelete.as_deref())
-                    && !self.effect_cannot_fire(task, step, effect_index)
-                {
-                    additions.push(Threat {
-                        step: step.id,
-                        effect: effect_index,
-                        link: link_index,
-                    });
-                }
-            }
-            if let Some(mutexes) = self.edelete.as_deref() {
-                if precondition_e_deletes(&task.operators[step.operator], link.condition, mutexes) {
-                    additions.push(Threat {
-                        step: step.id,
-                        effect: NO_EFFECT,
-                        link: link_index,
-                    });
-                }
-            }
+            self.collect_link_threats(task, step, link, link_index, &mut additions);
         }
         if additions.is_empty() {
             return;
@@ -770,9 +793,6 @@ pub fn translate(ctx: &SearchContext<'_>) -> Result<Task, Error> {
 /// library callers that do not need the full [`Parameters`] surface.
 pub fn solve(task: &Task, node_limit: usize) -> (Outcome, SearchStats) {
     let params = Parameters {
-        // ADDR is the literal planner's default, but its reuse treatment forms
-        // poor plateaus on FDR nodes. Plain ADD is the robust FDR default.
-        heuristic: Heuristic::parse("ADD").expect("ADD is a valid heuristic"),
         search_limits: vec![node_limit],
         ..Parameters::default()
     };
@@ -3836,6 +3856,64 @@ mod tests {
     }
 
     #[test]
+    fn unavoidable_threats_dominate_only_within_the_same_step_and_link() {
+        let mut task = breaker_task();
+        // A conditional threat precedes two unavoidable assignments in effect
+        // order. The collector must discard it when it finds the first one.
+        for _ in 0..2 {
+            task.operators[1].effects.push(Effect {
+                conditions: vec![],
+                variable: 0,
+                pre: None,
+                post: 0,
+            });
+        }
+        let (mut plan, _) = trapped_breaker_plan();
+        plan.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(&task)));
+        plan.threats = Rc::new(Vec::new());
+        let mut by_step = plan.clone();
+        plan.add_link_threats(&task, 0);
+        by_step.add_step_threats(&task, 2);
+        let expected = vec![Threat {
+            step: 2,
+            effect: 2,
+            link: 0,
+        }];
+        assert_eq!(*plan.threats, expected);
+        assert_eq!(plan.threats, by_step.threats);
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+        assert!(Planner::new(&task)
+            .confrontations(&plan, &expected[0])
+            .is_empty());
+
+        // A precondition threat also dominates conditional assignments, even
+        // when there is no unconditional threatening effect.
+        task.operators[1].effects.truncate(2);
+        task.operators[1].prevail = vec![Fact::new(0, 0)];
+        plan.threats = Rc::new(Vec::new());
+        plan.add_link_threats(&task, 0);
+        assert_eq!(
+            *plan.threats,
+            vec![Threat {
+                step: 2,
+                effect: NO_EFFECT,
+                link: 0
+            }]
+        );
+        assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
+
+        // Without the unavoidable precondition conflict, the original
+        // conditional effect and its confrontation alternative must survive.
+        task.operators[1].prevail = vec![Fact::new(0, 1)];
+        plan.threats = Rc::new(Vec::new());
+        plan.add_link_threats(&task, 0);
+        assert_eq!(plan.threats[0].effect, 1);
+        let children = Planner::new(&task).resolve_threat(&plan, &plan.threats[0]);
+        assert_eq!(children.len(), 1);
+        assert!(children[0].effect_suppressed(2, 1));
+    }
+
+    #[test]
     fn ordering_repairs_retire_every_reason_for_the_same_threat() {
         let mut task = travel_task();
         // A protects location=lyon until B. T both requires paris and assigns
@@ -3882,9 +3960,8 @@ mod tests {
         plan.edelete = Some(Rc::new(crate::cutset::FactMutexes::new(&task)));
         plan.add_step_threats(&task, 2);
         assert_eq!(plan.threats(&task), plan.rediscover_threats(&task));
-        assert_eq!(plan.threats.len(), 2);
+        assert_eq!(plan.threats.len(), 1);
         assert_eq!(plan.threats[0].effect, 0);
-        assert_eq!(plan.threats[1].effect, NO_EFFECT);
 
         let immediate = Planner::new(&task);
         let deferred = Planner::new(&task)
@@ -4007,7 +4084,7 @@ mod tests {
                 .iter()
                 .filter(|t| child.threat_covered(t))
                 .count(),
-            1
+            3
         );
         // Forcing promotion must trigger a new threat sweep: all three
         // assignments are now outside both protected intervals.

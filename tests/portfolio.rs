@@ -43,22 +43,34 @@ fn stage_generated(stderr: &str, prefix: &str) -> i64 {
         .expect("a numeric node count")
 }
 
-/// Default search on `sussman-anomaly`. The restored-effect threat fix
-/// reduces the former 64 generated / 40 visited nodes to 58 / 36. Portfolio
-/// accounting must still reproduce the standalone search exactly.
+/// Explicit ADD search on `sussman-anomaly`, used by the stages below.
+/// Portfolio accounting must reproduce the standalone search exactly.
 const SUSSMAN_GENERATED: i64 = 58;
 
 #[test]
-fn the_default_configuration_still_generates_the_same_nodes() {
+fn the_default_configuration_matches_explicit_add_lifo() {
     let output = run(&[
         "examples/blocks-world-domain.pddl",
         "examples/sussman-anomaly.pddl",
     ]);
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert_eq!(stat(&stderr, "nodes_generated"), SUSSMAN_GENERATED);
-    assert_eq!(stat(&stderr, "nodes_visited"), 36);
+    assert_eq!(stat(&stderr, "nodes_generated"), 44);
+    assert_eq!(stat(&stderr, "nodes_visited"), 28);
     assert!(stderr.contains("\"outcome\":\"solved\""));
+    assert!(stderr.contains("\"heuristic\":\"A(ADD/LIFO)\""));
+
+    let explicit = run(&[
+        "-h",
+        "ADD/LIFO",
+        "examples/blocks-world-domain.pddl",
+        "examples/sussman-anomaly.pddl",
+    ]);
+    assert!(explicit.status.success());
+    let explicit_stderr = String::from_utf8(explicit.stderr).expect("stderr is UTF-8");
+    for field in ["nodes_generated", "nodes_visited", "h_evals", "plan_cost"] {
+        assert_eq!(stat(&stderr, field), stat(&explicit_stderr, field));
+    }
 }
 
 #[test]
@@ -223,6 +235,8 @@ fn a_stage_hands_its_memory_back_to_the_one_after_it() {
     // particular number of megabytes — only on the two stages costing the same,
     // which they must, being the same configuration on the same problem.
     let probe = run(&[
+        "-h",
+        "ADD",
         "--time-limit",
         "2",
         "examples/gripper-domain.pddl",
