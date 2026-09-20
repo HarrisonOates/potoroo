@@ -2321,18 +2321,15 @@ impl<'a> Planner<'a> {
             stats.h_eval_nanos += start.elapsed().as_nanos();
             stats.h_eval_ms = stats.h_eval_nanos / 1_000_000;
         }
-        (
-            params.heuristic.queue_rank(result.0),
-            params.heuristic.queue_rank(result.1),
-        )
+        result
     }
 
-    fn compute_rank_both(&self, plan: &PartialPlan, params: &Parameters) -> (Vec<f32>, Vec<f32>) {
+    fn compute_rank_both(&self, plan: &PartialPlan, params: &Parameters) -> (Rank, Rank) {
         let g = plan.cost() as f32;
         let opens = plan.num_open_conditions();
         let threats = plan.threats.len();
-        let mut rank = Vec::with_capacity(params.heuristic.terms().len());
-        let mut grank = Vec::with_capacity(params.heuristic.terms().len() + 2);
+        let mut rank = Rank::new();
+        let mut grank = Rank::new();
         let mut add = None;
         let mut addr = None;
         let mut relax = None;
@@ -2345,12 +2342,12 @@ impl<'a> Planner<'a> {
         for term in params.heuristic.terms() {
             match term {
                 HVal::Lifo => {
-                    rank.push(-(plan.id as f32));
-                    grank.push(-(plan.id as f32));
+                    rank.push_lifo(plan.id);
+                    grank.push_lifo(plan.id);
                 }
                 HVal::Fifo => {
-                    rank.push(plan.id as f32);
-                    grank.push(plan.id as f32);
+                    rank.push_fifo(plan.id);
+                    grank.push_fifo(plan.id);
                 }
                 HVal::Oc => {
                     rank.push(opens as f32);
@@ -2431,7 +2428,7 @@ impl<'a> Planner<'a> {
             }
         }
         grank.push(opens as f32);
-        grank.push(-(plan.id as f32));
+        grank.push_lifo(plan.id);
         (rank, grank)
     }
 
@@ -3040,8 +3037,8 @@ fn saturate_relaxed_values(
 }
 
 fn push_add_rank(
-    rank: &mut Vec<f32>,
-    grank: &mut Vec<f32>,
+    rank: &mut Rank,
+    grank: &mut Rank,
     term: HVal,
     estimate: AddEstimate,
     steps: f32,
@@ -3131,6 +3128,38 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn queue_rank_storage_does_not_allocate() {
+        use crate::alloc_test::allocations_during;
+        use std::hint::black_box;
+
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        let params = Parameters {
+            // Four composed terms plus the two GBFS tiebreakers fill the rank.
+            heuristic: Heuristic::parse("OC/FIFO/LIFO/UC").unwrap(),
+            ..Parameters::default()
+        };
+        let mut plan = PartialPlan::initial(&task);
+        plan.id = usize::MAX;
+        let mut stats = SearchStats::default();
+        let ((a, g), allocations) =
+            allocations_during(|| black_box(planner.rank_both(&plan, &params, &mut stats)));
+        assert_eq!(allocations, 0);
+        assert_eq!(stats.h_evals, 1);
+        let expected = [1.0, usize::MAX as f32, -(usize::MAX as f32), 0.0];
+        assert_eq!(&*a, &expected);
+        assert_eq!(&g[..4], &expected);
+        assert_eq!(&g[4..], &[1.0, -(usize::MAX as f32)]);
+
+        // Positive control: count the two allocations that the previous
+        // implementation needed to hold its temporary numeric rank vectors.
+        let ((av, gv), allocations) = allocations_during(|| black_box((a.to_vec(), g.to_vec())));
+        assert_eq!(allocations, 2);
+        assert_eq!(&*a, av);
+        assert_eq!(&*g, gv);
+    }
 
     #[test]
     fn queues_and_lazy_reranking_use_exact_plan_ids() {

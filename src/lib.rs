@@ -11,6 +11,8 @@
 //! lowering time. See the README's "Supported PDDL" section.
 
 pub mod action;
+#[cfg(test)]
+mod alloc_test;
 pub mod bindings;
 pub mod chain;
 pub mod cl_relax;

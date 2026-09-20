@@ -240,10 +240,9 @@ impl Heuristic {
         &self.h
     }
 
-    /// Preserve the configured positions of integer ID terms when a numeric
-    /// heuristic vector enters a queue. The public score-vector APIs remain
-    /// available for diagnostics; their f32 ID approximations must never be
-    /// used to compare queued plans.
+    /// The previous numeric-vector conversion, retained only as a test oracle
+    /// for the direct inline builder's score values and exact ID tags.
+    #[cfg(test)]
     pub(crate) fn queue_rank(&self, values: Vec<f32>) -> Rank {
         let mut rank = Rank::from_slice(&values);
         assert!(values.len() == self.h.len() || values.len() == self.h.len() + 2);
@@ -261,7 +260,7 @@ impl Heuristic {
         rank
     }
 
-    /// Fills `rank` with the heuristic ranks for `plan`. Lower is better.
+    /// Returns the numeric heuristic ranks for `plan`. Lower is better.
     pub fn plan_rank(
         &self,
         plan: &Plan,
@@ -271,14 +270,15 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> Vec<f32> {
-        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+        self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx)
             .0
+            .to_vec()
     }
 
     /// Computes the A* rank ([`plan_rank`](Self::plan_rank)) and the GBFS rank
     /// ([`plan_rank_gbfs`](Self::plan_rank_gbfs)) in one pass, sharing every
     /// heuristic evaluation between them. The two ranks differ only in the
-    /// g-component (step count) mixed into some entries and the trailing GBFS
+    /// g-component (committed action cost) mixed into some entries and the trailing GBFS
     /// tiebreakers, so algorithms that need both orderings of the same plan
     /// (`ALT`) pay one evaluation instead of two.
     pub fn plan_rank_both(
@@ -290,8 +290,24 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> (Vec<f32>, Vec<f32>) {
-        let mut rank = Vec::with_capacity(self.h.len());
-        let mut grank = Vec::with_capacity(self.h.len() + 2);
+        let (rank, grank) = self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx);
+        (rank.to_vec(), grank.to_vec())
+    }
+
+    /// Evaluate once into the two inline queue ranks. The vector-returning
+    /// public APIs above are diagnostic compatibility wrappers; search uses
+    /// these ranks directly without allocating temporary score vectors.
+    pub(crate) fn plan_queue_ranks(
+        &self,
+        plan: &Plan,
+        weight: f32,
+        predicates: &PredicateTable,
+        ctx: &TypeContext,
+        pg: Option<&PlanningGraph>,
+        search_ctx: &SearchContext,
+    ) -> (Rank, Rank) {
+        let mut rank = Rank::new();
+        let mut grank = Rank::new();
         // Cache the ADD / ADDR sums across the (single) ADD* / ADDR* terms.
         let mut add_done = false;
         let mut add_cost = 0.0f32;
@@ -307,12 +323,12 @@ impl Heuristic {
             match h {
                 // No g component: both ranks carry the same value.
                 HVal::Lifo => {
-                    rank.push(-(plan.serial_no() as f32));
-                    grank.push(-(plan.serial_no() as f32));
+                    rank.push_lifo(plan.serial_no());
+                    grank.push_lifo(plan.serial_no());
                 }
                 HVal::Fifo => {
-                    rank.push(plan.serial_no() as f32);
-                    grank.push(plan.serial_no() as f32);
+                    rank.push_fifo(plan.serial_no());
+                    grank.push_fifo(plan.serial_no());
                 }
                 HVal::Oc => {
                     rank.push(plan.num_open_conds() as f32);
@@ -492,15 +508,16 @@ impl Heuristic {
         // would sweep h-plateaus breadth-first, which is exactly where greedy
         // search stalls; diving on the newest plan escapes them.
         grank.push(plan.num_open_conds() as f32);
-        grank.push(-(plan.serial_no() as f32));
+        grank.push_lifo(plan.serial_no());
         (rank, grank)
     }
 
-    /// Greedy-BFS variant of [`plan_rank`]: strips the g-component (step count)
-    /// from each `HVal` so the primary sort criterion is pure h. After the
-    /// h-components, `steps` and `plan_id` are appended as tiebreakers so the
-    /// ordering remains deterministic. Heuristics that already have no g
-    /// component (e.g. `AddCost`, `Oc`, `Fifo`) are returned unchanged.
+    /// Greedy-BFS variant of [`plan_rank`](Self::plan_rank): strips the
+    /// g-component (committed action cost) from each `HVal` so the primary sort
+    /// criterion is pure h. After the selected terms come open-condition count
+    /// and the LIFO ID approximation. Terms that already have no g component
+    /// (e.g. `AddCost`, `Oc`, `Fifo`) are returned unchanged. These numeric
+    /// vectors are diagnostic; search compares integer ID terms exactly.
     pub fn plan_rank_gbfs(
         &self,
         plan: &Plan,
@@ -510,8 +527,9 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> Vec<f32> {
-        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+        self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx)
             .1
+            .to_vec()
     }
 }
 

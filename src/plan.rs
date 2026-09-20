@@ -17,6 +17,7 @@ use crate::effect::Effect;
 use crate::flaws::{Flaw, FormulaTime, OpenCondition, Unsafe};
 use crate::formula::{Atom, Formula, Literal};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
+use crate::rank::Rank;
 use crate::search::SearchContext;
 use crate::terms::{Term, Variable};
 
@@ -139,63 +140,40 @@ impl Plan {
     }
 
     pub fn primary_rank(&self, ctx: &SearchContext) -> f32 {
-        self.rank(ctx)[0]
+        self.queue_rank(ctx)[0]
     }
 
-    /// Full rank vector. Each generated plan is ranked exactly once (the result
-    /// is carried by its queue entry), so no caching is kept on the plan itself
-    /// — that just duplicated the vector for millions of queued plans.
+    /// Full numeric rank vector for callers that need an owned diagnostic
+    /// vector. Search builds inline ranks instead.
     pub fn rank(&self, ctx: &SearchContext) -> Vec<f32> {
-        let type_ctx = ctx.type_ctx();
-        let pg = if ctx.params.heuristic.needs_planning_graph() {
-            Some(ctx.planning_graph())
-        } else {
-            None
-        };
-        let start = ctx.h_eval_start();
-        let rank = ctx.params.heuristic.plan_rank(
-            self,
-            ctx.params.weight,
-            &ctx.domain.predicates,
-            &type_ctx,
-            pg.as_deref(),
-            ctx,
-        );
-        ctx.record_h_eval(start);
-        // Most generated plans are ranked once and then parked in a queue;
-        // don't let each retain its bindings lookup index.
-        self.bindings.clear_index();
-        rank
+        self.queue_rank(ctx).to_vec()
     }
 
     /// Both rank vectors — A* ([`rank`](Self::rank)) and GBFS
     /// ([`rank_gbfs`](Self::rank_gbfs)) — from a single heuristic evaluation.
-    /// Used by `ALT`, which queues every child under both orderings; counts as
-    /// one h evaluation since the underlying work is done once.
+    /// Counts as one h evaluation since the underlying work is done once.
     pub fn rank_both(&self, ctx: &SearchContext) -> (Vec<f32>, Vec<f32>) {
-        let type_ctx = ctx.type_ctx();
-        let pg = if ctx.params.heuristic.needs_planning_graph() {
-            Some(ctx.planning_graph())
-        } else {
-            None
-        };
-        let start = ctx.h_eval_start();
-        let ranks = ctx.params.heuristic.plan_rank_both(
-            self,
-            ctx.params.weight,
-            &ctx.domain.predicates,
-            &type_ctx,
-            pg.as_deref(),
-            ctx,
-        );
-        ctx.record_h_eval(start);
-        self.bindings.clear_index();
-        ranks
+        let (rank, grank) = self.queue_ranks(ctx);
+        (rank.to_vec(), grank.to_vec())
     }
 
-    /// Greedy-BFS rank vector: h-only (no g component), with steps and
-    /// plan_id appended as tiebreakers. Used by GBFS, LGBFS, and LGBFS-D.
+    /// Greedy rank's numeric scores for diagnostic callers. After the selected
+    /// heuristic terms come open-condition count and the LIFO ID approximation.
     pub fn rank_gbfs(&self, ctx: &SearchContext) -> Vec<f32> {
+        self.queue_rank_gbfs(ctx).to_vec()
+    }
+
+    pub(crate) fn queue_rank(&self, ctx: &SearchContext) -> Rank {
+        self.queue_ranks(ctx).0
+    }
+
+    pub(crate) fn queue_rank_gbfs(&self, ctx: &SearchContext) -> Rank {
+        self.queue_ranks(ctx).1
+    }
+
+    /// Both inline queue ranks from one evaluation. ALT needs both; other
+    /// algorithms use one. Neither rank allocates or stays cached on the plan.
+    pub(crate) fn queue_ranks(&self, ctx: &SearchContext) -> (Rank, Rank) {
         let type_ctx = ctx.type_ctx();
         let pg = if ctx.params.heuristic.needs_planning_graph() {
             Some(ctx.planning_graph())
@@ -203,7 +181,7 @@ impl Plan {
             None
         };
         let start = ctx.h_eval_start();
-        let rank = ctx.params.heuristic.plan_rank_gbfs(
+        let ranks = ctx.params.heuristic.plan_queue_ranks(
             self,
             ctx.params.weight,
             &ctx.domain.predicates,
@@ -215,7 +193,7 @@ impl Plan {
         // Most generated plans are ranked once and then parked in a queue;
         // don't let each retain its bindings lookup index.
         self.bindings.clear_index();
-        rank
+        ranks
     }
 
     #[allow(clippy::too_many_arguments)]

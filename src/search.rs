@@ -915,11 +915,10 @@ fn pop_next(
         ctx.register_plan(&q.plan);
         // Lazy: compute the real rank now.
         let real_rank = if is_gbfs {
-            q.plan.rank_gbfs(ctx)
+            q.plan.queue_rank_gbfs(ctx)
         } else {
-            q.plan.rank(ctx)
+            q.plan.queue_rank(ctx)
         };
-        let real_rank = ctx.params.heuristic.queue_rank(real_rank);
         if real_rank.primary(q.plan.id.get()).is_finite() {
             primary.push(QueuedPlan {
                 plan: q.plan,
@@ -1220,10 +1219,7 @@ fn plan_impl(
     let mut limit_reached = false;
 
     let mut f_limit = if is_ida {
-        ctx.params
-            .heuristic
-            .queue_rank(initial_plan.rank(ctx))
-            .primary(initial_plan.id.get())
+        initial_plan.queue_rank(ctx).primary(initial_plan.id.get())
     } else {
         inf
     };
@@ -1250,15 +1246,12 @@ fn plan_impl(
                     let (rank, secondary_rank) = if is_bfs {
                         (Rank::bfs(inst.num_steps(), inst.id.get()), None)
                     } else if is_gbfs {
-                        (ctx.params.heuristic.queue_rank(inst.rank_gbfs(ctx)), None)
+                        (inst.queue_rank_gbfs(ctx), None)
                     } else if is_alt {
-                        let (a, g) = inst.rank_both(ctx);
-                        (
-                            ctx.params.heuristic.queue_rank(a),
-                            Some(ctx.params.heuristic.queue_rank(g)),
-                        )
+                        let (a, g) = inst.queue_ranks(ctx);
+                        (a, Some(g))
                     } else {
-                        (ctx.params.heuristic.queue_rank(inst.rank(ctx)), None)
+                        (inst.queue_rank(ctx), None)
                     };
                     let primary = rank.primary(inst.id.get());
                     if primary.is_finite() {
@@ -1372,19 +1365,16 @@ fn plan_impl(
                         true,
                     )
                 } else if is_gbfs {
-                    (
-                        ctx.params.heuristic.queue_rank(new_plan.rank_gbfs(ctx)),
-                        false,
-                    )
+                    (new_plan.queue_rank_gbfs(ctx), false)
                 } else if is_alt {
                     // ALT queues the child under both orderings; one shared
                     // evaluation produces the A* rank (primary queue) and the
                     // GBFS rank (secondary queue, pushed below).
-                    let (a_rank, g_rank) = new_plan.rank_both(ctx);
-                    alt_gbfs_rank = Some(ctx.params.heuristic.queue_rank(g_rank));
-                    (ctx.params.heuristic.queue_rank(a_rank), false)
+                    let (a_rank, g_rank) = new_plan.queue_ranks(ctx);
+                    alt_gbfs_rank = Some(g_rank);
+                    (a_rank, false)
                 } else {
-                    (ctx.params.heuristic.queue_rank(new_plan.rank(ctx)), false)
+                    (new_plan.queue_rank(ctx), false)
                 };
 
                 let primary = rank.primary(new_plan.id.get());
@@ -1868,6 +1858,52 @@ mod review_tests {
     }
 
     #[test]
+    fn queue_rank_storage_does_not_allocate() {
+        use crate::alloc_test::allocations_during;
+        use std::hint::black_box;
+
+        let (domain, problem) = task();
+        let params = Parameters {
+            // Exercise all six slots, including explicit and implicit ID tags.
+            // Cheap terms isolate rank storage from heuristic workspace.
+            heuristic: Heuristic::parse("OC/FIFO/LIFO/UC").unwrap(),
+            ..Parameters::default()
+        };
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let plan = Plan::make_initial_plan(&ctx).unwrap();
+        plan.id.set(usize::MAX);
+        let before = ctx.h_evals.get();
+        let ((a, g), allocations) = allocations_during(|| black_box(plan.queue_ranks(&ctx)));
+        assert_eq!(allocations, 0);
+        assert_eq!(ctx.h_evals.get(), before + 1);
+        let expected = [1.0, usize::MAX as f32, -(usize::MAX as f32), 0.0];
+        assert_eq!(&*a, &expected);
+        assert_eq!(&g[..4], &expected);
+        assert_eq!(&g[4..], &[1.0, -(usize::MAX as f32)]);
+
+        // The owned-vector API is a positive control for the allocation counter
+        // and must retain the same numeric scores and evaluation accounting.
+        let ((av, gv), allocations) = allocations_during(|| black_box(plan.rank_both(&ctx)));
+        assert_eq!(allocations, 2);
+        assert_eq!(ctx.h_evals.get(), before + 2);
+        assert_eq!(&*a, av);
+        assert_eq!(&*g, gv);
+
+        for greedy in [false, true] {
+            let (rank, allocations) = allocations_during(|| {
+                black_box(if greedy {
+                    plan.queue_rank_gbfs(&ctx)
+                } else {
+                    plan.queue_rank(&ctx)
+                })
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(&*rank, if greedy { &gv } else { &av });
+        }
+        assert_eq!(ctx.h_evals.get(), before + 4);
+    }
+
+    #[test]
     fn queues_and_lazy_reranking_use_exact_plan_ids() {
         let (domain, problem) = task();
         for older in [1 << 24, usize::MAX - 1] {
@@ -1891,9 +1927,9 @@ mod review_tests {
                             let rank = if lazy {
                                 Rank::lazy_proxy(RankTerm::ZERO, plan.num_open_conds(), id)
                             } else if greedy {
-                                params.heuristic.queue_rank(plan.rank_gbfs(&ctx))
+                                plan.queue_rank_gbfs(&ctx)
                             } else {
-                                params.heuristic.queue_rank(plan.rank(&ctx))
+                                plan.queue_rank(&ctx)
                             };
                             queue.push(QueuedPlan {
                                 plan,

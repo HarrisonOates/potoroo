@@ -107,6 +107,28 @@ impl PartialEq for RankTerm {
 impl Eq for RankTerm {}
 
 impl Rank {
+    pub(crate) fn new() -> Self {
+        Self::from_slice(&[])
+    }
+
+    /// Append directly to inline storage during heuristic evaluation. Proxy
+    /// ranks with a saved parent ID are complete and must not be extended.
+    pub(crate) fn push(&mut self, score: f32) {
+        assert!(!self.saved_primary && (self.len as usize) < MAX_TERMS);
+        self.terms[self.len as usize] = score;
+        self.len += 1;
+    }
+
+    pub(crate) fn push_fifo(&mut self, id: usize) {
+        self.push(id as f32);
+        self.mark_fifo(self.len as usize - 1);
+    }
+
+    pub(crate) fn push_lifo(&mut self, id: usize) {
+        self.push(-(id as f32));
+        self.mark_lifo(self.len as usize - 1);
+    }
+
     pub fn from_slice(terms: &[f32]) -> Rank {
         assert!(
             terms.len() <= MAX_TERMS,
