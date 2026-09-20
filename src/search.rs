@@ -20,7 +20,7 @@ use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
 use crate::problem::Metric;
 use crate::problem::Problem;
-use crate::rank::Rank;
+use crate::rank::{Rank, RankTerm};
 use crate::terms::{Object, Term, Variable};
 use crate::types::{Type, OBJECT};
 
@@ -741,7 +741,8 @@ impl PartialOrd for QueuedPlan {
 impl Ord for QueuedPlan {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         // Greater = better, so the heap pops the best plan. Smaller rank is better.
-        self.rank.better_first(&other.rank)
+        self.rank
+            .better_first(&other.rank, || self.plan.id.get(), || other.plan.id.get())
     }
 }
 
@@ -852,7 +853,7 @@ fn pop_next(
     is_alt: bool,
     boost_budget: &mut usize,
     expand_count: &mut usize,
-) -> (Option<Rc<Plan>>, f32) {
+) -> (Option<Rc<Plan>>, RankTerm) {
     // ALT: strict 1:1 alternation between the A*-ordered primary queue and the
     // h-ordered secondary queue. The queue is chosen once per call (i.e. per
     // expansion) so skipping stale entries inside the loop below does not
@@ -870,7 +871,7 @@ fn pop_next(
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return (None, 0.0);
+            return (None, RankTerm::ZERO);
         }
         // In dual-queue mode, decide which queue to pop from.
         let use_secondary = alt_use_secondary
@@ -897,7 +898,7 @@ fn pop_next(
 
         let q = match q {
             Some(q) => q,
-            None => return (None, 0.0),
+            None => return (None, RankTerm::ZERO),
         };
 
         // Skip plans already expanded (stale secondary-queue duplicates).
@@ -906,7 +907,7 @@ fn pop_next(
         }
 
         if !is_lazy || !q.is_lazy {
-            let r0 = q.rank[0];
+            let r0 = q.rank.primary(q.plan.id.get());
             return (Some(q.plan), r0);
         }
 
@@ -918,10 +919,11 @@ fn pop_next(
         } else {
             q.plan.rank(ctx)
         };
-        if real_rank[0].is_finite() {
+        let real_rank = ctx.params.heuristic.queue_rank(real_rank);
+        if real_rank.primary(q.plan.id.get()).is_finite() {
             primary.push(QueuedPlan {
                 plan: q.plan,
-                rank: real_rank.into(),
+                rank: real_rank,
                 is_lazy: false,
             });
         }
@@ -1124,7 +1126,7 @@ fn plan_impl(
     let search_started = Instant::now();
     let mut progress_memory = crate::memory::ProgressMemory::default();
     let n_orders = ctx.params.flaw_orders.len();
-    let inf = f32::INFINITY;
+    let inf = RankTerm::INFINITY;
 
     let initial_plan = match Plan::make_initial_plan(ctx) {
         Some(p) => p,
@@ -1169,7 +1171,7 @@ fn plan_impl(
     };
 
     // Dual-queue boost state.
-    let mut best_h: f32 = inf;
+    let mut best_h = inf;
     let mut boost_budget: usize = 0;
     let mut expand_count: usize = 0; // for 2:1 primary:secondary ratio
 
@@ -1209,7 +1211,7 @@ fn plan_impl(
 
     // The rank[0] of the plan currently being expanded. Used as the lazy proxy
     // for its children in lazy-evaluation modes.
-    let mut current_rank0: f32 = 0.0;
+    let mut current_rank0 = RankTerm::ZERO;
 
     let mut current_plan: Option<Rc<Plan>> = Some(initial_plan.clone());
     generated_plans[current_flaw_order] += 1;
@@ -1218,7 +1220,10 @@ fn plan_impl(
     let mut limit_reached = false;
 
     let mut f_limit = if is_ida {
-        initial_plan.primary_rank(ctx)
+        ctx.params
+            .heuristic
+            .queue_rank(initial_plan.rank(ctx))
+            .primary(initial_plan.id.get())
     } else {
         inf
     };
@@ -1243,31 +1248,34 @@ fn plan_impl(
                     // A schema cost is a lower bound until every argument is
                     // known. Requeue under this algorithm's actual ordering.
                     let (rank, secondary_rank) = if is_bfs {
-                        (vec![inst.num_steps() as f32, inst.id.get() as f32], None)
+                        (Rank::bfs(inst.num_steps(), inst.id.get()), None)
                     } else if is_gbfs {
-                        (inst.rank_gbfs(ctx), None)
+                        (ctx.params.heuristic.queue_rank(inst.rank_gbfs(ctx)), None)
                     } else if is_alt {
                         let (a, g) = inst.rank_both(ctx);
-                        (a, Some(g))
+                        (
+                            ctx.params.heuristic.queue_rank(a),
+                            Some(ctx.params.heuristic.queue_rank(g)),
+                        )
                     } else {
-                        (inst.rank(ctx), None)
+                        (ctx.params.heuristic.queue_rank(inst.rank(ctx)), None)
                     };
-                    if rank[0].is_finite() {
-                        if is_ida && rank[0] > f_limit {
-                            next_f_limit = next_f_limit.min(rank[0]);
+                    let primary = rank.primary(inst.id.get());
+                    if primary.is_finite() {
+                        if is_ida && primary > f_limit {
+                            next_f_limit = next_f_limit.min(primary);
                         } else {
                             if is_dual || is_alt {
                                 secondary_queues[current_flaw_order].push(QueuedPlan {
                                     plan: inst.clone(),
                                     rank: secondary_rank
-                                        .unwrap_or_else(|| vec![inst.id.get() as f32])
-                                        .into(),
+                                        .unwrap_or_else(|| Rank::fifo(inst.id.get())),
                                     is_lazy: false,
                                 });
                             }
                             queues[current_flaw_order].push(QueuedPlan {
                                 plan: inst,
-                                rank: rank.into(),
+                                rank,
                                 is_lazy: false,
                             });
                             num_generated_plans += 1;
@@ -1339,15 +1347,12 @@ fn plan_impl(
 
                 // ALT: GBFS-ordered rank from the shared evaluation, consumed
                 // by the secondary-queue push below.
-                let mut alt_gbfs_rank: Option<Vec<f32>> = None;
+                let mut alt_gbfs_rank: Option<Rank> = None;
 
                 // Compute rank and determine whether to push eagerly or lazily.
                 let (rank, is_lazy_push) = if is_bfs {
                     // BFS: rank by step count, then plan id (FIFO tiebreak).
-                    (
-                        vec![new_plan.num_steps() as f32, new_plan.id.get() as f32],
-                        false,
-                    )
+                    (Rank::bfs(new_plan.num_steps(), new_plan.id.get()), false)
                 } else if is_lazy {
                     if prune_unreachable && has_unreachable_new_open_cond(ctx, &plan, &new_plan) {
                         ctx.pruned.set(ctx.pruned.get() + 1);
@@ -1359,27 +1364,30 @@ fn plan_impl(
                     // would sweep proxy-plateaus breadth-first — exactly where
                     // lazy GBFS stalls.
                     (
-                        vec![
+                        Rank::lazy_proxy(
                             current_rank0,
-                            new_plan.num_open_conds() as f32,
-                            -(new_plan.id.get() as f32),
-                        ],
+                            new_plan.num_open_conds(),
+                            new_plan.id.get(),
+                        ),
                         true,
                     )
                 } else if is_gbfs {
-                    (new_plan.rank_gbfs(ctx), false)
+                    (
+                        ctx.params.heuristic.queue_rank(new_plan.rank_gbfs(ctx)),
+                        false,
+                    )
                 } else if is_alt {
                     // ALT queues the child under both orderings; one shared
                     // evaluation produces the A* rank (primary queue) and the
                     // GBFS rank (secondary queue, pushed below).
                     let (a_rank, g_rank) = new_plan.rank_both(ctx);
-                    alt_gbfs_rank = Some(g_rank);
-                    (a_rank, false)
+                    alt_gbfs_rank = Some(ctx.params.heuristic.queue_rank(g_rank));
+                    (ctx.params.heuristic.queue_rank(a_rank), false)
                 } else {
-                    (new_plan.rank(ctx), false)
+                    (ctx.params.heuristic.queue_rank(new_plan.rank(ctx)), false)
                 };
 
-                let primary = rank[0];
+                let primary = rank.primary(new_plan.id.get());
                 if primary.is_finite() && generated_plans[cfo] < ctx.params.search_limits[cfo] {
                     if is_ida && primary > f_limit {
                         next_f_limit = next_f_limit.min(primary);
@@ -1389,7 +1397,7 @@ fn plan_impl(
                         // Secondary queue: pure FIFO ordered by plan id.
                         secondary_queues[cfo].push(QueuedPlan {
                             plan: new_plan.clone(),
-                            rank: Rank::from_slice(&[new_plan.id.get() as f32]),
+                            rank: Rank::fifo(new_plan.id.get()),
                             is_lazy: is_lazy_push,
                         });
                     } else if is_alt {
@@ -1399,14 +1407,13 @@ fn plan_impl(
                             plan: new_plan.clone(),
                             rank: alt_gbfs_rank
                                 .take()
-                                .expect("ALT child ranked without GBFS rank")
-                                .into(),
+                                .expect("ALT child ranked without GBFS rank"),
                             is_lazy: false,
                         });
                     }
                     queues[cfo].push(QueuedPlan {
                         plan: new_plan,
-                        rank: rank.into(),
+                        rank,
                         is_lazy: is_lazy_push,
                     });
                     generated_plans[cfo] += 1;
@@ -1474,7 +1481,7 @@ fn plan_impl(
                 if generated_plans[current_flaw_order] == 0 {
                     // First visit to this flaw order: start from the initial plan.
                     current_plan = Some(initial_plan.clone());
-                    current_rank0 = 0.0;
+                    current_rank0 = RankTerm::ZERO;
                     generated_plans[current_flaw_order] += 1;
                     num_generated_plans += 1;
                 } else {
@@ -1515,7 +1522,7 @@ fn plan_impl(
         if f_limit != inf {
             // Restart the IDA* search with the relaxed f-limit.
             current_plan = Some(initial_plan.clone());
-            current_rank0 = 0.0;
+            current_rank0 = RankTerm::ZERO;
         } else {
             break;
         }
@@ -1816,6 +1823,7 @@ fn format_float(f: f32) -> String {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    use crate::heuristics::Heuristic;
     use crate::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
 
     fn task() -> (Domain, Problem) {
@@ -1856,6 +1864,54 @@ mod review_tests {
             ctx.register_step(1, action);
             assert_eq!(ctx.var_type(v1, 1), first.var_types[0]);
             assert_eq!(ctx.var_type(v2, 1), second.var_types[0]);
+        }
+    }
+
+    #[test]
+    fn queues_and_lazy_reranking_use_exact_plan_ids() {
+        let (domain, problem) = task();
+        for older in [1 << 24, usize::MAX - 1] {
+            for (name, newest_first) in [
+                ("OC/LIFO", true),
+                ("OC/FIFO", false),
+                ("LIFO/FIFO", true),
+                ("FIFO/LIFO", false),
+            ] {
+                let params = Parameters {
+                    heuristic: Heuristic::parse(name).unwrap(),
+                    ..Parameters::default()
+                };
+                let ctx = SearchContext::new(&domain, &problem, &params);
+                for (lazy, greedy) in [(false, false), (false, true), (true, true)] {
+                    for ids in [[older, older + 1], [older + 1, older]] {
+                        let mut queue = BinaryHeap::new();
+                        for id in ids {
+                            let plan = Plan::make_initial_plan(&ctx).unwrap();
+                            plan.id.set(id);
+                            let rank = if lazy {
+                                Rank::lazy_proxy(RankTerm::ZERO, plan.num_open_conds(), id)
+                            } else if greedy {
+                                params.heuristic.queue_rank(plan.rank_gbfs(&ctx))
+                            } else {
+                                params.heuristic.queue_rank(plan.rank(&ctx))
+                            };
+                            queue.push(QueuedPlan {
+                                plan,
+                                rank,
+                                is_lazy: lazy,
+                            });
+                        }
+                        let first = if newest_first { older + 1 } else { older };
+                        let second = if newest_first { older } else { older + 1 };
+                        for expected in [first, second] {
+                            let (next, _) = pop_next(
+                                &mut queue, None, &ctx, lazy, greedy, false, false, &mut 0, &mut 0,
+                            );
+                            assert_eq!(next.unwrap().id.get(), expected, "{name} lazy={lazy}");
+                        }
+                    }
+                }
+            }
         }
     }
 

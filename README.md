@@ -172,6 +172,11 @@ Equal scores prefer the newest generated plan. The same defaults apply to every
 representation. Any explicit `-h`, `-f`, `-s`, `-a`, or `-w` option overrides the
 corresponding default.
 
+FIFO/LIFO queue terms compare exact integer plan IDs, including beyond the
+16.7-million-node boundary where floating-point IDs used to lose precision.
+Their position in a composed ranking is preserved. See the
+exact queue ordering checks.
+
 An explicit `-h` replaces the whole ranking: use `-h ADD/FIFO` for FIFO ties,
 `-h ADD/OC/LIFO` to prefer fewer open conditions before recency, or `-h ADD`
 for the former ranking without a queue tie policy. Portfolio `--stage`

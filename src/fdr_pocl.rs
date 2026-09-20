@@ -35,7 +35,7 @@ use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
 use crate::params::{ActionCost, Parameters, SearchAlgorithm};
 use crate::plan::{GOAL_ID, INIT_ID};
-use crate::rank::Rank;
+use crate::rank::{Rank, RankTerm};
 use crate::search::{SearchContext, SearchProgress};
 
 /// A committed real step. Init and goal are represented by [`INIT_ID`] and
@@ -1185,7 +1185,7 @@ impl<'a> Planner<'a> {
         let search_started = Instant::now();
         let mut progress_memory = crate::memory::ProgressMemory::default();
         let n_orders = params.flaw_orders.len();
-        let inf = f32::INFINITY;
+        let inf = RankTerm::INFINITY;
         let alg = params.search_algorithm;
         let is_ida = alg == SearchAlgorithm::Ida;
         let is_bfs = alg == SearchAlgorithm::Bfs;
@@ -1255,13 +1255,15 @@ impl<'a> Planner<'a> {
         let mut best_h = inf;
         let mut boost_budget = 0usize;
         let mut expand_count = 0usize;
-        let mut current_rank0 = 0.0f32;
+        let mut current_rank0 = RankTerm::ZERO;
 
         generated_per_order[0] = 1;
         stats.nodes_generated = 1;
         let mut current_plan = Some(initial.clone());
         let mut f_limit = if is_ida {
-            self.rank_both(&initial, params, &mut stats).0[0]
+            self.rank_both(&initial, params, &mut stats)
+                .0
+                .primary(initial.id)
         } else {
             inf
         };
@@ -1377,7 +1379,7 @@ impl<'a> Planner<'a> {
                     let child = Rc::new(child);
                     let mut alt_gbfs_rank = None;
                     let (rank, lazy_push) = if is_bfs {
-                        (vec![child.num_steps() as f32, child.id as f32], false)
+                        (Rank::bfs(child.num_steps(), child.id), false)
                     } else if is_lazy {
                         if params.heuristic.needs_planning_graph()
                             && !self.open_estimate(&child, false).cost.is_finite()
@@ -1386,11 +1388,7 @@ impl<'a> Planner<'a> {
                             continue;
                         }
                         (
-                            vec![
-                                current_rank0,
-                                child.num_open_conditions() as f32,
-                                -(child.id as f32),
-                            ],
+                            Rank::lazy_proxy(current_rank0, child.num_open_conditions(), child.id),
                             true,
                         )
                     } else if is_gbfs {
@@ -1403,7 +1401,7 @@ impl<'a> Planner<'a> {
                         (self.rank_both(&child, params, &mut stats).0, false)
                     };
 
-                    let primary = rank[0];
+                    let primary = rank.primary(child.id);
                     if primary.is_finite()
                         && generated_per_order[order_index] < params.search_limits[order_index]
                     {
@@ -1414,7 +1412,7 @@ impl<'a> Planner<'a> {
                         if is_dual {
                             secondary_queues[order_index].push(QueuedPlan {
                                 plan: child.clone(),
-                                rank: Rank::from_slice(&[child.id as f32]),
+                                rank: Rank::fifo(child.id),
                                 is_lazy: lazy_push,
                             });
                         } else if is_alt {
@@ -1422,14 +1420,13 @@ impl<'a> Planner<'a> {
                                 plan: child.clone(),
                                 rank: alt_gbfs_rank
                                     .take()
-                                    .expect("ALT child has both rank vectors")
-                                    .into(),
+                                    .expect("ALT child has both rank vectors"),
                                 is_lazy: false,
                             });
                         }
                         queues[order_index].push(QueuedPlan {
                             plan: child,
-                            rank: rank.into(),
+                            rank,
                             is_lazy: lazy_push,
                         });
                         generated_per_order[order_index] += 1;
@@ -1499,7 +1496,7 @@ impl<'a> Planner<'a> {
                 }
                 if generated_per_order[current_order] == 0 {
                     current_plan = Some(initial.clone());
-                    current_rank0 = 0.0;
+                    current_rank0 = RankTerm::ZERO;
                     generated_per_order[current_order] = 1;
                     stats.nodes_generated += 1;
                 } else {
@@ -1534,7 +1531,7 @@ impl<'a> Planner<'a> {
             f_limit = next_f_limit;
             if is_ida && f_limit.is_finite() {
                 current_plan = Some(initial.clone());
-                current_rank0 = 0.0;
+                current_rank0 = RankTerm::ZERO;
             } else {
                 break;
             }
@@ -2314,7 +2311,7 @@ impl<'a> Planner<'a> {
         plan: &PartialPlan,
         params: &Parameters,
         stats: &mut SearchStats,
-    ) -> (Vec<f32>, Vec<f32>) {
+    ) -> (Rank, Rank) {
         // Only read the clock when `h_eval_ms` will be reported; see
         // `Parameters::time_h_evals`.
         let start = params.time_h_evals.then(Instant::now);
@@ -2324,7 +2321,10 @@ impl<'a> Planner<'a> {
             stats.h_eval_nanos += start.elapsed().as_nanos();
             stats.h_eval_ms = stats.h_eval_nanos / 1_000_000;
         }
-        result
+        (
+            params.heuristic.queue_rank(result.0),
+            params.heuristic.queue_rank(result.1),
+        )
     }
 
     fn compute_rank_both(&self, plan: &PartialPlan, params: &Parameters) -> (Vec<f32>, Vec<f32>) {
@@ -2666,7 +2666,7 @@ impl<'a> Planner<'a> {
         boost_budget: &mut usize,
         expand_count: &mut usize,
         stats: &mut SearchStats,
-    ) -> (Option<Rc<PartialPlan>>, f32) {
+    ) -> (Option<Rc<PartialPlan>>, RankTerm) {
         let alt_use_secondary = is_alt && {
             *expand_count += 1;
             (*expand_count).is_multiple_of(2)
@@ -2676,7 +2676,7 @@ impl<'a> Planner<'a> {
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
-                return (None, 0.0);
+                return (None, RankTerm::ZERO);
             }
             let use_secondary = alt_use_secondary
                 || (is_dual && *boost_budget == 0 && {
@@ -2696,23 +2696,24 @@ impl<'a> Planner<'a> {
                 primary.pop()
             };
             let Some(queued) = queued else {
-                return (None, 0.0);
+                return (None, RankTerm::ZERO);
             };
             if (is_dual || is_alt) && queued.plan.expanded.get() {
                 continue;
             }
             if !is_lazy || !queued.is_lazy {
-                return (Some(queued.plan), queued.rank[0]);
+                let primary = queued.rank.primary(queued.plan.id);
+                return (Some(queued.plan), primary);
             }
             let rank = if is_gbfs {
                 self.rank_both(&queued.plan, params, stats).1
             } else {
                 self.rank_both(&queued.plan, params, stats).0
             };
-            if rank[0].is_finite() {
+            if rank.primary(queued.plan.id).is_finite() {
                 primary.push(QueuedPlan {
                     plan: queued.plan,
-                    rank: rank.into(),
+                    rank,
                     is_lazy: false,
                 });
             }
@@ -3110,7 +3111,8 @@ impl PartialOrd for QueuedPlan {
 
 impl Ord for QueuedPlan {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.rank.better_first(&other.rank)
+        self.rank
+            .better_first(&other.rank, || self.plan.id, || other.plan.id)
     }
 }
 
@@ -3129,6 +3131,59 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn queues_and_lazy_reranking_use_exact_plan_ids() {
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        for older in [1 << 24, usize::MAX - 1] {
+            for (name, newest_first) in [
+                ("OC/LIFO", true),
+                ("OC/FIFO", false),
+                ("LIFO/FIFO", true),
+                ("FIFO/LIFO", false),
+            ] {
+                let params = Parameters {
+                    heuristic: Heuristic::parse(name).unwrap(),
+                    ..Parameters::default()
+                };
+                for (lazy, greedy) in [(false, false), (false, true), (true, true)] {
+                    for ids in [[older, older + 1], [older + 1, older]] {
+                        let mut queue = BinaryHeap::new();
+                        let mut stats = SearchStats::default();
+                        for id in ids {
+                            let mut plan = PartialPlan::initial(&task);
+                            plan.id = id;
+                            let rank = if lazy {
+                                Rank::lazy_proxy(RankTerm::ZERO, plan.num_open_conditions(), id)
+                            } else {
+                                let (a, g) = planner.rank_both(&plan, &params, &mut stats);
+                                if greedy {
+                                    g
+                                } else {
+                                    a
+                                }
+                            };
+                            queue.push(QueuedPlan {
+                                plan: Rc::new(plan),
+                                rank,
+                                is_lazy: lazy,
+                            });
+                        }
+                        let first = if newest_first { older + 1 } else { older };
+                        let second = if newest_first { older } else { older + 1 };
+                        for expected in [first, second] {
+                            let (next, _) = planner.pop_next(
+                                &mut queue, None, &params, lazy, greedy, false, false, &mut 0,
+                                &mut 0, &mut stats,
+                            );
+                            assert_eq!(next.unwrap().id, expected, "{name} lazy={lazy}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn h2_strengthens_combined_pruning_and_preserves_reachable_goals() {

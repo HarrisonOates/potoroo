@@ -8,6 +8,7 @@ use crate::flaws::Flaw;
 use crate::plan::Plan;
 use crate::planning_graph::{formula_value, PlanningGraph};
 use crate::predicates::PredicateTable;
+use crate::rank::Rank;
 use crate::search::SearchContext;
 
 /// A plan-ranking heuristic value. `MAKESPAN` (temporal) is deferred.
@@ -237,6 +238,27 @@ impl Heuristic {
     /// same `-h` configuration without translating SAS+ facts back to literals.
     pub(crate) fn terms(&self) -> &[HVal] {
         &self.h
+    }
+
+    /// Preserve the configured positions of integer ID terms when a numeric
+    /// heuristic vector enters a queue. The public score-vector APIs remain
+    /// available for diagnostics; their f32 ID approximations must never be
+    /// used to compare queued plans.
+    pub(crate) fn queue_rank(&self, values: Vec<f32>) -> Rank {
+        let mut rank = Rank::from_slice(&values);
+        assert!(values.len() == self.h.len() || values.len() == self.h.len() + 2);
+        for (index, term) in self.h.iter().enumerate() {
+            match term {
+                HVal::Fifo => rank.mark_fifo(index),
+                HVal::Lifo => rank.mark_lifo(index),
+                _ => {}
+            }
+        }
+        if values.len() == self.h.len() + 2 {
+            // GBFS appends open-condition count and LIFO after user terms.
+            rank.mark_lifo(values.len() - 1);
+        }
+        rank
     }
 
     /// Fills `rank` with the heuristic ranks for `plan`. Lower is better.
