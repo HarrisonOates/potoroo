@@ -1369,6 +1369,10 @@ impl<'a> Planner<'a> {
                             continue;
                         }
                     }
+                    if self.has_unresolvable_threat(&child) {
+                        stats.pruned += 1;
+                        continue;
+                    }
                     if self.structurally_pruned(&child) {
                         stats.pruned += 1;
                         continue;
@@ -2086,13 +2090,42 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// A refinement cannot relax an existing ordering or a step's required
+    /// facts. If a live threat has neither an ordering repair nor a possible
+    /// confrontation, no descendant can complete this plan. Reject it before
+    /// ranking and queueing, rather than waiting for flaw selection to find it.
+    fn has_unresolvable_threat(&self, plan: &PartialPlan) -> bool {
+        // Threats are sorted by link index; links are stored newest first.
+        // Walk both backwards to avoid a chain lookup for every threat.
+        let mut links = plan.links();
+        let mut remaining_links = plan.num_links;
+        let mut link = None;
+        for threat in plan.threats.iter().rev() {
+            while remaining_links > threat.link {
+                link = links.next();
+                remaining_links -= 1;
+            }
+            let link = link.expect("threat refers to an existing causal link");
+            if self.threat_ordering_count(plan, threat, link) == 0
+                && self.confrontations(plan, threat).is_empty()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn threat_refinement_count(
         &self,
         plan: &PartialPlan,
         threat: &Threat,
         confrontations: usize,
     ) -> i32 {
-        let link = plan.threatened_link(threat);
+        self.threat_ordering_count(plan, threat, plan.threatened_link(threat))
+            .saturating_add(i32::try_from(confrontations).unwrap_or(i32::MAX))
+    }
+
+    fn threat_ordering_count(&self, plan: &PartialPlan, threat: &Threat, link: &CausalLink) -> i32 {
         let demote = link.producer != INIT_ID
             && plan.orderings.possibly_before(
                 threat.step,
@@ -2107,9 +2140,7 @@ impl<'a> Planner<'a> {
                 threat.step,
                 StepTime::AtEnd,
             );
-        i32::from(demote)
-            .saturating_add(i32::from(promote))
-            .saturating_add(i32::try_from(confrontations).unwrap_or(i32::MAX))
+        i32::from(demote) + i32::from(promote)
     }
 
     fn open_refinement_count(&self, plan: &PartialPlan, open: &OpenCondition) -> i32 {
@@ -4454,6 +4485,99 @@ mod tests {
             refinements[0].rediscover_threats(&task)
         );
         assert!(is_ordered_before(&refinements[0].orderings, 2, 1));
+    }
+
+    #[test]
+    fn dead_threat_check_preserves_confrontation_and_demotion() {
+        let mut task = breaker_task();
+        let (plan, _) = trapped_breaker_plan();
+        assert!(!Planner::new(&task).has_unresolvable_threat(&plan));
+
+        let mut committed = plan.clone();
+        committed.push_open(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(2, 0),
+        });
+        assert!(Planner::new(&task).has_unresolvable_threat(&committed));
+
+        // An unconditional effect cannot be confronted, but moving the step
+        // before the producer remains valid when their ordering permits it.
+        task.operators[1].effects[1].conditions.clear();
+        let planner = Planner::new(&task);
+        assert!(planner.has_unresolvable_threat(&plan));
+        let mut unordered = plan.clone();
+        unordered.orderings = Rc::new(BinaryOrderings::new());
+        for step in 1..=2 {
+            unordered.orderings = unordered
+                .orderings
+                .refine_with_step(
+                    Ordering::new(step, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                    step,
+                )
+                .unwrap();
+        }
+        assert!(!planner.has_unresolvable_threat(&unordered));
+        assert_eq!(
+            planner
+                .resolve_threat(&unordered, &unordered.threats[0])
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_discards_dead_initial_links_but_keeps_later_achievers() {
+        let mut task = shared_effect_task();
+        task.initial[0] = 1;
+        task.operators[0].effects[0].post = 0;
+        task.operators[0].effects[0].pre = None;
+        task.operators[0].cost = 3;
+        // The only way to achieve right=on destroys left=on. An initial-state
+        // link protecting left=on until the goal therefore cannot survive it.
+        for restore in [false, true] {
+            if restore {
+                task.operators.push(Operator {
+                    name: "restore-left".into(),
+                    prevail: vec![],
+                    effects: vec![Effect {
+                        conditions: vec![],
+                        variable: 0,
+                        pre: Some(0),
+                        post: 1,
+                    }],
+                    cost: 7,
+                });
+            }
+            for algorithm in [
+                SearchAlgorithm::A,
+                SearchAlgorithm::Bfs,
+                SearchAlgorithm::Gbfs,
+                SearchAlgorithm::LazyGbfsDual,
+                SearchAlgorithm::Alt,
+            ] {
+                let params = Parameters {
+                    search_algorithm: algorithm,
+                    flaw_orders: vec![FlawSelectionOrder::parse("ZLIFO").unwrap()],
+                    heuristic: Heuristic::parse("ADD/LIFO").unwrap(),
+                    search_limits: vec![1_000],
+                    ..Parameters::default()
+                };
+                let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+                assert!(
+                    stats.pruned > 0,
+                    "{algorithm:?} must reject the dead initial link"
+                );
+                if restore {
+                    let Outcome::Solved(solution) = outcome else {
+                        panic!("{algorithm:?} lost the later achiever");
+                    };
+                    assert_eq!(solution.operators, vec![0, 1]);
+                    assert_eq!(solution.plan.cost, 10);
+                } else {
+                    assert!(matches!(outcome, Outcome::NoSolution), "{algorithm:?}");
+                }
+            }
+        }
     }
 
     #[test]
