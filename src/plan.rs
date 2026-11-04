@@ -17,6 +17,7 @@ use crate::effect::Effect;
 use crate::flaws::{Flaw, FormulaTime, OpenCondition, Unsafe};
 use crate::formula::{Atom, Formula, Literal};
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
+use crate::rank::Rank;
 use crate::search::SearchContext;
 use crate::terms::{Term, Variable};
 
@@ -105,6 +106,10 @@ pub struct Plan {
     pub num_open_conds: usize,
     /// Serial number (set before rank is computed).
     pub id: std::cell::Cell<usize>,
+    /// Set once the search has expanded this plan. Dual-queue algorithms
+    /// queue a plan twice and skip the second entry by this flag, which costs
+    /// nothing per plan where a set of expanded ids grew with the search.
+    pub expanded: std::cell::Cell<bool>,
 }
 
 impl Plan {
@@ -135,63 +140,40 @@ impl Plan {
     }
 
     pub fn primary_rank(&self, ctx: &SearchContext) -> f32 {
-        self.rank(ctx)[0]
+        self.queue_rank(ctx)[0]
     }
 
-    /// Full rank vector. Each generated plan is ranked exactly once (the result
-    /// is carried by its queue entry), so no caching is kept on the plan itself
-    /// — that just duplicated the vector for millions of queued plans.
+    /// Full numeric rank vector for callers that need an owned diagnostic
+    /// vector. Search builds inline ranks instead.
     pub fn rank(&self, ctx: &SearchContext) -> Vec<f32> {
-        let type_ctx = ctx.type_ctx();
-        let pg = if ctx.params.heuristic.needs_planning_graph() {
-            Some(ctx.planning_graph())
-        } else {
-            None
-        };
-        let start = ctx.h_eval_start();
-        let rank = ctx.params.heuristic.plan_rank(
-            self,
-            ctx.params.weight,
-            &ctx.domain.predicates,
-            &type_ctx,
-            pg.as_deref(),
-            ctx,
-        );
-        ctx.record_h_eval(start);
-        // Most generated plans are ranked once and then parked in a queue;
-        // don't let each retain its bindings lookup index.
-        self.bindings.clear_index();
-        rank
+        self.queue_rank(ctx).to_vec()
     }
 
     /// Both rank vectors — A* ([`rank`](Self::rank)) and GBFS
     /// ([`rank_gbfs`](Self::rank_gbfs)) — from a single heuristic evaluation.
-    /// Used by `ALT`, which queues every child under both orderings; counts as
-    /// one h evaluation since the underlying work is done once.
+    /// Counts as one h evaluation since the underlying work is done once.
     pub fn rank_both(&self, ctx: &SearchContext) -> (Vec<f32>, Vec<f32>) {
-        let type_ctx = ctx.type_ctx();
-        let pg = if ctx.params.heuristic.needs_planning_graph() {
-            Some(ctx.planning_graph())
-        } else {
-            None
-        };
-        let start = ctx.h_eval_start();
-        let ranks = ctx.params.heuristic.plan_rank_both(
-            self,
-            ctx.params.weight,
-            &ctx.domain.predicates,
-            &type_ctx,
-            pg.as_deref(),
-            ctx,
-        );
-        ctx.record_h_eval(start);
-        self.bindings.clear_index();
-        ranks
+        let (rank, grank) = self.queue_ranks(ctx);
+        (rank.to_vec(), grank.to_vec())
     }
 
-    /// Greedy-BFS rank vector: h-only (no g component), with steps and
-    /// plan_id appended as tiebreakers. Used by GBFS, LGBFS, and LGBFS-D.
+    /// Greedy rank's numeric scores for diagnostic callers. After the selected
+    /// heuristic terms come open-condition count and the LIFO ID approximation.
     pub fn rank_gbfs(&self, ctx: &SearchContext) -> Vec<f32> {
+        self.queue_rank_gbfs(ctx).to_vec()
+    }
+
+    pub(crate) fn queue_rank(&self, ctx: &SearchContext) -> Rank {
+        self.queue_ranks(ctx).0
+    }
+
+    pub(crate) fn queue_rank_gbfs(&self, ctx: &SearchContext) -> Rank {
+        self.queue_ranks(ctx).1
+    }
+
+    /// Both inline queue ranks from one evaluation. ALT needs both; other
+    /// algorithms use one. Neither rank allocates or stays cached on the plan.
+    pub(crate) fn queue_ranks(&self, ctx: &SearchContext) -> (Rank, Rank) {
         let type_ctx = ctx.type_ctx();
         let pg = if ctx.params.heuristic.needs_planning_graph() {
             Some(ctx.planning_graph())
@@ -199,7 +181,7 @@ impl Plan {
             None
         };
         let start = ctx.h_eval_start();
-        let rank = ctx.params.heuristic.plan_rank_gbfs(
+        let ranks = ctx.params.heuristic.plan_queue_ranks(
             self,
             ctx.params.weight,
             &ctx.domain.predicates,
@@ -211,7 +193,7 @@ impl Plan {
         // Most generated plans are ranked once and then parked in a queue;
         // don't let each retain its bindings lookup index.
         self.bindings.clear_index();
-        rank
+        ranks
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -241,6 +223,7 @@ impl Plan {
             open_conds,
             num_open_conds,
             id: std::cell::Cell::new(0),
+            expanded: std::cell::Cell::new(false),
         })
     }
 
@@ -334,26 +317,49 @@ impl Plan {
     fn handle_unsafe(&self, ctx: &SearchContext, plans: &mut Vec<Rc<Plan>>, unsafe_: &Unsafe) {
         let link = &unsafe_.link;
         let mut unifier: Vec<Binding> = Vec::new();
-        let affected = self.orderings.possibly_not_after(
-            link.from_id,
-            link.effect_time,
-            unsafe_.step_id,
-            StepTime::AtEnd,
-        ) && self.orderings.possibly_not_before(
-            link.to_id,
-            link.condition_time.end_time(),
-            unsafe_.step_id,
-            StepTime::AtEnd,
-        ) && self.bindings.affects_mgu(
-            &ctx.type_ctx(),
-            &mut unifier,
-            &unsafe_.effect.literal,
-            unsafe_.step_id,
-            &link.condition,
-            link.to_id,
-        );
+        let placement_admits = unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id)
+            && self.orderings.possibly_not_after(
+                link.from_id,
+                link.effect_time,
+                unsafe_.step_id,
+                StepTime::AtEnd,
+            )
+            && self.orderings.possibly_not_before(
+                link.to_id,
+                link.condition_time.end_time(),
+                unsafe_.step_id,
+                StepTime::AtEnd,
+            );
+        let affected = placement_admits
+            && self.bindings.affects_mgu(
+                &ctx.type_ctx(),
+                &mut unifier,
+                &unsafe_.effect.literal,
+                unsafe_.step_id,
+                &link.condition,
+                link.to_id,
+            );
+        // With `-p params`, a threat whose unifier the parameter domains rule out
+        // is not a flaw: dropping it here saves the two or three children that
+        // resolving it would have cost.
+        let affected = affected
+            && !(ctx.params.prune.params
+                && crate::search::threat_unifier_impossible(ctx, &unifier));
+
         if affected {
             self.separate(ctx, plans, unsafe_, &unifier);
+            self.promote(ctx, plans, unsafe_);
+            self.demote(ctx, plans, unsafe_);
+        } else if placement_admits
+            && effect_e_deletes(ctx, &self.bindings, &unsafe_.effect, unsafe_.step_id, link)
+        {
+            // An e-deletion threat has no unifier to separate: the two atoms
+            // are already ground and a mutex group rules them out together, so
+            // the only resolvers are ordering ones. If neither is consistent
+            // the conflict is unavoidable and the plan has no children, which
+            // is the correct outcome.
             self.promote(ctx, plans, unsafe_);
             self.demote(ctx, plans, unsafe_);
         } else {
@@ -375,8 +381,8 @@ impl Plan {
     }
 
     /// The goal whose achievement separates `unsafe_`: the disjunction of the
-    /// inequalities that would break the threatening unifier, plus — for a
-    /// conditional effect — the negation of its guard (confrontation).
+    /// inequalities that would break the threatening unifier, plus the
+    /// negation of its strengthened guard (confrontation).
     ///
     /// Shared by [`Self::separate`] and [`Self::separate_count`] so a refinement
     /// is never counted on a different formula from the one it produces. The
@@ -411,11 +417,15 @@ impl Plan {
                 }
             }
         }
-        // Conditional effect condition (negated) — only when the effect is
-        // conditional. For a universally-quantified effect, wrap the negated
-        // condition in a fresh-variable `forall` so that *no* instance of the
-        // effect fires.
-        let effect_cond = &unsafe_.effect.condition;
+        // The strengthened guard includes cancellation by a same-step add.
+        // Confrontation may therefore resolve a delete by equating its arguments
+        // with that add, or by establishing the restoring add's condition.
+        // For a universally-quantified effect, wrap the negated guard in a
+        // fresh-variable `forall` so that no instance of the effect fires.
+        let effect_cond = Formula::and(
+            unsafe_.effect.condition.clone(),
+            unsafe_.effect.link_condition.clone(),
+        );
         if !effect_cond.tautology() {
             let cond_goal = if unsafe_.effect.parameters.is_empty() {
                 effect_cond.negation()
@@ -558,7 +568,7 @@ impl Plan {
                 self.reuse_step(ctx, plans, &literal, open_cond, achievers);
             }
             if let Literal::Negation(atom) = &literal {
-                self.new_cw_link(ctx, plans, atom, open_cond);
+                self.new_cw_link(ctx, plans, atom, open_cond, false);
             }
         } else if let Some((left, right)) = open_cond.inequality() {
             self.handle_inequality(ctx, plans, left, right, open_cond);
@@ -659,8 +669,30 @@ impl Plan {
         open_cond: &OpenCondition,
         achievers: &[(Rc<StepAction>, usize)],
     ) {
+        // Under `-p symmetry`, a ground step may introduce an interchangeable
+        // object only if it is the first of its class the plan has not used;
+        // the objects a plan uses are exactly its steps' arguments. Lifted
+        // steps carry no arguments yet and pass through. See `crate::symmetry`.
+        let symmetries = ctx
+            .params
+            .prune
+            .symmetry
+            .then(|| ctx.object_symmetries())
+            .filter(|symmetries| !symmetries.is_empty());
+        let used: Option<crate::fasthash::FastSet<crate::terms::Object>> =
+            symmetries.as_ref().map(|_| {
+                chain::iter(&self.steps)
+                    .flat_map(|step| step.action.arguments.iter().copied())
+                    .collect()
+            });
         for (action, effect_idx) in achievers {
             if !action.synthetic() {
+                if let (Some(symmetries), Some(used)) = (&symmetries, &used) {
+                    if !symmetries.canonical_arguments(&action.arguments, |o| used.contains(&o)) {
+                        ctx.pruned.set(ctx.pruned.get() + 1);
+                        continue;
+                    }
+                }
                 let step = Step {
                     id: self.num_steps + 1,
                     action: action.clone(),
@@ -733,17 +765,20 @@ impl Plan {
         }
     }
 
-    /// Adds a child plan with a closed-world link for a negative literal.
+    /// Supports a negative literal from the closed world. Test-only calls run
+    /// the same feasibility gates without constructing a child or its threats.
     fn new_cw_link(
         &self,
         ctx: &SearchContext,
         plans: &mut Vec<Rc<Plan>>,
         negation_atom: &Atom,
         open_cond: &OpenCondition,
-    ) {
+        test_only: bool,
+    ) -> bool {
         // The init action's effects are the only effects considered (closed
         // world over the initial state).
         let mut goals = Rc::new(Formula::True);
+        let positive = Literal::Atom(negation_atom.clone());
         for effect in ctx.init_action.effects.iter() {
             let mut mgu: Vec<Binding> = Vec::new();
             if self.bindings.unify_mgu(
@@ -751,12 +786,12 @@ impl Plan {
                 &mut mgu,
                 &effect.literal,
                 INIT_ID,
-                &Literal::Atom(negation_atom.clone()),
+                &positive,
                 open_cond.step_id,
             ) {
                 if mgu.is_empty() {
                     // Impossible to separate goal from init: no cw link.
-                    return;
+                    return false;
                 }
                 let mut binds = Rc::new(Formula::False);
                 for subst in &mgu {
@@ -768,7 +803,11 @@ impl Plan {
                 goals = Formula::and(goals, binds);
             }
         }
-        let mut new_open_conds = chain::remove(&self.open_conds, open_cond);
+        let mut new_open_conds = if test_only {
+            None
+        } else {
+            chain::remove(&self.open_conds, open_cond)
+        };
         let mut new_num_open_conds = self.num_open_conds - 1;
         let mut new_bindings: Vec<Binding> = Vec::new();
         let added = add_goal(
@@ -778,10 +817,13 @@ impl Plan {
             &mut new_bindings,
             goals,
             INIT_ID,
-            false,
+            test_only,
         );
         if added {
-            if let Some(bindings) = self.bindings.add(&ctx.type_ctx(), &new_bindings, false) {
+            if let Some(bindings) = self.bindings.add(&ctx.type_ctx(), &new_bindings, test_only) {
+                if test_only {
+                    return true;
+                }
                 // New link from init (id 0).
                 let link = Link {
                     from_id: INIT_ID,
@@ -819,8 +861,10 @@ impl Plan {
                     new_open_conds,
                     new_num_open_conds,
                 ));
+                return true;
             }
         }
+        false
     }
 
     /// Builds the child plan that supports `open_cond` with `effect` of `step`,
@@ -1008,6 +1052,184 @@ impl Plan {
     }
 }
 
+/// Resumable counts for one flaw in one immutable plan. Kept only during flaw
+/// selection, never shared between plans or after their bindings change.
+/// Construct lazily: unrestricted LIFO/FIFO criteria need no counting at all.
+pub(crate) struct OpenConditionCounts<'a> {
+    plan: &'a Plan,
+    open: &'a OpenCondition,
+    literal: Option<Literal>,
+    new_cursor: usize,
+    new_count: i32,
+    reuse_step: Option<&'a Chain<Step>>,
+    reuse_cursor: usize,
+    reuse_count: i32,
+    cw_done: bool,
+    formula_count: Option<i32>,
+    #[cfg(test)]
+    tested_candidates: usize,
+}
+
+impl<'a> OpenConditionCounts<'a> {
+    pub(crate) fn new(plan: &'a Plan, open: &'a OpenCondition) -> Self {
+        Self {
+            plan,
+            open,
+            literal: open.literal(),
+            new_cursor: 0,
+            new_count: 0,
+            reuse_step: plan.steps.as_deref(),
+            reuse_cursor: 0,
+            reuse_count: 0,
+            cw_done: false,
+            formula_count: None,
+            #[cfg(test)]
+            tested_candidates: 0,
+        }
+    }
+
+    fn new_up_to(&mut self, ctx: &SearchContext, cap: i32) -> i32 {
+        let Some(literal) = &self.literal else {
+            return 0;
+        };
+        let achievers = ctx.literal_achievers(literal).unwrap_or(&[]);
+        let mut unused = Vec::new();
+        while self.new_count < cap && self.new_cursor < achievers.len() {
+            let (action, index) = &achievers[self.new_cursor];
+            self.new_cursor += 1;
+            if action.synthetic() {
+                continue;
+            }
+            let step = Step {
+                id: self.plan.num_steps + 1,
+                action: action.clone(),
+            };
+            ctx.register_step(step.id, action);
+            #[cfg(test)]
+            {
+                self.tested_candidates += 1;
+            }
+            if self.plan.new_link(
+                ctx,
+                &mut unused,
+                &step,
+                &action.effects[*index],
+                literal,
+                self.open,
+                true,
+            ) {
+                self.new_count += 1;
+            }
+        }
+        self.new_count
+    }
+
+    fn reuse_up_to(&mut self, ctx: &SearchContext, cap: i32) -> i32 {
+        let Some(literal) = &self.literal else {
+            return 0;
+        };
+        let achievers = ctx.literal_achievers(literal).unwrap_or(&[]);
+        let mut unused = Vec::new();
+        while self.reuse_count < cap {
+            let Some(node) = self.reuse_step else {
+                break;
+            };
+            let step = &node.head;
+            if !self.plan.orderings.possibly_before(
+                step.id,
+                StepTime::AtEnd,
+                self.open.step_id,
+                self.open.when.start_time(),
+            ) {
+                self.reuse_step = node.tail.as_deref();
+                self.reuse_cursor = 0;
+                continue;
+            }
+            while self.reuse_cursor < achievers.len() && self.reuse_count < cap {
+                let (action, index) = &achievers[self.reuse_cursor];
+                self.reuse_cursor += 1;
+                if !Rc::ptr_eq(action, &step.action) {
+                    continue;
+                }
+                #[cfg(test)]
+                {
+                    self.tested_candidates += 1;
+                }
+                if self.plan.new_link(
+                    ctx,
+                    &mut unused,
+                    step,
+                    &action.effects[*index],
+                    literal,
+                    self.open,
+                    true,
+                ) {
+                    self.reuse_count += 1;
+                }
+            }
+            if self.reuse_cursor == achievers.len() {
+                self.reuse_step = node.tail.as_deref();
+                self.reuse_cursor = 0;
+            }
+        }
+        if self.reuse_count < cap && !self.cw_done {
+            self.cw_done = true;
+            if let Literal::Negation(atom) = literal {
+                #[cfg(test)]
+                {
+                    self.tested_candidates += 1;
+                }
+                if self
+                    .plan
+                    .new_cw_link(ctx, &mut unused, atom, self.open, true)
+                {
+                    self.reuse_count += 1;
+                }
+            }
+        }
+        self.reuse_count
+    }
+
+    pub(crate) fn within(&mut self, ctx: &SearchContext, limit: i32) -> bool {
+        if limit < 0 {
+            return false;
+        }
+        if self.literal.is_none() {
+            return self.exact(ctx) <= limit;
+        }
+        let added = self.new_up_to(ctx, limit.saturating_add(1));
+        added <= limit && self.reuse_up_to(ctx, (limit - added).saturating_add(1)) <= limit - added
+    }
+
+    pub(crate) fn exact(&mut self, ctx: &SearchContext) -> i32 {
+        if self.literal.is_some() {
+            return self
+                .new_up_to(ctx, i32::MAX)
+                .saturating_add(self.reuse_up_to(ctx, i32::MAX));
+        }
+        *self.formula_count.get_or_insert_with(|| {
+            let mut plans = Vec::new();
+            if self.open.disjunction().is_some() {
+                self.plan.handle_disjunction(ctx, &mut plans, self.open);
+            } else if let Some((left, right)) = self.open.inequality() {
+                self.plan
+                    .handle_inequality(ctx, &mut plans, left, right, self.open);
+            } else {
+                panic!("unknown kind of open condition");
+            }
+            i32::try_from(plans.len()).unwrap_or(i32::MAX)
+        })
+    }
+
+    pub(crate) fn has_new(&mut self, ctx: &SearchContext) -> bool {
+        self.new_up_to(ctx, 1) > 0
+    }
+
+    pub(crate) fn has_reuse(&mut self, ctx: &SearchContext) -> bool {
+        self.reuse_up_to(ctx, 1) > 0
+    }
+}
+
 // -- Refinement counting (test-only) -----------------------------------------
 //
 // Count how many child plans a flaw would produce without allocating them.
@@ -1021,9 +1243,12 @@ impl Plan {
         let lt2 = link.condition_time.end_time();
         let et = StepTime::AtEnd;
         let mut unifier: Vec<Binding> = Vec::new();
-        if self
-            .orderings
-            .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+        if unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id)
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
             && self
                 .orderings
                 .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
@@ -1118,9 +1343,13 @@ impl Plan {
         let lt2 = link.condition_time.end_time();
         let et = StepTime::AtEnd;
         let mut unifier: Vec<Binding> = Vec::new();
-        let affected = self
-            .orderings
-            .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+        let possible = unsafe_
+            .effect
+            .threat_possible(&self.bindings, unsafe_.step_id);
+        let affected = possible
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
             && self
                 .orderings
                 .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
@@ -1132,6 +1361,30 @@ impl Plan {
                 &link.condition,
                 link.to_id,
             );
+        let e_deleting = possible
+            && !affected
+            && self
+                .orderings
+                .possibly_not_after(link.from_id, lt1, unsafe_.step_id, et)
+            && self
+                .orderings
+                .possibly_not_before(link.to_id, lt2, unsafe_.step_id, et)
+            && effect_e_deletes(ctx, &self.bindings, &unsafe_.effect, unsafe_.step_id, link);
+        if e_deleting {
+            // No separation, but promotion and demotion still apply, so the
+            // flaw order must not read this as an irremediable zero.
+            let mut r = 0;
+            if *promotable < 0 {
+                *promotable = self.promotable(unsafe_);
+            }
+            r += *promotable;
+            if *demotable < 0 {
+                *demotable = self.demotable(unsafe_);
+            }
+            r += *demotable;
+            *refinements = r;
+            return r <= limit;
+        }
         if affected {
             let mut r = 0;
             if *separable < 0 {
@@ -1315,10 +1568,9 @@ impl Plan {
             }
         }
         if let Literal::Negation(atom) = literal {
-            // The closed-world link still builds its child: it is at most one
-            // per open condition, and its goal is a disjunction the feasibility
-            // path would have to reproduce.
-            self.new_cw_link(ctx, &mut plans, atom, open_cond);
+            // Keep this legacy counting API as a construction-based reference
+            // for the feasibility-only closed-world path in OpenConditionCounts.
+            self.new_cw_link(ctx, &mut plans, atom, open_cond, false);
             found += plans.len() as i32;
             if found > limit {
                 return false;
@@ -1457,8 +1709,27 @@ fn add_goal(
                     new_bindings.push(Binding::new(var, var_id, term, term_id, is_eq));
                 }
             }
-            Formula::Exists { body, .. } => {
-                goals.push(body.clone());
+            Formula::Exists { params, body } => {
+                // Each occurrence needs its own witnesses, including copies
+                // made by a surrounding forall. Record even unused witnesses:
+                // an empty type or inconsistent inequalities must not pass as
+                // a complete plan simply because no literal mentions them.
+                let mut subst = HashMap::new();
+                for &param in params {
+                    let ty = ctx.var_type(param, step_id);
+                    if ctx.compatible_objects(ty).is_empty() {
+                        return false;
+                    }
+                    let var = fresh_for(ctx, &mut subst, param, step_id);
+                    new_bindings.push(Binding::new(
+                        var,
+                        step_id,
+                        Term::Variable(var),
+                        step_id,
+                        true,
+                    ));
+                }
+                goals.push(body.substitute(&subst));
             }
             Formula::Forall { params, body } => {
                 // Universal base: instantiate the body over all type-compatible
@@ -1466,7 +1737,8 @@ fn add_goal(
                 let expanded = ctx.universal_base(params, body, step_id);
                 goals.push(expanded);
             }
-            Formula::True | Formula::False => {}
+            Formula::True => {}
+            Formula::False => return false,
         }
     }
     true
@@ -1486,6 +1758,53 @@ fn binding_of(
             Term::Object(_) => (Variable(0), left_id, right, right_id),
         },
     }
+}
+
+/// Whether an effect **e-deletes** a link's condition: it asserts something the
+/// lifted mutex groups say cannot hold beside the protected fact.
+///
+/// Nguyen & Kambhampati (IJCAI-01, Def. 3) widen a threat from "deletes `p`" to
+/// "cannot hold beside `p`". On the literal representation the widening needs
+/// two things the classical test does not: mutexes, which
+/// [`crate::lifted_mutex`] supplies without grounding, and both atoms resolved
+/// to objects through the binding constraints. A condition still carrying a
+/// variable yields `false` — no threat claimed, which is the safe direction,
+/// since a threat claimed wrongly could force an ordering that loses a plan.
+///
+/// Only an **unconditional, unquantified positive** effect counts. A
+/// conditional add may never fire, and a `forall` add is not one atom.
+///
+/// The precondition case of e-deletion — a step whose *precondition* is mutex
+/// with the protected fact — is not a threat here, because there is no effect
+/// to hang an [`Unsafe`] on. `-p cutset` catches those once the orderings put
+/// the step inside the interval; see [`crate::cutset::lifted`].
+pub(crate) fn effect_e_deletes(
+    ctx: &SearchContext,
+    bindings: &Bindings,
+    effect: &Effect,
+    step_id: usize,
+    link: &Link,
+) -> bool {
+    if !ctx.params.prune.edelete || effect.conditional() || !effect.parameters.is_empty() {
+        return false;
+    }
+    let Literal::Atom(added) = &effect.literal else {
+        return false;
+    };
+    let Literal::Atom(protected) = link.condition.as_ref() else {
+        return false;
+    };
+    let mutexes = ctx.lifted_mutexes();
+    if mutexes.is_empty() {
+        return false;
+    }
+    let (Some(added), Some(protected)) = (
+        crate::lifted_mutex::ground_atom(bindings, added, step_id),
+        crate::lifted_mutex::ground_atom(bindings, protected, link.to_id),
+    ) else {
+        return false;
+    };
+    mutexes.mutex(&added, &protected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1520,19 +1839,22 @@ pub fn link_threats(
                 // Cheapest test first: it reads the effect literal alone, and
                 // rules out most effects before the second `Rc` hop into the
                 // link condition and the unification below.
-                if !e.literal.may_affect(&link.condition) {
+                let classical = e.literal.may_affect(&link.condition);
+                if !classical && !effect_e_deletes(ctx, bindings, e, s.id, link) {
                     continue;
                 }
-                if e.link_condition.contradiction() {
+                if !e.threat_possible(bindings, s.id) {
                     continue;
                 }
-                if bindings.affects(
-                    &ctx.type_ctx(),
-                    &e.literal,
-                    s.id,
-                    &link.condition,
-                    link.to_id,
-                ) {
+                if !classical
+                    || bindings.affects(
+                        &ctx.type_ctx(),
+                        &e.literal,
+                        s.id,
+                        &link.condition,
+                        link.to_id,
+                    )
+                {
                     *unsafes = chain::cons(
                         Unsafe {
                             link: link.clone(),
@@ -1575,13 +1897,16 @@ pub fn step_threats(
             }
             for e in step.action.effects.iter() {
                 // See `link_threats`.
-                if !e.literal.may_affect(&l.condition) {
+                let classical = e.literal.may_affect(&l.condition);
+                if !classical && !effect_e_deletes(ctx, bindings, e, step.id, l) {
                     continue;
                 }
-                if e.link_condition.contradiction() {
+                if !e.threat_possible(bindings, step.id) {
                     continue;
                 }
-                if bindings.affects(&ctx.type_ctx(), &e.literal, step.id, &l.condition, l.to_id) {
+                if !classical
+                    || bindings.affects(&ctx.type_ctx(), &e.literal, step.id, &l.condition, l.to_id)
+                {
                     *unsafes = chain::cons(
                         Unsafe {
                             link: l.clone(),
@@ -1594,5 +1919,153 @@ pub fn step_threats(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod counting_tests {
+    use super::*;
+    use crate::heuristics::FlawSelectionOrder;
+    use crate::params::Parameters;
+    use crate::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
+
+    #[test]
+    fn zero_then_one_queries_resume_at_the_next_achiever() {
+        let ParsedUnit::Domain(d) = read_pddl(
+            "(define (domain counts) (:requirements :strips) (:predicates (p))
+            (:action a :parameters () :precondition (and) :effect (p))
+            (:action b :parameters () :precondition (and) :effect (p))
+            (:action c :parameters () :precondition (and) :effect (p)))",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let domain = lower_domain(&d).unwrap();
+        let ParsedUnit::Problem(p) =
+            read_pddl("(define (problem p) (:domain counts) (:init) (:goal (p)))").unwrap()
+        else {
+            panic!()
+        };
+        let problem = lower_problem(&p, &domain).unwrap();
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let plan = Plan::make_initial_plan(&ctx).unwrap();
+        ctx.register_plan(&plan);
+        let oc = chain::iter(plan.open_conds()).next().unwrap();
+        let mut counts = OpenConditionCounts::new(&plan, oc);
+        assert!(!counts.within(&ctx, 0));
+        assert_eq!(counts.tested_candidates, 1);
+        assert!(!counts.within(&ctx, 1));
+        assert_eq!(counts.tested_candidates, 2);
+        assert!(counts.has_new(&ctx));
+        assert_eq!(counts.tested_candidates, 2);
+        assert_eq!(counts.exact(&ctx), 3);
+        assert_eq!(counts.tested_candidates, 3);
+    }
+
+    #[test]
+    fn resumed_counts_match_actual_children_and_never_retest_candidates() {
+        let ParsedUnit::Domain(d) = read_pddl(
+            "(define (domain counts)
+            (:requirements :adl :typing) (:types item)
+            (:predicates (p ?x - item) (q ?x - item) (r ?x - item))
+            (:action first :parameters (?x - item) :precondition (q ?x) :effect (p ?x))
+            (:action second :parameters (?x - item) :precondition (not (r ?x)) :effect (p ?x))
+            (:action many :parameters () :precondition (and)
+                :effect (forall (?x - item) (when (q ?x) (p ?x)))))",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let domain = lower_domain(&d).unwrap();
+        let mut checked = 0;
+        let mut reused = 0;
+        let mut closed_world = 0;
+        for goal in [
+            "(and (p a) (not (r b)))",
+            "(exists (?x - item) (and (p ?x) (not (q ?x))))",
+            "(or (p a) (p b))",
+        ] {
+            let ParsedUnit::Problem(p) = read_pddl(&format!(
+                "(define (problem p) (:domain counts)
+                (:objects a b - item) (:init (p b) (q a)) (:goal {goal}))"
+            ))
+            .unwrap() else {
+                panic!()
+            };
+            let problem = lower_problem(&p, &domain).unwrap();
+            for ground_actions in [false, true] {
+                let params = Parameters {
+                    ground_actions,
+                    flaw_orders: vec![FlawSelectionOrder::parse("ZLIFO").unwrap()],
+                    ..Parameters::default()
+                };
+                let ctx = SearchContext::new(&domain, &problem, &params);
+                let mut queue =
+                    std::collections::VecDeque::from([Plan::make_initial_plan(&ctx).unwrap()]);
+                for _ in 0..24 {
+                    let Some(plan) = queue.pop_front() else {
+                        break;
+                    };
+                    ctx.register_plan(&plan);
+                    for oc in chain::iter(plan.open_conds()) {
+                        let mut counts = OpenConditionCounts::new(&plan, oc);
+                        for limit in [0, 0, 1, 0, 2, 1, i32::MAX, 0] {
+                            let before = counts.tested_candidates;
+                            let within = counts.within(&ctx, limit);
+                            let mut exact = -1;
+                            let (mut addable, mut reusable) = (-1, -1);
+                            let reference = plan.open_cond_refinements(
+                                &ctx,
+                                &mut exact,
+                                &mut addable,
+                                &mut reusable,
+                                oc,
+                                limit,
+                            );
+                            assert_eq!(within, reference);
+                            let after = counts.tested_candidates;
+                            assert!(after >= before);
+                            assert_eq!(counts.within(&ctx, limit), within);
+                            assert_eq!(
+                                counts.tested_candidates, after,
+                                "an identical query rescanned candidates"
+                            );
+                        }
+                        let count = counts.exact(&ctx);
+                        let after = counts.tested_candidates;
+                        let mut children = Vec::new();
+                        plan.handle_open_condition(&ctx, &mut children, oc);
+                        assert_eq!(count as usize, children.len());
+                        counts.has_new(&ctx);
+                        counts.has_reuse(&ctx);
+                        assert_eq!(
+                            counts.tested_candidates, after,
+                            "exact count did not finish the scans"
+                        );
+                        // NEW/REUSE can precede threshold and ranking criteria.
+                        let mut availability = OpenConditionCounts::new(&plan, oc);
+                        assert_eq!(availability.has_reuse(&ctx), counts.reuse_count > 0);
+                        assert_eq!(availability.has_new(&ctx), counts.new_count > 0);
+                        assert_eq!(availability.within(&ctx, 1), count <= 1);
+                        assert_eq!(availability.exact(&ctx), count);
+                        reused += usize::from(counts.reuse_count > 0);
+                        closed_world += usize::from(
+                            matches!(counts.literal, Some(Literal::Negation(_))) && counts.cw_done,
+                        );
+                        checked += 1;
+                    }
+                    if !plan.complete() {
+                        let mut children = Vec::new();
+                        plan.refinements(&ctx, &mut children);
+                        queue.extend(children);
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 20 && reused > 0 && closed_world > 0,
+            "insufficient coverage: {checked} flaws, {reused} reuse cases, {closed_world} closed-world cases"
+        );
     }
 }

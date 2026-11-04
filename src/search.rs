@@ -3,14 +3,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::fasthash::FastMap;
 use std::rc::Rc;
 
 use crate::action::ActionSchema;
-use crate::bindings::{Bindings, StepVarTypes, TypeContext};
+use crate::bindings::{Binding, Bindings, StepVarTypes, TypeContext};
 use crate::chain;
 use crate::domain::Domain;
 use crate::effect::Effect;
@@ -20,6 +20,7 @@ use crate::params::{Parameters, SearchAlgorithm};
 use crate::plan::{Plan, StepAction, GOAL_ID, INIT_ID};
 use crate::problem::Metric;
 use crate::problem::Problem;
+use crate::rank::{Rank, RankTerm};
 use crate::terms::{Object, Term, Variable};
 use crate::types::{Type, OBJECT};
 
@@ -57,14 +58,21 @@ pub struct SearchContext<'a> {
     planning_graph: RefCell<Option<Rc<crate::planning_graph::PlanningGraph>>>,
     /// Types of fresh variables allocated per step for universally-quantified
     /// effect instances (the renamed forall parameters in `make_link`/`separate`).
-    /// Keyed by step id; each fresh variable has index `action.var_types.len() +
-    /// position`.
+    /// Keyed by step id; each fresh variable has index `fresh_var_base + position`.
     fresh_vars: RefCell<FastMap<usize, Vec<Type>>>,
+    /// Fresh indices must not depend on which sibling action currently owns a
+    /// step id: siblings can have different numbers of declared variables.
+    fresh_var_base: usize,
     /// The constant base of the SAS⁺ causal-link compilation (the ground original
     /// actions + their facts), built lazily on first use. Reused across every
     /// search node so the `COMPILE` heuristic only re-grounds the per-node delta
     /// (committed steps + indicators + guards). See `crate::compile`.
     compile_base: RefCell<Option<Rc<crate::compile::BaseGroundTask>>>,
+    /// The translated finite-domain task, for the SAS+ LP heuristic. Built once
+    /// per search: translating runs Fast Downward, which costs far more than a
+    /// node. The inner `None` records that translation failed, so it is not
+    /// retried at every node.
+    fdr_task: RefCell<Option<Option<Rc<crate::fdr::Task>>>>,
     /// The problem-constant Sample-FF model (interned ground facts, delete-relaxed
     /// ground actions, cached initial-state fixpoint), built lazily on first use
     /// and reused across every search node. See `crate::sample_ff`.
@@ -79,6 +87,25 @@ pub struct SearchContext<'a> {
     pub(crate) h_eval_nanos: Cell<u128>,
     /// Children discarded by relaxed-reachability pruning at generation time.
     pub(crate) pruned: Cell<usize>,
+    /// An external evaluator failure is not a proof of a dead end. Disable the
+    /// failing backend for this search after warning once, then use h = 0.
+    pub(crate) failed_compile_backends:
+        RefCell<std::collections::HashSet<crate::external::FdHeuristic>>,
+    /// Operator parameter domains, built on first use when `-p params` is on.
+    /// See [`crate::param_domains`].
+    param_domains: RefCell<Option<Rc<crate::param_domains::ParameterDomains>>>,
+    /// The domain's operator graph and its SCCs, built on first use when
+    /// `-p recursion` is on. See [`crate::opgraph`].
+    operator_graph: RefCell<Option<Rc<crate::opgraph::OperatorGraph>>>,
+    /// The task's lifted landmarks, extracted on first use by `-h LM`.
+    landmarks: RefCell<Option<Rc<crate::landmarks::LiftedLandmarks>>>,
+    /// Landmarks extracted with the FAM cuts as well, cached apart because the
+    /// two extractions produce different landmark sets.
+    landmarks_fam: RefCell<Option<Rc<crate::landmarks::LiftedLandmarks>>>,
+    /// Lifted mutex groups, synthesised on first use when `-p cutset` is on.
+    /// See [`crate::lifted_mutex`].
+    lifted_mutexes: RefCell<Option<Rc<crate::lifted_mutex::LiftedMutexes>>>,
+    object_symmetries: RefCell<Option<Rc<crate::symmetry::ObjectSymmetries>>>,
 }
 
 impl<'a> StepVarTypes for SearchContext<'a> {
@@ -92,7 +119,10 @@ impl<'a> StepVarTypes for SearchContext<'a> {
             }
             // A fresh forall-instance variable (index past the action's params).
             if let Some(types) = self.fresh_vars.borrow().get(&step_id) {
-                if let Some(ty) = types.get(idx - base) {
+                if let Some(ty) = idx
+                    .checked_sub(self.fresh_var_base)
+                    .and_then(|i| types.get(i))
+                {
                     return *ty;
                 }
             }
@@ -142,12 +172,27 @@ impl<'a> SearchContext<'a> {
             step_var_types: RefCell::new(FastMap::default()),
             planning_graph: RefCell::new(None),
             fresh_vars: RefCell::new(FastMap::default()),
+            fresh_var_base: domain
+                .actions
+                .iter()
+                .map(|a| a.var_types.len())
+                .chain(std::iter::once(problem.goal_var_types.len()))
+                .max()
+                .unwrap_or(0),
             compile_base: RefCell::new(None),
+            fdr_task: RefCell::new(None),
             sample_ff_model: RefCell::new(None),
             cost_values: crate::parser::lower::cost_function_values(problem),
             h_evals: Cell::new(0),
             h_eval_nanos: Cell::new(0),
             pruned: Cell::new(0),
+            failed_compile_backends: RefCell::new(std::collections::HashSet::new()),
+            param_domains: RefCell::new(None),
+            operator_graph: RefCell::new(None),
+            lifted_mutexes: RefCell::new(None),
+            object_symmetries: RefCell::new(None),
+            landmarks: RefCell::new(None),
+            landmarks_fam: RefCell::new(None),
         };
         ctx.step_var_types
             .borrow_mut()
@@ -163,7 +208,7 @@ impl<'a> SearchContext<'a> {
     /// reachability-based grounder when available, falling back to naive
     /// Cartesian instantiation otherwise.
     fn build_achievers(&mut self) {
-        let actions: Vec<Rc<StepAction>> = if self.params.ground_actions {
+        let mut actions: Vec<Rc<StepAction>> = if self.params.ground_actions {
             self.fd_reachable_ground_actions()
         } else {
             self.domain
@@ -172,6 +217,21 @@ impl<'a> SearchContext<'a> {
                 .map(|a| Rc::new(schema_to_action(a)))
                 .collect()
         };
+        // With `-p params`, drop action instances whose arguments lie outside
+        // their parameter domains before they ever become achievers. In ground
+        // mode this removes them from every open condition's candidate set at
+        // once, for a single up-front cost; in lifted mode it removes whole
+        // schemas that have no viable instance at all.
+        if self.params.prune.params {
+            let domains = self.param_domains();
+            actions.retain(|action| {
+                if action.arguments.is_empty() {
+                    domains.schema_viable(&action.name)
+                } else {
+                    domains.permits_arguments(&action.name, &action.arguments)
+                }
+            });
+        }
         for action in &actions {
             for (idx, effect) in action.effects.iter().enumerate() {
                 let pred = effect.literal.atom().predicate.0;
@@ -303,7 +363,9 @@ impl<'a> SearchContext<'a> {
             cost: schema
                 .instance_cost(tuple, &self.cost_values)
                 .unwrap_or(schema.cost),
-            var_types: Vec::new(),
+            // Schema parameters are substituted, but quantified variables in
+            // preconditions and effects still use their original indices.
+            var_types: schema.var_types.clone(),
         }))
     }
 
@@ -406,6 +468,68 @@ impl<'a> SearchContext<'a> {
         self.planning_graph.borrow().clone().unwrap()
     }
 
+    /// Operator parameter domains, computed once per search.
+    pub fn param_domains(&self) -> Rc<crate::param_domains::ParameterDomains> {
+        if self.param_domains.borrow().is_none() {
+            let domains =
+                crate::param_domains::ParameterDomains::compute(self.domain, self.problem);
+            *self.param_domains.borrow_mut() = Some(Rc::new(domains));
+        }
+        self.param_domains.borrow().clone().unwrap()
+    }
+
+    /// The task's lifted landmarks, extracted once per search. `fam` also cuts
+    /// the mutex groups' transition graphs, which needs those groups and so
+    /// costs a synthesis on top of the backchaining.
+    pub fn landmarks(&self, fam: bool) -> Rc<crate::landmarks::LiftedLandmarks> {
+        let cache = if fam {
+            &self.landmarks_fam
+        } else {
+            &self.landmarks
+        };
+        if cache.borrow().is_none() {
+            let extracted = if fam {
+                let mutexes = self.lifted_mutexes();
+                crate::landmarks::LiftedLandmarks::extract_with_mutexes(
+                    self.domain,
+                    self.problem,
+                    &mutexes,
+                )
+            } else {
+                crate::landmarks::LiftedLandmarks::extract(self.domain, self.problem)
+            };
+            *cache.borrow_mut() = Some(Rc::new(extracted));
+        }
+        cache.borrow().clone().unwrap()
+    }
+
+    /// The domain's lifted mutex groups, synthesised once per search.
+    pub fn lifted_mutexes(&self) -> Rc<crate::lifted_mutex::LiftedMutexes> {
+        if self.lifted_mutexes.borrow().is_none() {
+            let mutexes = crate::lifted_mutex::LiftedMutexes::synthesise(self.domain, self.problem);
+            *self.lifted_mutexes.borrow_mut() = Some(Rc::new(mutexes));
+        }
+        self.lifted_mutexes.borrow().clone().unwrap()
+    }
+
+    /// The task's interchangeable objects, computed once per search.
+    pub fn object_symmetries(&self) -> Rc<crate::symmetry::ObjectSymmetries> {
+        if self.object_symmetries.borrow().is_none() {
+            let symmetries = crate::symmetry::ObjectSymmetries::compute(self.domain, self.problem);
+            *self.object_symmetries.borrow_mut() = Some(Rc::new(symmetries));
+        }
+        self.object_symmetries.borrow().clone().unwrap()
+    }
+
+    /// The domain's operator graph, computed once per search.
+    pub fn operator_graph(&self) -> Rc<crate::opgraph::OperatorGraph> {
+        if self.operator_graph.borrow().is_none() {
+            let graph = crate::opgraph::OperatorGraph::build(self.domain);
+            *self.operator_graph.borrow_mut() = Some(Rc::new(graph));
+        }
+        self.operator_graph.borrow().clone().unwrap()
+    }
+
     /// Effective cost of inserting an action under the selected cost model.
     pub fn action_cost(&self, action: &StepAction) -> usize {
         let declared = if self.problem.metric == Some(Metric::MinimizeTotalCost) {
@@ -425,6 +549,16 @@ impl<'a> SearchContext<'a> {
             *self.compile_base.borrow_mut() = Some(Rc::new(base));
         }
         self.compile_base.borrow().clone().unwrap()
+    }
+
+    /// The translated finite-domain task, or `None` if translation failed.
+    /// Translation runs Fast Downward, so it happens once per search.
+    pub fn fdr_task(&self) -> Option<Rc<crate::fdr::Task>> {
+        if self.fdr_task.borrow().is_none() {
+            let translated = crate::fdr_pocl::translate(self).ok().map(Rc::new);
+            *self.fdr_task.borrow_mut() = Some(translated);
+        }
+        self.fdr_task.borrow().clone().flatten()
     }
 
     /// Returns the problem-constant Sample-FF model (interned facts, delete-relaxed
@@ -492,10 +626,23 @@ impl<'a> SearchContext<'a> {
     }
 
     /// Registers a step's action for variable-type lookups.
+    /// The action currently registered for a step id, if any. Step ids repeat
+    /// across sibling plans, so this answers for the plan most recently
+    /// registered — which is the one being refined.
+    pub fn step_action(&self, step_id: usize) -> Option<Rc<StepAction>> {
+        self.step_var_types.borrow().get(&step_id).cloned()
+    }
+
     pub fn register_step(&self, step_id: usize, action: &Rc<StepAction>) {
         self.step_var_types
             .borrow_mut()
             .insert(step_id, action.clone());
+    }
+
+    pub(crate) fn register_plan(&self, plan: &Plan) {
+        for step in chain::iter(&plan.steps) {
+            self.register_step(step.id, &step.action);
+        }
     }
 
     /// Re-points the step-action map at `plan`'s own newest step.
@@ -517,15 +664,9 @@ impl<'a> SearchContext<'a> {
     /// Its index lies past the step's action parameters; [`var_type`] resolves it
     /// via `fresh_vars`.
     pub fn fresh_forall_var(&self, step_id: usize, ty: Type) -> Variable {
-        let base = self
-            .step_var_types
-            .borrow()
-            .get(&step_id)
-            .map(|a| a.var_types.len())
-            .unwrap_or(0);
         let mut fresh = self.fresh_vars.borrow_mut();
         let v = fresh.entry(step_id).or_default();
-        let idx = base + v.len();
+        let idx = self.fresh_var_base + v.len();
         v.push(ty);
         Variable(idx as u32)
     }
@@ -556,11 +697,7 @@ impl<'a> SearchContext<'a> {
             }
             combos = next;
         }
-        let mut result = Rc::new(Formula::True);
-        for combo in &combos {
-            result = Formula::and(result, body.substitute(combo));
-        }
-        result
+        Formula::conjoin_all(combos.iter().map(|combo| body.substitute(combo)))
     }
 }
 
@@ -583,7 +720,7 @@ fn schema_to_action(schema: &ActionSchema) -> StepAction {
 /// `BinaryHeap` is a max-heap; the best plan must sort largest to be popped).
 struct QueuedPlan {
     plan: Rc<Plan>,
-    rank: Vec<f32>,
+    rank: Rank,
     /// When true the rank is a cheap proxy (parent's h + structural tiebreakers)
     /// and the real h must be computed when this plan is popped. Used by
     /// `LazyGbfs` and `LazyGbfsDual`.
@@ -604,17 +741,8 @@ impl PartialOrd for QueuedPlan {
 impl Ord for QueuedPlan {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         // Greater = better, so the heap pops the best plan. Smaller rank is better.
-        let n = self.rank.len().max(other.rank.len());
-        for i in 0..n {
-            let a = self.rank.get(i).copied().unwrap_or(0.0);
-            let b = other.rank.get(i).copied().unwrap_or(0.0);
-            if a < b {
-                return CmpOrdering::Greater; // self better
-            } else if a > b {
-                return CmpOrdering::Less;
-            }
-        }
-        CmpOrdering::Equal
+        self.rank
+            .better_first(&other.rank, || self.plan.id.get(), || other.plan.id.get())
     }
 }
 
@@ -649,6 +777,14 @@ pub struct SearchStats {
     pub max_threats: usize,
     /// Largest primary open-list size observed during search.
     pub max_queued: usize,
+    /// Queued plans discarded by an open-list bound (`--max-queued`,
+    /// `--mem-mb`). Zero unless one is set; see [`crate::memory`].
+    pub dropped: usize,
+    /// Why the search stopped short, when a budget rather than the search
+    /// itself ended it. The outcome is [`Outcome::LimitReached`] here as it is
+    /// for the node limit; this is what tells them apart, and which budget it
+    /// was. See [`crate::memory::SearchStop`].
+    pub stopped: Option<crate::memory::StopReason>,
 }
 
 /// A point-in-time view of an active search, delivered after an expansion.
@@ -668,6 +804,11 @@ pub struct SearchProgress {
     pub h_evals: usize,
     pub h_eval_ms: u128,
     pub pruned: usize,
+    /// Queued plans discarded by an open-list bound so far.
+    pub dropped: usize,
+    /// The process's resident set in kilobytes, sampled at most every 100 ms;
+    /// zero where it cannot be measured.
+    pub resident_kb: u64,
     /// Shape of the partial plan expanded for this update.
     pub current_steps: usize,
     pub current_open_conditions: usize,
@@ -705,7 +846,6 @@ pub fn plan_with_progress(
 fn pop_next(
     primary: &mut BinaryHeap<QueuedPlan>,
     mut secondary: Option<&mut BinaryHeap<QueuedPlan>>,
-    expanded_ids: &HashSet<usize>,
     ctx: &SearchContext,
     is_lazy: bool,
     is_gbfs: bool,
@@ -713,7 +853,7 @@ fn pop_next(
     is_alt: bool,
     boost_budget: &mut usize,
     expand_count: &mut usize,
-) -> (Option<Rc<Plan>>, f32) {
+) -> (Option<Rc<Plan>>, RankTerm) {
     // ALT: strict 1:1 alternation between the A*-ordered primary queue and the
     // h-ordered secondary queue. The queue is chosen once per call (i.e. per
     // expansion) so skipping stale entries inside the loop below does not
@@ -724,6 +864,15 @@ fn pop_next(
         (*expand_count).is_multiple_of(2)
     };
     loop {
+        // A lazy pop can evaluate many dead ends without an expansion. Keep
+        // the deadline effective while draining that queue too.
+        if ctx
+            .params
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return (None, RankTerm::ZERO);
+        }
         // In dual-queue mode, decide which queue to pop from.
         let use_secondary = alt_use_secondary
             || (is_dual && *boost_budget == 0 && {
@@ -749,26 +898,28 @@ fn pop_next(
 
         let q = match q {
             Some(q) => q,
-            None => return (None, 0.0),
+            None => return (None, RankTerm::ZERO),
         };
 
         // Skip plans already expanded (stale secondary-queue duplicates).
-        if (is_dual || is_alt) && expanded_ids.contains(&q.plan.id.get()) {
+        if (is_dual || is_alt) && q.plan.expanded.get() {
             continue;
         }
 
         if !is_lazy || !q.is_lazy {
-            let r0 = q.rank[0];
+            let r0 = q.rank.primary(q.plan.id.get());
             return (Some(q.plan), r0);
         }
 
+        // The registry may still describe a different branch of the queue.
+        ctx.register_plan(&q.plan);
         // Lazy: compute the real rank now.
         let real_rank = if is_gbfs {
-            q.plan.rank_gbfs(ctx)
+            q.plan.queue_rank_gbfs(ctx)
         } else {
-            q.plan.rank(ctx)
+            q.plan.queue_rank(ctx)
         };
-        if real_rank[0].is_finite() {
+        if real_rank.primary(q.plan.id.get()).is_finite() {
             primary.push(QueuedPlan {
                 plan: q.plan,
                 rank: real_rank,
@@ -777,6 +928,143 @@ fn pop_next(
         }
         // Do not expand; loop to pop the next candidate.
     }
+}
+
+/// Whether an opt-in pruning rule discards this refinement.
+///
+/// The rules are checked cheapest first, so an expensive one only runs on plans
+/// the cheap ones kept. Each is sound on its own terms; see `crate::pruning`.
+///
+/// `parent` is the plan `plan` was refined from. `cutset` reads it to extend
+/// the parent's ground facts instead of resolving the whole plan again.
+fn discarded_by_pruning(ctx: &SearchContext, parent: Option<&Plan>, plan: &Plan) -> bool {
+    let options = ctx.params.prune;
+    if options.params && violates_parameter_domains(ctx, plan) {
+        return true;
+    }
+    if options.cutset || options.symbolic {
+        let mutexes = ctx.lifted_mutexes();
+        let discard = (options.symbolic || crate::cutset::lifted::may_apply(plan, &mutexes))
+            && crate::cutset::lifted::has_inconsistent_cutset(ctx, plan, &mutexes, parent);
+        // The incremental rule must discard exactly what the one-pass form it
+        // replaced discarded: a verdict gained is a refinable plan thrown away,
+        // and a verdict lost is pruning quietly switched off. Under test every
+        // generated node is put to both.
+        #[cfg(test)]
+        {
+            let reference = crate::cutset::lifted::may_apply(plan, &mutexes)
+                && crate::cutset::lifted::reference::has_inconsistent_cutset(plan, &mutexes);
+            if options.symbolic {
+                assert!(
+                    !reference || discard,
+                    "symbolic cutsets lost a ground conflict"
+                );
+            } else {
+                assert_eq!(discard, reference, "incremental cutset state diverged");
+            }
+        }
+        if discard {
+            return true;
+        }
+    }
+    if options.minimality && crate::minimality::prunable(plan) {
+        return true;
+    }
+    if options.recursion && crate::opgraph::prunable(ctx, plan) {
+        return true;
+    }
+    false
+}
+
+/// Whether parameter domains rule out a threat's unifier
+/// (Gerevini & Schubert, JAIR 5, 1996, §5).
+///
+/// Reject a parameter/object equality outside the parameter's domain or a
+/// parameter/parameter equality whose domains are disjoint.
+pub(crate) fn threat_unifier_impossible(ctx: &SearchContext, unifier: &[Binding]) -> bool {
+    if unifier.is_empty() {
+        return false;
+    }
+    let domains = ctx.param_domains();
+    for binding in unifier {
+        if !binding.equality {
+            continue;
+        }
+        let Some((action, position)) = parameter_position(ctx, binding.var, binding.var_id) else {
+            continue;
+        };
+        match binding.term {
+            Term::Object(object) => {
+                if !domains.permits(&action.name, position, object) {
+                    return true;
+                }
+            }
+            Term::Variable(other) => {
+                let Some((other_action, other_position)) =
+                    parameter_position(ctx, other, binding.term_id)
+                else {
+                    continue;
+                };
+                if !domains.positions_can_agree(
+                    &action.name,
+                    position,
+                    &other_action.name,
+                    other_position,
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The action a step was instantiated from, and the index of `var` among its
+/// parameters. `None` for a synthetic step, or a variable that is not one of the
+/// action's own parameters (a `forall` instance variable, say).
+fn parameter_position(
+    ctx: &SearchContext,
+    var: Variable,
+    step_id: usize,
+) -> Option<(Rc<StepAction>, usize)> {
+    let action = ctx.step_action(step_id)?;
+    if action.synthetic() {
+        return None;
+    }
+    let position = action.parameters.iter().position(|p| *p == var)?;
+    Some((action, position))
+}
+
+/// Whether any step of the plan binds a parameter to an object outside the
+/// constants that can reach it (Gerevini & Schubert 1996).
+///
+/// Every step is checked, not only the newest: a binding added anywhere in the
+/// plan — by a link, or by a separation — can be what first pins an older
+/// step's parameter to an impossible object.
+fn violates_parameter_domains(ctx: &SearchContext, plan: &Plan) -> bool {
+    let domains = ctx.param_domains();
+    for step in chain::iter(&plan.steps) {
+        let action = &step.action;
+        if action.synthetic() {
+            continue;
+        }
+        // A ground step carries its arguments directly.
+        if !action.arguments.is_empty() {
+            if !domains.permits_arguments(&action.name, &action.arguments) {
+                return true;
+            }
+            continue;
+        }
+        for (position, variable) in action.parameters.iter().enumerate() {
+            if let Term::Object(object) = plan.bindings.binding(Term::Variable(*variable), step.id)
+            {
+                if !domains.permits(&action.name, position, object) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether some open condition introduced by `child`'s newly added step is
@@ -835,8 +1123,9 @@ fn plan_impl(
     mut progress: Option<&mut dyn FnMut(SearchProgress)>,
 ) -> (Outcome, SearchStats) {
     let search_started = Instant::now();
+    let mut progress_memory = crate::memory::ProgressMemory::default();
     let n_orders = ctx.params.flaw_orders.len();
-    let inf = f32::INFINITY;
+    let inf = RankTerm::INFINITY;
 
     let initial_plan = match Plan::make_initial_plan(ctx) {
         Some(p) => p,
@@ -867,6 +1156,7 @@ fn plan_impl(
     // refinement's *new* open conditions for relaxed reachability at generation
     // time instead. Eager modes already get this from the ∞-rank discard.
     let prune_unreachable = is_lazy && ctx.params.heuristic.needs_planning_graph();
+    let prune_options = ctx.params.prune;
 
     // One pending-plan queue and generated-plan counter per flaw order.
     let mut queues: Vec<BinaryHeap<QueuedPlan>> =
@@ -878,11 +1168,9 @@ fn plan_impl(
     } else {
         Vec::new()
     };
-    // Plan IDs already expanded; used to skip stale secondary-queue entries.
-    let mut expanded_ids: HashSet<usize> = HashSet::new();
 
     // Dual-queue boost state.
-    let mut best_h: f32 = inf;
+    let mut best_h = inf;
     let mut boost_budget: usize = 0;
     let mut expand_count: usize = 0; // for 2:1 primary:secondary ratio
 
@@ -893,7 +1181,28 @@ fn plan_impl(
     let mut max_open_conditions: usize = 0;
     let mut max_threats: usize = 0;
     let mut max_queued: usize = 0;
+    let mut bound = crate::memory::OpenListBound::new(ctx.params);
+    let mut stop = crate::memory::SearchStop::new(ctx.params);
+    let mut num_dropped: usize = 0;
+    // Which budget ended the search, if one did. A stop is a restart, not a
+    // prune: the node it stopped at is still in the queue, and nothing has
+    // been discarded.
+    let mut stopped: Option<crate::memory::StopReason> = None;
     let stats = std::env::var_os("POTOROO_STATS").is_some();
+
+    // The stop is consulted wherever the loop takes another plan off a queue,
+    // not only where it expands one: a complete plan that cannot be
+    // instantiated pops its successor and goes round again without expanding
+    // anything, and a search that spends its whole budget on such a run must
+    // still honour it.
+    macro_rules! stop_expired {
+        () => {
+            match stop.as_mut() {
+                Some(stop) => stop.expired(num_visited_plans),
+                None => None,
+            }
+        };
+    }
 
     let mut current_flaw_order: usize = 0;
     let mut flaw_orders_left: usize = n_orders;
@@ -901,7 +1210,7 @@ fn plan_impl(
 
     // The rank[0] of the plan currently being expanded. Used as the lazy proxy
     // for its children in lazy-evaluation modes.
-    let mut current_rank0: f32 = 0.0;
+    let mut current_rank0 = RankTerm::ZERO;
 
     let mut current_plan: Option<Rc<Plan>> = Some(initial_plan.clone());
     generated_plans[current_flaw_order] += 1;
@@ -910,7 +1219,7 @@ fn plan_impl(
     let mut limit_reached = false;
 
     let mut f_limit = if is_ida {
-        initial_plan.primary_rank(ctx)
+        initial_plan.queue_rank(ctx).primary(initial_plan.id.get())
     } else {
         inf
     };
@@ -918,7 +1227,80 @@ fn plan_impl(
     loop {
         let mut next_f_limit = inf;
         while let Some(plan) = current_plan.clone() {
+            ctx.register_plan(&plan);
             if plan.complete() {
+                // This applies to the initial plan and to ground actions too:
+                // quantified goals/preconditions can still leave witnesses.
+                if is_dual || is_alt {
+                    plan.expanded.set(true);
+                }
+                if let Some(inst) = step_instantiation(ctx, &plan)
+                    .filter(|inst| crate::validate::is_executable_solution(inst, ctx).is_ok())
+                {
+                    if inst.cost == plan.cost {
+                        current_plan = Some(inst);
+                        break;
+                    }
+                    // A schema cost is a lower bound until every argument is
+                    // known. Requeue under this algorithm's actual ordering.
+                    let (rank, secondary_rank) = if is_bfs {
+                        (Rank::bfs(inst.num_steps(), inst.id.get()), None)
+                    } else if is_gbfs {
+                        (inst.queue_rank_gbfs(ctx), None)
+                    } else if is_alt {
+                        let (a, g) = inst.queue_ranks(ctx);
+                        (a, Some(g))
+                    } else {
+                        (inst.queue_rank(ctx), None)
+                    };
+                    let primary = rank.primary(inst.id.get());
+                    if primary.is_finite() {
+                        if is_ida && primary > f_limit {
+                            next_f_limit = next_f_limit.min(primary);
+                        } else {
+                            if is_dual || is_alt {
+                                secondary_queues[current_flaw_order].push(QueuedPlan {
+                                    plan: inst.clone(),
+                                    rank: secondary_rank
+                                        .unwrap_or_else(|| Rank::fifo(inst.id.get())),
+                                    is_lazy: false,
+                                });
+                            }
+                            queues[current_flaw_order].push(QueuedPlan {
+                                plan: inst,
+                                rank,
+                                is_lazy: false,
+                            });
+                            num_generated_plans += 1;
+                        }
+                    }
+                } else {
+                    eprintln!("UNINSTANTIABLE");
+                }
+                if let Some(reason) = stop_expired!() {
+                    stopped = Some(reason);
+                    current_plan = None;
+                    break;
+                }
+                (current_plan, current_rank0) = pop_next(
+                    &mut queues[current_flaw_order],
+                    if is_dual || is_alt {
+                        Some(&mut secondary_queues[current_flaw_order])
+                    } else {
+                        None
+                    },
+                    ctx,
+                    is_lazy,
+                    is_gbfs,
+                    is_dual,
+                    is_alt,
+                    &mut boost_budget,
+                    &mut expand_count,
+                );
+                continue;
+            }
+            if let Some(reason) = stop_expired!() {
+                stopped = Some(reason);
                 break;
             }
             num_visited_plans += 1;
@@ -926,7 +1308,7 @@ fn plan_impl(
             max_open_conditions = max_open_conditions.max(plan.num_open_conds());
             max_threats = max_threats.max(plan.num_unsafes());
             if is_dual || is_alt {
-                expanded_ids.insert(plan.id.get());
+                plan.expanded.set(true);
             }
             if is_dual {
                 // Update boost when this plan's h improves the incumbent.
@@ -935,10 +1317,6 @@ fn plan_impl(
                     boost_budget = boost_budget.saturating_add(10);
                 }
                 boost_budget = boost_budget.saturating_sub(1);
-            }
-            // Register step actions referenced by this plan for type lookups.
-            for s in chain::iter(&plan.steps) {
-                ctx.register_step(s.id, &s.action);
             }
             // Refine the current plan under the current flaw order.
             let mut refinements: Vec<Rc<Plan>> = Vec::new();
@@ -952,17 +1330,22 @@ fn plan_impl(
                 // variables are typed by anything below.
                 ctx.register_newest_step(&new_plan, plan.num_steps);
 
+                // Opt-in literature pruning rules (`-p`). Each discards a plan
+                // it has proved unrefinable or provably non-minimal; all are
+                // off unless asked for. See `crate::pruning`.
+                if prune_options.any() && discarded_by_pruning(ctx, Some(&plan), &new_plan) {
+                    ctx.pruned.set(ctx.pruned.get() + 1);
+                    continue;
+                }
+
                 // ALT: GBFS-ordered rank from the shared evaluation, consumed
                 // by the secondary-queue push below.
-                let mut alt_gbfs_rank: Option<Vec<f32>> = None;
+                let mut alt_gbfs_rank: Option<Rank> = None;
 
                 // Compute rank and determine whether to push eagerly or lazily.
                 let (rank, is_lazy_push) = if is_bfs {
                     // BFS: rank by step count, then plan id (FIFO tiebreak).
-                    (
-                        vec![new_plan.num_steps() as f32, new_plan.id.get() as f32],
-                        false,
-                    )
+                    (Rank::bfs(new_plan.num_steps(), new_plan.id.get()), false)
                 } else if is_lazy {
                     if prune_unreachable && has_unreachable_new_open_cond(ctx, &plan, &new_plan) {
                         ctx.pruned.set(ctx.pruned.get() + 1);
@@ -974,27 +1357,27 @@ fn plan_impl(
                     // would sweep proxy-plateaus breadth-first — exactly where
                     // lazy GBFS stalls.
                     (
-                        vec![
+                        Rank::lazy_proxy(
                             current_rank0,
-                            new_plan.num_open_conds() as f32,
-                            -(new_plan.id.get() as f32),
-                        ],
+                            new_plan.num_open_conds(),
+                            new_plan.id.get(),
+                        ),
                         true,
                     )
                 } else if is_gbfs {
-                    (new_plan.rank_gbfs(ctx), false)
+                    (new_plan.queue_rank_gbfs(ctx), false)
                 } else if is_alt {
                     // ALT queues the child under both orderings; one shared
                     // evaluation produces the A* rank (primary queue) and the
                     // GBFS rank (secondary queue, pushed below).
-                    let (a_rank, g_rank) = new_plan.rank_both(ctx);
+                    let (a_rank, g_rank) = new_plan.queue_ranks(ctx);
                     alt_gbfs_rank = Some(g_rank);
                     (a_rank, false)
                 } else {
-                    (new_plan.rank(ctx), false)
+                    (new_plan.queue_rank(ctx), false)
                 };
 
-                let primary = rank[0];
+                let primary = rank.primary(new_plan.id.get());
                 if primary.is_finite() && generated_plans[cfo] < ctx.params.search_limits[cfo] {
                     if is_ida && primary > f_limit {
                         next_f_limit = next_f_limit.min(primary);
@@ -1004,7 +1387,7 @@ fn plan_impl(
                         // Secondary queue: pure FIFO ordered by plan id.
                         secondary_queues[cfo].push(QueuedPlan {
                             plan: new_plan.clone(),
-                            rank: vec![new_plan.id.get() as f32],
+                            rank: Rank::fifo(new_plan.id.get()),
                             is_lazy: is_lazy_push,
                         });
                     } else if is_alt {
@@ -1030,15 +1413,24 @@ fn plan_impl(
 
             let queued = queues.iter().map(BinaryHeap::len).sum();
             max_queued = max_queued.max(queued);
+            if let Some(bound) = bound.as_mut() {
+                if let Some(keep) = bound.trim_target(num_generated_plans, queued) {
+                    num_dropped += crate::memory::trim_all(&mut queues, keep);
+                    crate::memory::trim_all(&mut secondary_queues, keep);
+                }
+            }
             if let Some(report) = progress.as_deref_mut() {
+                let elapsed = search_started.elapsed();
                 report(SearchProgress {
-                    elapsed: search_started.elapsed(),
+                    elapsed,
                     nodes_generated: num_generated_plans,
                     nodes_visited: num_visited_plans,
                     queued,
                     h_evals: ctx.h_evals.get(),
                     h_eval_ms: ctx.h_eval_nanos.get() / 1_000_000,
                     pruned: ctx.pruned.get(),
+                    dropped: num_dropped,
+                    resident_kb: progress_memory.sample(elapsed),
                     current_steps: plan.num_steps(),
                     current_open_conditions: plan.num_open_conds(),
                     current_threats: plan.num_unsafes(),
@@ -1064,7 +1456,7 @@ fn plan_impl(
                         current_flaw_order += 1;
                         if current_flaw_order >= n_orders {
                             current_flaw_order = 0;
-                            next_switch *= 2;
+                            next_switch = next_switch.saturating_mul(2);
                         }
                         if generated_plans[current_flaw_order]
                             < ctx.params.search_limits[current_flaw_order]
@@ -1079,7 +1471,7 @@ fn plan_impl(
                 if generated_plans[current_flaw_order] == 0 {
                     // First visit to this flaw order: start from the initial plan.
                     current_plan = Some(initial_plan.clone());
-                    current_rank0 = 0.0;
+                    current_rank0 = RankTerm::ZERO;
                     generated_plans[current_flaw_order] += 1;
                     num_generated_plans += 1;
                 } else {
@@ -1090,7 +1482,6 @@ fn plan_impl(
                         } else {
                             None
                         },
-                        &expanded_ids,
                         ctx,
                         is_lazy,
                         is_gbfs,
@@ -1100,95 +1491,6 @@ fn plan_impl(
                         &mut expand_count,
                     );
                 }
-
-                // Instantiate all actions if the plan is otherwise complete
-                // (lifted mode only).
-                if !ctx.params.ground_actions {
-                    let correct_costs = has_parameterised_costs(ctx);
-                    loop {
-                        match &current_plan {
-                            Some(p) if p.complete() => match step_instantiation(ctx, p) {
-                                Some(inst) => {
-                                    // A step whose cost depends on its arguments
-                                    // was priced at the schema's lower bound when
-                                    // it was added. Now that instantiation has
-                                    // bound every argument the real cost is known;
-                                    // if it is higher this plan is worse than its
-                                    // `g` claimed, so requeue it at its true cost
-                                    // rather than return it as the best found.
-                                    let exact = if correct_costs {
-                                        exact_plan_cost(ctx, &inst)
-                                    } else {
-                                        inst.cost
-                                    };
-                                    if exact > inst.cost {
-                                        num_generated_plans += 1;
-                                        let corrected = Rc::new(Plan {
-                                            steps: inst.steps.clone(),
-                                            num_steps: inst.num_steps,
-                                            cost: exact,
-                                            links: inst.links.clone(),
-                                            num_links: inst.num_links,
-                                            orderings: inst.orderings.clone(),
-                                            bindings: inst.bindings.clone(),
-                                            unsafes: inst.unsafes.clone(),
-                                            num_unsafes: inst.num_unsafes,
-                                            open_conds: inst.open_conds.clone(),
-                                            num_open_conds: inst.num_open_conds,
-                                            id: std::cell::Cell::new(num_generated_plans),
-                                        });
-                                        let rank = corrected.rank(ctx);
-                                        if rank[0].is_finite() {
-                                            queues[current_flaw_order].push(QueuedPlan {
-                                                plan: corrected,
-                                                rank,
-                                                is_lazy: false,
-                                            });
-                                        }
-                                        (current_plan, current_rank0) = pop_next(
-                                            &mut queues[current_flaw_order],
-                                            if is_dual || is_alt {
-                                                Some(&mut secondary_queues[current_flaw_order])
-                                            } else {
-                                                None
-                                            },
-                                            &expanded_ids,
-                                            ctx,
-                                            is_lazy,
-                                            is_gbfs,
-                                            is_dual,
-                                            is_alt,
-                                            &mut boost_budget,
-                                            &mut expand_count,
-                                        );
-                                        continue;
-                                    }
-                                    current_plan = Some(inst);
-                                    break;
-                                }
-                                None => {
-                                    (current_plan, current_rank0) = pop_next(
-                                        &mut queues[current_flaw_order],
-                                        if is_dual || is_alt {
-                                            Some(&mut secondary_queues[current_flaw_order])
-                                        } else {
-                                            None
-                                        },
-                                        &expanded_ids,
-                                        ctx,
-                                        is_lazy,
-                                        is_gbfs,
-                                        is_dual,
-                                        is_alt,
-                                        &mut boost_budget,
-                                        &mut expand_count,
-                                    );
-                                }
-                            },
-                            _ => break,
-                        }
-                    }
-                }
             } else {
                 if next_f_limit != inf {
                     current_plan = None;
@@ -1197,6 +1499,12 @@ fn plan_impl(
             }
         }
 
+        if current_plan.is_none() && stopped.is_none() {
+            stopped = stop_expired!();
+        }
+        if stopped.is_some() {
+            break;
+        }
         if matches!(&current_plan, Some(p) if p.complete()) {
             break;
         }
@@ -1204,7 +1512,7 @@ fn plan_impl(
         if f_limit != inf {
             // Restart the IDA* search with the relaxed f-limit.
             current_plan = Some(initial_plan.clone());
-            current_rank0 = 0.0;
+            current_rank0 = RankTerm::ZERO;
         } else {
             break;
         }
@@ -1224,6 +1532,8 @@ fn plan_impl(
         max_open_conditions,
         max_threats,
         max_queued,
+        dropped: num_dropped,
+        stopped,
     };
     let outcome = match current_plan {
         Some(p) if p.complete() => {
@@ -1243,7 +1553,9 @@ fn plan_impl(
             );
             Outcome::Solved(p)
         }
-        _ if limit_reached => Outcome::LimitReached,
+        // Queues emptied by an open-list bound say nothing about solvability,
+        // and neither does a search stopped part-way for time or memory.
+        _ if stopped.is_some() || limit_reached || num_dropped > 0 => Outcome::LimitReached,
         _ => Outcome::NoSolution,
     };
     (outcome, search_stats)
@@ -1257,13 +1569,13 @@ fn plan_impl(
 /// cost that depends on those arguments can only be bounded from below at that
 /// point. Once the plan is complete and instantiated every argument is known,
 /// and this recovers the real cost.
-fn exact_plan_cost(ctx: &SearchContext, plan: &Plan) -> usize {
+fn exact_plan_cost(ctx: &SearchContext, plan: &Plan, bindings: &Bindings) -> usize {
     let mut total: usize = 0;
     for step in chain::iter(&plan.steps) {
         if step.id == INIT_ID || step.id == GOAL_ID {
             continue;
         }
-        total = total.saturating_add(exact_step_cost(ctx, plan, step));
+        total = total.saturating_add(exact_step_cost(ctx, bindings, step));
     }
     total
 }
@@ -1272,7 +1584,7 @@ fn exact_plan_cost(ctx: &SearchContext, plan: &Plan) -> usize {
 /// number is only a bound. Falls back to the recorded cost whenever the step is
 /// already ground, the schema has no parameterised cost, or a parameter is
 /// still unbound.
-fn exact_step_cost(ctx: &SearchContext, plan: &Plan, step: &crate::plan::Step) -> usize {
+fn exact_step_cost(ctx: &SearchContext, bindings: &Bindings, step: &crate::plan::Step) -> usize {
     let recorded = ctx.action_cost(&step.action);
     if !step.action.arguments.is_empty() || step.action.parameters.is_empty() {
         return recorded;
@@ -1285,7 +1597,7 @@ fn exact_step_cost(ctx: &SearchContext, plan: &Plan, step: &crate::plan::Step) -
     }
     let mut arguments = Vec::with_capacity(step.action.parameters.len());
     for &v in &step.action.parameters {
-        match plan.bindings.binding(Term::Variable(v), step.id) {
+        match bindings.binding(Term::Variable(v), step.id) {
             Term::Object(o) => arguments.push(o),
             Term::Variable(_) => return recorded,
         }
@@ -1316,14 +1628,14 @@ fn has_parameterised_costs(ctx: &SearchContext) -> bool {
 /// Returns a fully-instantiated copy of a complete plan, or `None` if its steps
 /// cannot all be ground consistently.
 fn step_instantiation(ctx: &SearchContext, plan: &Rc<Plan>) -> Option<Rc<Plan>> {
-    let bindings = instantiate_steps(ctx, &plan.steps, plan.bindings.clone())?;
-    if Rc::ptr_eq(&bindings, &plan.bindings) {
+    let (bindings, cost) = instantiate_steps(ctx, plan)?;
+    if Rc::ptr_eq(&bindings, &plan.bindings) && cost == plan.cost {
         return Some(plan.clone());
     }
     Some(Rc::new(Plan {
         steps: plan.steps.clone(),
         num_steps: plan.num_steps,
-        cost: plan.cost,
+        cost,
         links: plan.links.clone(),
         num_links: plan.num_links,
         orderings: plan.orderings.clone(),
@@ -1333,55 +1645,88 @@ fn step_instantiation(ctx: &SearchContext, plan: &Rc<Plan>) -> Option<Rc<Plan>> 
         open_conds: None,
         num_open_conds: 0,
         id: std::cell::Cell::new(plan.id.get()),
+        expanded: std::cell::Cell::new(false),
     }))
 }
 
-/// Recursively binds each unbound schema parameter to a compatible object.
-fn instantiate_steps(
-    ctx: &SearchContext,
-    steps: &Option<Rc<chain::Chain<crate::plan::Step>>>,
-    bindings: Rc<Bindings>,
-) -> Option<Rc<Bindings>> {
-    let step_vec: Vec<crate::plan::Step> = chain::iter(steps).cloned().collect();
-    instantiate_step_list(ctx, &step_vec, 0, 0, bindings)
-}
-
-fn instantiate_step_list(
-    ctx: &SearchContext,
-    steps: &[crate::plan::Step],
-    step_idx: usize,
-    param_idx: usize,
-    bindings: Rc<Bindings>,
-) -> Option<Rc<Bindings>> {
-    if step_idx >= steps.len() {
-        return Some(bindings);
+/// Bind action parameters and all constrained witnesses. With parameterised
+/// costs, keep the cheapest consistent grounding rather than the first tuple.
+fn instantiate_steps(ctx: &SearchContext, plan: &Plan) -> Option<(Rc<Bindings>, usize)> {
+    enum Pending {
+        Visit(usize, Rc<Bindings>),
+        Choices(usize, Rc<Bindings>, std::vec::IntoIter<Object>),
     }
-    let step = &steps[step_idx];
-    let params = &step.action.parameters;
-    if params.len() <= param_idx {
-        return instantiate_step_list(ctx, steps, step_idx + 1, 0, bindings);
+    let mut variables = Vec::new();
+    for step in chain::iter(&plan.steps) {
+        variables.extend(step.action.parameters.iter().map(|&v| (v, step.id)));
     }
-    let v = params[param_idx];
-    // Already bound to an object?
-    if let Term::Object(_) = bindings.binding(Term::Variable(v), step.id) {
-        return instantiate_step_list(ctx, steps, step_idx, param_idx + 1, bindings);
-    }
-    let ty = step.action.var_types[v.0 as usize];
-    for obj in ctx.compatible_objects(ty) {
-        let bl = vec![crate::bindings::Binding::new(
-            v,
-            step.id,
-            Term::Object(obj),
-            0,
-            true,
-        )];
-        if let Some(nb) = bindings.add(&ctx.type_ctx(), &bl, false) {
-            if let Some(result) = instantiate_step_list(ctx, steps, step_idx, param_idx + 1, nb) {
-                return Some(result);
-            }
+    variables.extend(plan.bindings.constrained_variables());
+    variables.retain(|&(v, id)| {
+        matches!(
+            plan.bindings.binding(Term::Variable(v), id),
+            Term::Variable(_)
+        )
+    });
+    // Preserve parameter order, then remove duplicate witness entries.
+    let mut seen = std::collections::HashSet::new();
+    variables.retain(|v| seen.insert(*v));
+    let price = has_parameterised_costs(ctx);
+    let mut best: Option<(Rc<Bindings>, usize)> = None;
+    let mut pending = vec![Pending::Visit(0, plan.bindings.clone())];
+    while let Some(frame) = pending.pop() {
+        if ctx
+            .params
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return None;
         }
+        // Materialize one choice at a time. Pushing every bound sibling here
+        // would allocate an entire object domain even when the first choice
+        // immediately gives a solution.
+        let (mut index, bindings) = match frame {
+            Pending::Visit(index, bindings) => (index, bindings),
+            Pending::Choices(index, bindings, mut objects) => {
+                if let Some(object) = objects.next() {
+                    let (variable, step_id) = variables[index];
+                    let constraint = Binding::new(variable, step_id, Term::Object(object), 0, true);
+                    let bound = bindings.add(&ctx.type_ctx(), &[constraint], false);
+                    pending.push(Pending::Choices(index, bindings, objects));
+                    if let Some(bound) = bound {
+                        pending.push(Pending::Visit(index + 1, bound));
+                    }
+                }
+                continue;
+            }
+        };
+        while index < variables.len()
+            && matches!(
+                bindings.binding(Term::Variable(variables[index].0), variables[index].1),
+                Term::Object(_)
+            )
+        {
+            index += 1;
+        }
+        if index == variables.len() {
+            let cost = if price {
+                exact_plan_cost(ctx, plan, &bindings)
+            } else {
+                plan.cost
+            };
+            if best.as_ref().is_none_or(|(_, old)| cost < *old) {
+                best = Some((bindings, cost));
+            }
+            // The committed cost is a lower bound on all its groundings.
+            if !price || cost == plan.cost {
+                break;
+            }
+            continue;
+        }
+        let (variable, step_id) = variables[index];
+        let objects = ctx.compatible_objects(ctx.var_type(variable, step_id));
+        pending.push(Pending::Choices(index, bindings, objects.into_iter()));
     }
-    None
+    best
 }
 
 /// Formats the plan body: the problem header comment, then the scheduled step
@@ -1462,5 +1807,169 @@ fn format_float(f: f32) -> String {
         format!("{}", f as i64)
     } else {
         format!("{f}")
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::heuristics::Heuristic;
+    use crate::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
+
+    fn task() -> (Domain, Problem) {
+        let ParsedUnit::Domain(d) = read_pddl(
+            "(define (domain t) (:requirements :typing :strips)
+            (:types item other) (:predicates (done))
+            (:action first :parameters (?x - item) :precondition (and) :effect (done))
+            (:action second :parameters (?x ?y - other) :precondition (and) :effect (done)))",
+        )
+        .unwrap() else {
+            panic!("domain")
+        };
+        let domain = lower_domain(&d).unwrap();
+        let ParsedUnit::Problem(p) = read_pddl(
+            "(define (problem p) (:domain t)
+            (:objects a - item b - other) (:init) (:goal (done)))",
+        )
+        .unwrap() else {
+            panic!("problem")
+        };
+        let problem = lower_problem(&p, &domain).unwrap();
+        (domain, problem)
+    }
+
+    #[test]
+    fn fresh_variable_types_do_not_shift_with_a_siblings_parameter_count() {
+        let (domain, problem) = task();
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let first = Rc::new(schema_to_action(&domain.actions[0]));
+        let second = Rc::new(schema_to_action(&domain.actions[1]));
+        ctx.register_step(1, &first);
+        let v1 = ctx.fresh_forall_var(1, first.var_types[0]);
+        ctx.register_step(1, &second);
+        let v2 = ctx.fresh_forall_var(1, second.var_types[0]);
+        assert_ne!(v1, v2);
+        for action in [&first, &second] {
+            ctx.register_step(1, action);
+            assert_eq!(ctx.var_type(v1, 1), first.var_types[0]);
+            assert_eq!(ctx.var_type(v2, 1), second.var_types[0]);
+        }
+    }
+
+    #[test]
+    fn queue_rank_storage_does_not_allocate() {
+        use crate::alloc_test::allocations_during;
+        use std::hint::black_box;
+
+        let (domain, problem) = task();
+        let params = Parameters {
+            // Exercise all six slots, including explicit and implicit ID tags.
+            // Cheap terms isolate rank storage from heuristic workspace.
+            heuristic: Heuristic::parse("OC/FIFO/LIFO/UC").unwrap(),
+            ..Parameters::default()
+        };
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let plan = Plan::make_initial_plan(&ctx).unwrap();
+        plan.id.set(usize::MAX);
+        let before = ctx.h_evals.get();
+        let ((a, g), allocations) = allocations_during(|| black_box(plan.queue_ranks(&ctx)));
+        assert_eq!(allocations, 0);
+        assert_eq!(ctx.h_evals.get(), before + 1);
+        let expected = [1.0, usize::MAX as f32, -(usize::MAX as f32), 0.0];
+        assert_eq!(&*a, &expected);
+        assert_eq!(&g[..4], &expected);
+        assert_eq!(&g[4..], &[1.0, -(usize::MAX as f32)]);
+
+        // The owned-vector API is a positive control for the allocation counter
+        // and must retain the same numeric scores and evaluation accounting.
+        let ((av, gv), allocations) = allocations_during(|| black_box(plan.rank_both(&ctx)));
+        assert_eq!(allocations, 2);
+        assert_eq!(ctx.h_evals.get(), before + 2);
+        assert_eq!(&*a, av);
+        assert_eq!(&*g, gv);
+
+        for greedy in [false, true] {
+            let (rank, allocations) = allocations_during(|| {
+                black_box(if greedy {
+                    plan.queue_rank_gbfs(&ctx)
+                } else {
+                    plan.queue_rank(&ctx)
+                })
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(&*rank, if greedy { &gv } else { &av });
+        }
+        assert_eq!(ctx.h_evals.get(), before + 4);
+    }
+
+    #[test]
+    fn queues_and_lazy_reranking_use_exact_plan_ids() {
+        let (domain, problem) = task();
+        for older in [1 << 24, usize::MAX - 1] {
+            for (name, newest_first) in [
+                ("OC/LIFO", true),
+                ("OC/FIFO", false),
+                ("LIFO/FIFO", true),
+                ("FIFO/LIFO", false),
+            ] {
+                let params = Parameters {
+                    heuristic: Heuristic::parse(name).unwrap(),
+                    ..Parameters::default()
+                };
+                let ctx = SearchContext::new(&domain, &problem, &params);
+                for (lazy, greedy) in [(false, false), (false, true), (true, true)] {
+                    for ids in [[older, older + 1], [older + 1, older]] {
+                        let mut queue = BinaryHeap::new();
+                        for id in ids {
+                            let plan = Plan::make_initial_plan(&ctx).unwrap();
+                            plan.id.set(id);
+                            let rank = if lazy {
+                                Rank::lazy_proxy(RankTerm::ZERO, plan.num_open_conds(), id)
+                            } else if greedy {
+                                plan.queue_rank_gbfs(&ctx)
+                            } else {
+                                plan.queue_rank(&ctx)
+                            };
+                            queue.push(QueuedPlan {
+                                plan,
+                                rank,
+                                is_lazy: lazy,
+                            });
+                        }
+                        let first = if newest_first { older + 1 } else { older };
+                        let second = if newest_first { older } else { older + 1 };
+                        for expected in [first, second] {
+                            let (next, _) = pop_next(
+                                &mut queue, None, &ctx, lazy, greedy, false, false, &mut 0, &mut 0,
+                            );
+                            assert_eq!(next.unwrap().id.get(), expected, "{name} lazy={lazy}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_queue_checks_its_deadline_before_evaluating_another_node() {
+        let (domain, problem) = task();
+        let params = Parameters {
+            deadline: Some(Instant::now()),
+            ..Parameters::default()
+        };
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let plan = Plan::make_initial_plan(&ctx).unwrap();
+        let mut queue = BinaryHeap::from([QueuedPlan {
+            plan,
+            rank: Rank::from_slice(&[0.0]),
+            is_lazy: true,
+        }]);
+        let (next, _) = pop_next(
+            &mut queue, None, &ctx, true, true, false, false, &mut 0, &mut 0,
+        );
+        assert!(next.is_none());
+        assert_eq!(ctx.h_evals.get(), 0);
+        assert_eq!(queue.len(), 1, "stopping must leave the node queued");
     }
 }

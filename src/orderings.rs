@@ -6,6 +6,7 @@
 //! specially rather than stored in the matrix.
 
 use std::collections::HashMap;
+use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 
 use crate::plan::GOAL_ID;
@@ -100,6 +101,92 @@ impl Row {
     }
 }
 
+/// Keep short plans flat; share blocks of row pointers once plans grow. The
+/// rows themselves were already shared, but cloning the entire pointer table
+/// for every child dominated retained memory on long plans (e.g. miconic).
+/// A refinement now copies the directory and only the blocks it changes.
+const ROW_BLOCK_SIZE: usize = 32;
+
+#[derive(Debug, Clone)]
+enum RowTable {
+    Flat(Vec<Rc<Row>>),
+    Blocked(Vec<Rc<Vec<Rc<Row>>>>),
+}
+
+impl Default for RowTable {
+    fn default() -> Self {
+        Self::Flat(Vec::new())
+    }
+}
+
+impl RowTable {
+    #[inline]
+    fn get(&self, index: usize) -> Option<&Rc<Row>> {
+        match self {
+            Self::Flat(rows) => rows.get(index),
+            Self::Blocked(blocks) => blocks
+                .get(index / ROW_BLOCK_SIZE)?
+                .get(index % ROW_BLOCK_SIZE),
+        }
+    }
+
+    /// Extend a shared table without reallocating a freshly cloned tail.
+    /// All blocks except the last are full; only that last block can grow.
+    fn expanded(&self, new_len: usize) -> Self {
+        let empty = Rc::new(Row::default());
+        if let Self::Flat(rows) = self {
+            if new_len <= ROW_BLOCK_SIZE {
+                let mut next = Vec::with_capacity(new_len);
+                next.extend(rows.iter().cloned());
+                next.resize(new_len, empty);
+                return Self::Flat(next);
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(new_len.div_ceil(ROW_BLOCK_SIZE));
+        match self {
+            Self::Flat(rows) if !rows.is_empty() => blocks.push(Rc::new(rows.clone())),
+            Self::Flat(_) => {}
+            Self::Blocked(old) => blocks.extend(old.iter().cloned()),
+        }
+        if let Some(last) = blocks.last() {
+            let tail_len = (new_len - (blocks.len() - 1) * ROW_BLOCK_SIZE).min(ROW_BLOCK_SIZE);
+            if last.len() < tail_len {
+                let mut tail = Vec::with_capacity(tail_len);
+                tail.extend(last.iter().cloned());
+                tail.resize(tail_len, empty.clone());
+                *blocks.last_mut().unwrap() = Rc::new(tail);
+            }
+        }
+        while blocks.len() * ROW_BLOCK_SIZE < new_len {
+            let len = (new_len - blocks.len() * ROW_BLOCK_SIZE).min(ROW_BLOCK_SIZE);
+            blocks.push(Rc::new(vec![empty.clone(); len]));
+        }
+        Self::Blocked(blocks)
+    }
+}
+
+impl Index<usize> for RowTable {
+    type Output = Rc<Row>;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("step has an ordering row")
+    }
+}
+
+impl IndexMut<usize> for RowTable {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match self {
+            Self::Flat(rows) => &mut rows[index],
+            Self::Blocked(blocks) => {
+                &mut Rc::make_mut(&mut blocks[index / ROW_BLOCK_SIZE])[index % ROW_BLOCK_SIZE]
+            }
+        }
+    }
+}
+
 /// Transitive-closure boolean order over real step ids.
 ///
 /// Successor-major: `succ[k - 1]` is the bit set of steps that step `k` is
@@ -115,8 +202,8 @@ pub struct BinaryOrderings {
     /// Highest real step id seen (0 means only init/goal). Real steps are
     /// `1..=high_id`.
     high_id: usize,
-    /// Per-step successor rows; `succ.len() == high_id`.
-    succ: Vec<Rc<Row>>,
+    /// Per-step successor rows; there are `high_id` entries.
+    succ: RowTable,
 }
 
 impl BinaryOrderings {
@@ -205,18 +292,9 @@ impl BinaryOrderings {
     ) -> Option<Rc<BinaryOrderings>> {
         if new_step_id != 0 && new_step_id != GOAL_ID {
             let mut orderings = if new_step_id > self.high_id {
-                // Clone straight into a vector sized for the new rows. Cloning
-                // first and resizing after would allocate twice: `Vec::clone`
-                // leaves `len == capacity`, so the resize reallocates the
-                // vector that was just built.
-                let mut succ = Vec::with_capacity(new_step_id);
-                succ.extend(self.succ.iter().cloned());
-                // Empty rows are free: a row allocates words only once the step
-                // actually gains a successor.
-                succ.resize(new_step_id, Rc::new(Row::default()));
                 BinaryOrderings {
                     high_id: new_step_id,
-                    succ,
+                    succ: self.succ.expanded(new_step_id),
                 }
             } else {
                 (**self).clone()
@@ -277,32 +355,31 @@ impl BinaryOrderings {
     /// predecessors; the initial step is not scheduled (it is implicitly at
     /// time 0).
     pub fn schedule(&self) -> (HashMap<usize, f32>, f32) {
-        let mut start_times: HashMap<usize, f32> = HashMap::new();
+        // In a transitive closure every predecessor has strictly more
+        // successors than its descendant. Sorting by that count therefore
+        // gives a topological order without recursion on the plan's depth.
+        let mut order: Vec<_> = (1..=self.high_id).collect();
+        order.sort_by_cached_key(|&id| {
+            std::cmp::Reverse(
+                self.succ[id - 1]
+                    .words
+                    .iter()
+                    .map(|w| w.count_ones() as usize)
+                    .sum::<usize>(),
+            )
+        });
+        let mut distances = vec![1.0f32; self.high_id];
         let mut max_dist = 0.0f32;
-        for i in 1..=self.high_id {
-            let ed = self.schedule_step(&mut start_times, i);
-            if ed > max_dist {
-                max_dist = ed;
-            }
-        }
-        (start_times, max_dist)
-    }
-
-    fn schedule_step(&self, start_times: &mut HashMap<usize, f32>, step_id: usize) -> f32 {
-        if let Some(&d) = start_times.get(&step_id) {
-            return d;
-        }
-        let mut sd = 1.0f32;
-        for j in 1..=self.high_id {
-            if step_id != j && self.ordered_before(j, step_id) {
-                let ed = 1.0 + self.schedule_step(start_times, j);
-                if ed > sd {
-                    sd = ed;
+        for &id in &order {
+            let distance = distances[id - 1];
+            max_dist = max_dist.max(distance);
+            for next in 1..=self.high_id {
+                if self.ordered_before(id, next) {
+                    distances[next - 1] = distances[next - 1].max(distance + 1.0);
                 }
             }
         }
-        start_times.insert(step_id, sd);
-        sd
+        ((1..=self.high_id).zip(distances).collect(), max_dist)
     }
 }
 
@@ -465,12 +542,105 @@ mod tests {
     fn set_before_and_rows_grow_lazily() {
         let mut orderings = BinaryOrderings::new();
         orderings.high_id = 3;
-        orderings.succ.resize(3, Rc::new(Row::default()));
+        orderings.succ = orderings.succ.expanded(3);
         // An untouched row holds no words at all.
         assert!(orderings.succ[0].words.is_empty());
         assert!(!orderings.ordered_before(1, 3));
         orderings.set_before(1, 3);
         assert!(orderings.ordered_before(1, 3));
         assert!(!orderings.ordered_before(3, 1));
+    }
+
+    #[test]
+    fn row_table_shares_unchanged_blocks_and_isolates_writes() {
+        let flat = RowTable::default().expanded(ROW_BLOCK_SIZE);
+        assert!(matches!(flat, RowTable::Flat(_)));
+        let parent = flat.expanded(2 * ROW_BLOCK_SIZE + 1);
+        let mut child = parent.expanded(2 * ROW_BLOCK_SIZE + 2);
+        let (RowTable::Blocked(before), RowTable::Blocked(after)) = (&parent, &child) else {
+            panic!("long tables should share blocks");
+        };
+        assert!(Rc::ptr_eq(&before[0], &after[0]));
+        assert!(Rc::ptr_eq(&before[1], &after[1]));
+        assert!(!Rc::ptr_eq(&before[2], &after[2]));
+        // A row write must copy its containing block before testing whether
+        // the row itself is shared, or the parent's row could be mutated.
+        Rc::make_mut(&mut child[ROW_BLOCK_SIZE]).set(129);
+        assert!(!parent[ROW_BLOCK_SIZE].get(129));
+        assert!(child[ROW_BLOCK_SIZE].get(129));
+        assert!(!child[ROW_BLOCK_SIZE + 1].get(129));
+        let (RowTable::Blocked(before), RowTable::Blocked(after)) = (&parent, &child) else {
+            unreachable!();
+        };
+        assert!(Rc::ptr_eq(&before[0], &after[0]));
+        assert!(!Rc::ptr_eq(&before[1], &after[1]));
+        assert!(parent.get(2 * ROW_BLOCK_SIZE + 1).is_none());
+        assert!(child.get(2 * ROW_BLOCK_SIZE + 1).is_some());
+    }
+
+    #[test]
+    fn closure_matches_reference_across_block_and_word_boundaries() {
+        const N: usize = 130;
+        let mut orderings = Rc::new(BinaryOrderings::new())
+            .refine_with_step(
+                Ordering::new(N, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                N,
+            )
+            .unwrap();
+        let empty = orderings.clone();
+        let mut reference = Reference::new(N);
+        for (a, b) in [
+            (1, 32),
+            (32, 33),
+            (33, 64),
+            (64, 65),
+            (65, 96),
+            (96, 97),
+            (97, 128),
+            (128, 129),
+            (129, 130),
+            (1, 64),
+            (128, 32),
+        ] {
+            let refined = orderings.refine(Ordering::new(a, StepTime::AtEnd, b, StepTime::AtStart));
+            assert_eq!(refined.is_some(), reference.refine(a, b));
+            if let Some(next) = refined {
+                orderings = next;
+            }
+            for x in 1..=N {
+                for y in 1..=N {
+                    assert_eq!(orderings.ordered_before(x, y), reference.get(x, y));
+                    assert!(!empty.ordered_before(x, y));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_deep_reverse_order_schedules_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let n = 2_000;
+                let mut orderings = BinaryOrderings {
+                    high_id: n,
+                    succ: RowTable::default().expanded(n),
+                };
+                for id in 1..=n {
+                    let mut row = Row::default();
+                    for predecessor in 1..id {
+                        row.set(predecessor - 1);
+                    }
+                    orderings.succ[id - 1] = Rc::new(row);
+                }
+                let (times, makespan) = orderings.schedule();
+                assert_eq!(makespan, n as f32);
+                for id in 1..=n {
+                    assert_eq!(times[&id], (n + 1 - id) as f32);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

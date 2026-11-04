@@ -82,6 +82,11 @@ impl GroundTask {
         &mut self.ops
     }
 
+    /// The interned name of a fact, for diagnostics.
+    pub fn fact_name(&self, fact: usize) -> &str {
+        &self.facts[fact]
+    }
+
     pub fn num_facts(&self) -> usize {
         self.facts.len()
     }

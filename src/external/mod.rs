@@ -148,7 +148,7 @@ fn in_repo_checkout(rel: &str) -> Option<String> {
     for root in roots {
         let candidate = root.join("downward").join(rel);
         if candidate.exists() {
-            return Some(candidate.to_string_lossy().into_owned());
+            return Some(resolve_program_path(&candidate.to_string_lossy()));
         }
     }
     None
@@ -162,7 +162,7 @@ fn in_repo_checkout(rel: &str) -> Option<String> {
 /// the apptainer `.sif` image, so callers need not care which is configured.
 pub fn fd_path() -> String {
     if let Ok(p) = std::env::var("POTOROO_FD") {
-        return p;
+        return resolve_program_path(&p);
     }
     if let Some(p) = in_repo_checkout("fast-downward.py") {
         return p;
@@ -207,7 +207,7 @@ pub fn run_fd_heuristic(
 /// order: `POTOROO_DOWNWARD` env → the submodule build → `downward` on `PATH`.
 pub fn downward_path() -> String {
     if let Ok(p) = std::env::var("POTOROO_DOWNWARD") {
-        return p;
+        return resolve_program_path(&p);
     }
     for build in ["release", "debug"] {
         let rel = format!("builds/{build}/bin/downward");
@@ -216,6 +216,14 @@ pub fn downward_path() -> String {
         }
     }
     "downward".to_string()
+}
+
+/// Child processes run in a temporary directory. Resolve existing local paths
+/// before changing cwd, while leaving bare executable names for PATH lookup.
+fn resolve_program_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|absolute| absolute.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
 }
 
 /// Whether the `downward` binary appears invocable.
@@ -613,13 +621,34 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…(truncated)", &s[..max])
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…(truncated)", &s[..end])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate("aéz", 2), "a…(truncated)");
+        assert_eq!(truncate("é", 1), "…(truncated)");
+    }
+
+    #[test]
+    fn local_program_paths_survive_a_child_working_directory_change() {
+        let resolved = resolve_program_path("./Cargo.toml");
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert!(std::path::Path::new(&resolved).is_file());
+        assert_eq!(
+            resolve_program_path("potoroo-nonexistent-executable"),
+            "potoroo-nonexistent-executable"
+        );
+    }
 
     #[test]
     fn parses_matching_initial_value() {

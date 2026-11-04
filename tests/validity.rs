@@ -213,3 +213,27 @@ fn mcd_blocks_world_valid_ground() {
         true,
     );
 }
+
+/// The lifted landmark heuristic is the only one that solves `fixit`, so its
+/// plan has never been through the independent checker under any other
+/// configuration. A heuristic that unlocks a problem is exactly the one whose
+/// output most needs verifying.
+#[test]
+fn flat_tire_valid_under_landmarks() {
+    check("flat-tire-domain.pddl", "fixit.pddl", "LM", false);
+}
+
+#[test]
+fn ferry_valid_under_landmarks() {
+    check("ferry-domain.pddl", "test-ferry.pddl", "LM", false);
+}
+
+#[test]
+fn sussman_valid_under_landmarks() {
+    check(
+        "blocks-world-domain.pddl",
+        "sussman-anomaly.pddl",
+        "LM",
+        false,
+    );
+}

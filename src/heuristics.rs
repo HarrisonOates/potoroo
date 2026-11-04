@@ -8,6 +8,7 @@ use crate::flaws::Flaw;
 use crate::plan::Plan;
 use crate::planning_graph::{formula_value, PlanningGraph};
 use crate::predicates::PredicateTable;
+use crate::rank::Rank;
 use crate::search::SearchContext;
 
 /// A plan-ranking heuristic value. `MAKESPAN` (temporal) is deferred.
@@ -31,11 +32,30 @@ pub(crate) enum HVal {
     /// action; `RelaxR` reuses existing plan steps (counts only new actions).
     Relax,
     RelaxR,
+    /// Lifted landmark count: how many of the task's lifted landmarks no step
+    /// of the partial plan achieves. Not a delete relaxation, and it needs no
+    /// grounding. See [`crate::landmarks`].
+    ///
+    /// `fam` adds the FAM-cut landmarks ([`crate::fam_cut`]) to the ones
+    /// backchaining over necessary subgoals finds; `orderings` counts a
+    /// landmark whose predecessor is still outstanding even when the plan
+    /// already achieves some instance of it. The four combinations are the
+    /// paper's `h^LNS`, `h^LNS→`, `h^LFAM` and `h^LFAM→`.
+    Landmarks {
+        fam: bool,
+        orderings: bool,
+    },
     /// Native LM-cut over the FDR POCL open-condition relaxation. `LmCut`
     /// starts from the problem initial state; `LmCutR` also treats effects of
     /// committed steps as initially available. FDR POCL search only.
     LmCut,
     LmCutR,
+    /// The causal-link compilation (Bercher, Geier & Biundo 2013), delete
+    /// relaxed and evaluated natively over the finite-domain task: `h_add` or
+    /// `h_FF` of the classical task in which every committed step is an
+    /// action that must run. FDR POCL search only. See [`crate::cl_relax`].
+    ClAdd,
+    ClFf,
     /// Sample-FF heuristic (Bercher et al. 2013): keep the committed plan steps
     /// non-relaxed and fill the gaps between them with delete relaxation, over
     /// `usize` sampled linearizations of the partial order. Ground search only.
@@ -43,7 +63,9 @@ pub(crate) enum HVal {
     /// Lplan LP heuristic (Bylander 1997): the smallest horizon whose relaxed LP
     /// over the causal-link compilation reaches the goal — an admissible lower
     /// bound on the completion length. Ground search only.
-    Lplan,
+    Lplan(crate::lplan::Tightenings),
+    /// The SAS+ LP heuristic over Fast Downward's finite-domain task.
+    Lpsas(crate::lpsas::Operators),
     /// Causal-link compilation heuristic: rank by a state-based heuristic
     /// (computed by Fast Downward) on the initial state of the classical problem
     /// the partial plan compiles to (`crate::compile`). The `FdHeuristic` is the
@@ -66,6 +88,42 @@ impl Heuristic {
             // Causal-link compilation heuristics (COMPILE / COMPILE_FF / ...).
             if let Some(backend) = crate::compile::parse_backend(part) {
                 h.push(HVal::Compile(backend));
+                continue;
+            }
+            // Lplan: `LPLAN` is Bylander's encoding as published; `LPLAN2` adds the
+            // tightenings, with `LPLAN2:a+b` selecting them individually so each
+            // can be ablated against the baseline.
+            let upper = part.to_ascii_uppercase();
+            if upper == "LPLAN" {
+                h.push(HVal::Lplan(crate::lplan::Tightenings::NONE));
+                continue;
+            }
+            // `LPSAS` relaxes the operator variables; `LPSAS:MIP` holds them
+            // integral, and `LPSAS:MIP<millis>` caps each probe at that budget.
+            if upper == "LPSAS" || upper.starts_with("LPSAS:") {
+                let spec = upper.strip_prefix("LPSAS:").unwrap_or("");
+                let operators = match spec {
+                    "" => crate::lpsas::Operators::Fractional,
+                    "MIP" => crate::lpsas::Operators::Integral,
+                    other => match other.strip_prefix("MIP") {
+                        Some(millis) => crate::lpsas::Operators::IntegralWithin(
+                            millis
+                                .parse::<u64>()
+                                .map_err(|_| format!("invalid LPSAS budget `{millis}`"))?,
+                        ),
+                        None => {
+                            return Err(format!(
+                                "unknown LPSAS mode `{other}` (expected MIP or MIP<millis>)"
+                            ))
+                        }
+                    },
+                };
+                h.push(HVal::Lpsas(operators));
+                continue;
+            }
+            if upper == "LPLAN2" || upper.starts_with("LPLAN2:") {
+                let spec = upper.strip_prefix("LPLAN2:").unwrap_or("");
+                h.push(HVal::Lplan(crate::lplan::Tightenings::parse(spec)?));
                 continue;
             }
             // Sample-FF (SAMPLE_FF or SAMPLE_FF:k for k samples).
@@ -91,6 +149,22 @@ impl Heuristic {
                 "BUC" => HVal::Buc,
                 "S+OC" => HVal::SPlusOc,
                 "UCPOP" => HVal::Ucpop,
+                "LM" | "LANDMARKS" => HVal::Landmarks {
+                    fam: false,
+                    orderings: false,
+                },
+                "LMO" => HVal::Landmarks {
+                    fam: false,
+                    orderings: true,
+                },
+                "LMF" => HVal::Landmarks {
+                    fam: true,
+                    orderings: false,
+                },
+                "LMFO" => HVal::Landmarks {
+                    fam: true,
+                    orderings: true,
+                },
                 "ADD" => {
                     needs_pg = true;
                     HVal::Add
@@ -125,13 +199,24 @@ impl Heuristic {
                 }
                 "LMCUT" | "LM-CUT" => HVal::LmCut,
                 "LMCUTR" | "LM-CUTR" => HVal::LmCutR,
-                "LPLAN" => HVal::Lplan,
+                "CLADD" | "CL_ADD" => HVal::ClAdd,
+                "CLFF" | "CL_FF" => HVal::ClFf,
+
                 "MAKESPAN" => {
                     return Err("heuristic `MAKESPAN` is temporal and not yet supported".to_string())
                 }
                 other => return Err(format!("invalid heuristic `{other}`")),
             };
             h.push(v);
+        }
+        // A queue entry stores its rank inline, with room for the composed
+        // terms plus the two tiebreakers a search algorithm appends.
+        if h.len() > crate::rank::MAX_HEURISTIC_TERMS {
+            return Err(format!(
+                "at most {} heuristics can be composed with `/`, got {}",
+                crate::rank::MAX_HEURISTIC_TERMS,
+                h.len()
+            ));
         }
         Ok(Heuristic { h, needs_pg })
     }
@@ -145,7 +230,7 @@ impl Heuristic {
     pub fn requires_fdr_pocl(&self) -> bool {
         self.h
             .iter()
-            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR))
+            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf))
     }
 
     /// Parsed ranking terms for alternate plan representations. Keeping the
@@ -155,7 +240,27 @@ impl Heuristic {
         &self.h
     }
 
-    /// Fills `rank` with the heuristic ranks for `plan`. Lower is better.
+    /// The previous numeric-vector conversion, retained only as a test oracle
+    /// for the direct inline builder's score values and exact ID tags.
+    #[cfg(test)]
+    pub(crate) fn queue_rank(&self, values: Vec<f32>) -> Rank {
+        let mut rank = Rank::from_slice(&values);
+        assert!(values.len() == self.h.len() || values.len() == self.h.len() + 2);
+        for (index, term) in self.h.iter().enumerate() {
+            match term {
+                HVal::Fifo => rank.mark_fifo(index),
+                HVal::Lifo => rank.mark_lifo(index),
+                _ => {}
+            }
+        }
+        if values.len() == self.h.len() + 2 {
+            // GBFS appends open-condition count and LIFO after user terms.
+            rank.mark_lifo(values.len() - 1);
+        }
+        rank
+    }
+
+    /// Returns the numeric heuristic ranks for `plan`. Lower is better.
     pub fn plan_rank(
         &self,
         plan: &Plan,
@@ -165,14 +270,15 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> Vec<f32> {
-        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+        self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx)
             .0
+            .to_vec()
     }
 
     /// Computes the A* rank ([`plan_rank`](Self::plan_rank)) and the GBFS rank
     /// ([`plan_rank_gbfs`](Self::plan_rank_gbfs)) in one pass, sharing every
     /// heuristic evaluation between them. The two ranks differ only in the
-    /// g-component (step count) mixed into some entries and the trailing GBFS
+    /// g-component (committed action cost) mixed into some entries and the trailing GBFS
     /// tiebreakers, so algorithms that need both orderings of the same plan
     /// (`ALT`) pay one evaluation instead of two.
     pub fn plan_rank_both(
@@ -184,8 +290,24 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> (Vec<f32>, Vec<f32>) {
-        let mut rank = Vec::with_capacity(self.h.len());
-        let mut grank = Vec::with_capacity(self.h.len() + 2);
+        let (rank, grank) = self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx);
+        (rank.to_vec(), grank.to_vec())
+    }
+
+    /// Evaluate once into the two inline queue ranks. The vector-returning
+    /// public APIs above are diagnostic compatibility wrappers; search uses
+    /// these ranks directly without allocating temporary score vectors.
+    pub(crate) fn plan_queue_ranks(
+        &self,
+        plan: &Plan,
+        weight: f32,
+        predicates: &PredicateTable,
+        ctx: &TypeContext,
+        pg: Option<&PlanningGraph>,
+        search_ctx: &SearchContext,
+    ) -> (Rank, Rank) {
+        let mut rank = Rank::new();
+        let mut grank = Rank::new();
         // Cache the ADD / ADDR sums across the (single) ADD* / ADDR* terms.
         let mut add_done = false;
         let mut add_cost = 0.0f32;
@@ -201,12 +323,12 @@ impl Heuristic {
             match h {
                 // No g component: both ranks carry the same value.
                 HVal::Lifo => {
-                    rank.push(-(plan.serial_no() as f32));
-                    grank.push(-(plan.serial_no() as f32));
+                    rank.push_lifo(plan.serial_no());
+                    grank.push_lifo(plan.serial_no());
                 }
                 HVal::Fifo => {
-                    rank.push(plan.serial_no() as f32);
-                    grank.push(plan.serial_no() as f32);
+                    rank.push_fifo(plan.serial_no());
+                    grank.push_fifo(plan.serial_no());
                 }
                 HVal::Oc => {
                     rank.push(plan.num_open_conds() as f32);
@@ -349,7 +471,12 @@ impl Heuristic {
                         }
                     }
                 }
-                HVal::LmCut | HVal::LmCutR => {
+                HVal::Landmarks { fam, orderings } => {
+                    let v = search_ctx.landmarks(fam).count(plan, orderings) as f32;
+                    rank.push(g + weight * v);
+                    grank.push(weight * v);
+                }
+                HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf => {
                     unreachable!("native LMCUT/LMCUTR requires FDR POCL search")
                 }
                 // Delegating heuristics carry no separable g component; both
@@ -359,8 +486,13 @@ impl Heuristic {
                     rank.push(v);
                     grank.push(v);
                 }
-                HVal::Lplan => {
-                    let v = crate::lplan::lplan_rank(plan, search_ctx, weight);
+                HVal::Lpsas(operators) => {
+                    let v = crate::lpsas::lpsas_rank(plan, search_ctx, weight, operators);
+                    rank.push(v);
+                    grank.push(v);
+                }
+                HVal::Lplan(tightenings) => {
+                    let v = crate::lplan::lplan_rank(plan, search_ctx, weight, tightenings);
                     rank.push(v);
                     grank.push(v);
                 }
@@ -376,15 +508,16 @@ impl Heuristic {
         // would sweep h-plateaus breadth-first, which is exactly where greedy
         // search stalls; diving on the newest plan escapes them.
         grank.push(plan.num_open_conds() as f32);
-        grank.push(-(plan.serial_no() as f32));
+        grank.push_lifo(plan.serial_no());
         (rank, grank)
     }
 
-    /// Greedy-BFS variant of [`plan_rank`]: strips the g-component (step count)
-    /// from each `HVal` so the primary sort criterion is pure h. After the
-    /// h-components, `steps` and `plan_id` are appended as tiebreakers so the
-    /// ordering remains deterministic. Heuristics that already have no g
-    /// component (e.g. `AddCost`, `Oc`, `Fifo`) are returned unchanged.
+    /// Greedy-BFS variant of [`plan_rank`](Self::plan_rank): strips the
+    /// g-component (committed action cost) from each `HVal` so the primary sort
+    /// criterion is pure h. After the selected terms come open-condition count
+    /// and the LIFO ID approximation. Terms that already have no g component
+    /// (e.g. `AddCost`, `Oc`, `Fifo`) are returned unchanged. These numeric
+    /// vectors are diagnostic; search compares integer ID terms exactly.
     pub fn plan_rank_gbfs(
         &self,
         plan: &Plan,
@@ -394,8 +527,9 @@ impl Heuristic {
         pg: Option<&PlanningGraph>,
         search_ctx: &SearchContext,
     ) -> Vec<f32> {
-        self.plan_rank_both(plan, weight, predicates, ctx, pg, search_ctx)
+        self.plan_queue_ranks(plan, weight, predicates, ctx, pg, search_ctx)
             .1
+            .to_vec()
     }
 }
 
@@ -404,12 +538,15 @@ impl Heuristic {
 /// initial state, and combine as `g + weight*h` (`num_steps` committed plus the
 /// estimated remaining cost), matching the additive heuristic's shape.
 ///
-/// An unreachable compiled goal (FD reports infinite) or an FD error sinks the
-/// plan to `INFINITY` (it won't be expanded unless nothing better remains),
-/// matching how the ADD heuristic treats unreachable open conditions. Note: this
+/// An unreachable compiled goal (FD reports infinite) prunes the plan. An FD
+/// error disables this backend for the search and falls back to h = 0: failure
+/// to evaluate a heuristic says nothing about solvability. Note: this
 /// spawns an FD subprocess per evaluation — the dominant cost, as the paper
 /// notes; identical compiled problems are memoized in `crate::external`.
 fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuristic) -> f32 {
+    if ctx.failed_compile_backends.borrow().contains(&backend) {
+        return plan.cost() as f32;
+    }
     // Ground search: take the fast path — ground the task ourselves into FDR and
     // invoke only the `downward` C++ binary, skipping FD's Python translator
     // (~95% of the per-node cost). Lifted search: emit PDDL and run the full
@@ -425,8 +562,9 @@ fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuris
         Ok(HResult::Finite(h)) => plan.cost() as f32 + weight * h,
         Ok(HResult::Infinite) => f32::INFINITY,
         Err(e) => {
-            eprintln!("COMPILE heuristic: Fast Downward error: {e}");
-            f32::INFINITY
+            ctx.failed_compile_backends.borrow_mut().insert(backend);
+            eprintln!("COMPILE heuristic: Fast Downward error: {e}; using h=0 for this backend for the rest of this search");
+            plan.cost() as f32
         }
     }
 }
@@ -963,9 +1101,8 @@ impl FlawSelectionOrder {
             let local = oc.step_id == local_id;
             let mut is_static: i32 = -1;
             let mut is_unsafe: i32 = -1;
-            let mut refinements: i32 = -1;
-            let mut addable: i32 = -1;
-            let mut reusable: i32 = -1;
+            let mut counts = None;
+
             let mut c = first_criterion;
             while c <= last_criterion {
                 let crit = &self.selection_criteria[c as usize];
@@ -996,14 +1133,9 @@ impl FlawSelectionOrder {
                     || (crit.unsafe_open_cond && is_unsafe > 0);
                 if applies {
                     let within = crit.max_refinements == i32::MAX
-                        || plan.open_cond_refinements(
-                            ctx,
-                            &mut refinements,
-                            &mut addable,
-                            &mut reusable,
-                            oc,
-                            crit.max_refinements,
-                        );
+                        || counts
+                            .get_or_insert_with(|| crate::plan::OpenConditionCounts::new(plan, oc))
+                            .within(ctx, crit.max_refinements);
                     if within {
                         match crit.order {
                             OrderType::Lifo => {
@@ -1030,39 +1162,30 @@ impl FlawSelectionOrder {
                             }
                             OrderType::Lr => {
                                 let better = c < selection.criterion || {
-                                    plan.open_cond_refinements(
-                                        ctx,
-                                        &mut refinements,
-                                        &mut addable,
-                                        &mut reusable,
-                                        oc,
-                                        (selection.rank + 0.5) as i32 - 1,
-                                    )
+                                    counts
+                                        .get_or_insert_with(|| {
+                                            crate::plan::OpenConditionCounts::new(plan, oc)
+                                        })
+                                        .within(ctx, (selection.rank + 0.5) as i32 - 1)
                                 };
                                 if better {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
-                                    plan.open_cond_refinements(
-                                        ctx,
-                                        &mut refinements,
-                                        &mut addable,
-                                        &mut reusable,
-                                        oc,
-                                        i32::MAX,
-                                    );
+                                    let refinements = counts
+                                        .get_or_insert_with(|| {
+                                            crate::plan::OpenConditionCounts::new(plan, oc)
+                                        })
+                                        .exact(ctx);
                                     selection.rank = refinements as f32;
                                     last_criterion = if refinements == 0 { c - 1 } else { c };
                                 }
                             }
                             OrderType::Mr => {
-                                plan.open_cond_refinements(
-                                    ctx,
-                                    &mut refinements,
-                                    &mut addable,
-                                    &mut reusable,
-                                    oc,
-                                    i32::MAX,
-                                );
+                                let refinements = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .exact(ctx);
                                 if c < selection.criterion || refinements as f32 > selection.rank {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
@@ -1071,16 +1194,11 @@ impl FlawSelectionOrder {
                                 }
                             }
                             OrderType::New => {
-                                let has_new = if addable < 0 {
-                                    match oc.literal() {
-                                        Some(literal) => {
-                                            !plan.addable_steps(ctx, &mut addable, &literal, oc, 0)
-                                        }
-                                        None => false,
-                                    }
-                                } else {
-                                    addable > 0
-                                };
+                                let has_new = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .has_new(ctx);
                                 if has_new || c < selection.criterion {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
@@ -1088,20 +1206,11 @@ impl FlawSelectionOrder {
                                 }
                             }
                             OrderType::Reuse => {
-                                let has_reuse = if reusable < 0 {
-                                    match oc.literal() {
-                                        Some(literal) => !plan.reusable_steps(
-                                            ctx,
-                                            &mut reusable,
-                                            &literal,
-                                            oc,
-                                            0,
-                                        ),
-                                        None => false,
-                                    }
-                                } else {
-                                    reusable > 0
-                                };
+                                let has_reuse = counts
+                                    .get_or_insert_with(|| {
+                                        crate::plan::OpenConditionCounts::new(plan, oc)
+                                    })
+                                    .has_reuse(ctx);
                                 if has_reuse || c < selection.criterion {
                                     selection.flaw = Some(Flaw::OpenCondition(oc.clone()));
                                     selection.criterion = c;
