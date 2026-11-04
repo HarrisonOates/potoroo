@@ -715,22 +715,15 @@ impl PlanningGraph {
                     HeuristicValue::ZERO_COST_UNIT_WORK
                 }
             }
-            // Already ground before any binding lookup, so the pattern the arm
-            // below would resolve is fully bound and reproduces `atom`'s own
-            // terms. Take that arm's decisions directly rather than delegating
-            // to the unbound case above, which answers a different question:
-            // it neither checks whether the positive atom is still achievable
-            // nor reads the value out of the same table.
+            // Already ground: preserve the bindings-aware closed-world shortcut, but
+            // charge the cost of the negation when an action must achieve it.
             Some(_) if atom.ground() => {
-                // The same lookup answers both of that arm's uses of it: what
-                // `positive_value_for` returns for a ground atom, and the value
-                // it reads back once the negation table admits the atom.
                 let positive = self.heuristic_value_atom(atom, 0, None);
                 if !positive.zero() {
                     return HeuristicValue::ZERO;
                 }
-                if self.negation_values.contains_key(atom) {
-                    positive
+                if let Some(value) = self.negation_values.get(atom) {
+                    *value
                 } else if self.init_atoms.contains(atom) {
                     HeuristicValue::INFINITE
                 } else {
@@ -746,15 +739,13 @@ impl PlanningGraph {
                     return HeuristicValue::ZERO;
                 }
                 if let Some(terms) = pattern.object_terms() {
-                    // Fully bound: decide membership in the negation table
-                    // directly (the scan below values candidates through
-                    // `heuristic_value_atom`, so mirror that here).
+                    // Fully bound: read the cost of achieving the negation.
                     let ground = Atom {
                         predicate: atom.predicate,
                         terms,
                     };
-                    return if self.negation_values.contains_key(&ground) {
-                        self.heuristic_value_atom(&ground, 0, None)
+                    return if let Some(value) = self.negation_values.get(&ground) {
+                        *value
                     } else if self.init_atoms.contains(&ground) {
                         HeuristicValue::INFINITE
                     } else {
@@ -769,7 +760,7 @@ impl PlanningGraph {
                     &mut pattern,
                     |candidate| unifies(ctx, b, atom, step_id, candidate),
                     |candidate| {
-                        value = hv_min(value, self.heuristic_value_atom(candidate, 0, None));
+                        value = hv_min(value, self.heuristic_value_negation(candidate, 0, None));
                         !value.zero()
                     },
                 );
