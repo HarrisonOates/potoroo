@@ -3,7 +3,7 @@ name = "potoroo"
 version = "0.1.0"
 edition = "2021"
 description = "A modern partial-order causal-link (POCL) planner in Rust"
-license = "GPL-2.0-or-later"
+license = "Apache-2.0"
 
 [[bin]]
 name = "potoroo"

@@ -205,4 +205,5 @@ also appear beside their implementations.
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE.MD).
+Copyright 2026 Harrison Oates. Licensed under the [Apache License 2.0](LICENSE).
+See [NOTICE](NOTICE) for the copyright and license notice.
