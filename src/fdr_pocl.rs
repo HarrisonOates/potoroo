@@ -29,7 +29,7 @@ use thiserror::Error;
 
 use crate::chain::{self, Chain};
 use crate::external::FdError;
-use crate::fasthash::FastSet;
+use crate::fasthash::{FastMap, FastSet};
 use crate::fdr::{Fact, ParseError, Task};
 use crate::heuristics::{HVal, Heuristic, OrderType, SelectionCriterion};
 use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
@@ -1602,6 +1602,7 @@ impl<'a> Planner<'a> {
                 ),
                 plan.next_step_id,
             );
+            let mut sibling_links: FastMap<usize, Rc<Chain<CausalLink>>> = FastMap::default();
             let mut sibling_threats: FastSet<Rc<Vec<Threat>>> = FastSet::default();
             for achiever in achievers {
                 if let (Some(table), Some(used)) = (&self.symmetry, &used) {
@@ -1611,7 +1612,30 @@ impl<'a> Planner<'a> {
                     }
                 }
                 if let Some(orderings) = &new_step_orderings {
-                    if let Some(mut child) = self.add_step(plan, &open, achiever, orderings.clone())
+                    // The producer id, consumer, fact and tail are identical
+                    // across new-step siblings. Only the supporting effect's
+                    // index varies; its operator lives in each child's steps.
+                    let make_link = || {
+                        Chain::new(
+                            CausalLink {
+                                producer: plan.next_step_id,
+                                consumer: open.consumer,
+                                condition: open.condition,
+                                effect: Some(achiever.effect),
+                            },
+                            plan.links.clone(),
+                        )
+                    };
+                    let link = if achievers.len() > 1 {
+                        sibling_links
+                            .entry(achiever.effect)
+                            .or_insert_with(make_link)
+                            .clone()
+                    } else {
+                        make_link()
+                    };
+                    if let Some(mut child) =
+                        self.add_step(plan, &open, achiever, orderings.clone(), link)
                     {
                         // Different achievers often introduce the same conflicts.
                         // Keep one copy per sibling group, after independently
@@ -1717,6 +1741,7 @@ impl<'a> Planner<'a> {
         open: &OpenCondition,
         achiever: &Achiever,
         orderings: Rc<BinaryOrderings>,
+        link: Rc<Chain<CausalLink>>,
     ) -> Option<PartialPlan> {
         let new_id = plan.next_step_id;
         let operator = &self.task.operators[achiever.operator];
@@ -1734,12 +1759,8 @@ impl<'a> Planner<'a> {
         });
         child.remove_open(open);
         let link_index = child.num_links;
-        child.push_link(CausalLink {
-            producer: new_id,
-            consumer: open.consumer,
-            condition: open.condition,
-            effect: Some(achiever.effect),
-        });
+        child.links = Some(link);
+        child.num_links += 1;
         for &condition in &self.operator_preconditions[achiever.operator] {
             child.push_open(OpenCondition {
                 consumer: new_id,
@@ -3185,7 +3206,7 @@ mod tests {
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
     #[test]
-    fn new_step_siblings_share_orderings_without_sharing_later_refinements() {
+    fn new_step_siblings_share_storage_without_sharing_later_refinements() {
         let mut task = travel_task();
         // Three distinct achievers for the goal, each requiring location=1.
         task.operators.push(task.operators[1].clone());
@@ -3197,6 +3218,10 @@ mod tests {
         assert_eq!(children.len(), 3);
         for child in &children {
             assert!(Rc::ptr_eq(&child.orderings, &children[0].orderings));
+            assert!(Rc::ptr_eq(
+                child.links.as_ref().unwrap(),
+                children[0].links.as_ref().unwrap()
+            ));
             assert!(!Rc::ptr_eq(&child.orderings, &parent.orderings));
             assert_eq!(child.threats(&task), child.rediscover_threats(&task));
         }
@@ -3208,11 +3233,67 @@ mod tests {
         assert_eq!(next.len(), 1);
         assert!(is_ordered_before(&next[0].orderings, 2, 1));
         assert!(!Rc::ptr_eq(&next[0].orderings, &children[0].orderings));
+        assert_eq!(next[0].num_links(), 2);
+        assert!(Rc::ptr_eq(
+            next[0].links.as_ref().unwrap().tail.as_ref().unwrap(),
+            children[0].links.as_ref().unwrap()
+        ));
         for sibling in &children {
+            assert_eq!(sibling.num_links(), 1);
             assert_eq!(sibling.num_steps(), 1);
             assert!(!is_ordered_before(&sibling.orderings, 2, 1));
         }
         assert_eq!(parent.num_steps(), 0);
+    }
+
+    #[test]
+    fn sibling_links_share_across_operators_but_preserve_effect_indices() {
+        let mut task = travel_task();
+        task.variables.push(Variable {
+            name: "flag".into(),
+            values: vec!["off".into(), "on".into()],
+        });
+        task.initial.push(0);
+        let mut alternate = task.operators[1].clone();
+        alternate.effects.insert(
+            0,
+            Effect {
+                conditions: vec![],
+                variable: 1,
+                pre: None,
+                post: 1,
+            },
+        );
+        task.operators.push(alternate);
+        let mut direct = task.operators[1].clone();
+        direct.effects[0].pre = Some(0);
+        task.operators.push(direct);
+
+        let planner = Planner::new(&task);
+        let parent = PartialPlan::initial(&task);
+        let children =
+            planner.resolve_open(&parent, parent.open_conditions().next().unwrap().clone());
+        assert_eq!(children.len(), 3);
+        let links: Vec<_> = children
+            .iter()
+            .map(|child| child.links.as_ref().unwrap())
+            .collect();
+        assert!(Rc::ptr_eq(links[0], links[2]));
+        assert!(!Rc::ptr_eq(links[0], links[1]));
+        assert_eq!(links[0].head.effect, Some(0));
+        assert_eq!(links[1].head.effect, Some(1));
+        // Each shared link's producer is interpreted against its own plan's
+        // operator and preconditions, which need not match its siblings'.
+        for (index, child) in children.iter().enumerate() {
+            assert_eq!(child.step(1).unwrap().operator, index + 1);
+            let precondition = if index == 2 { 0 } else { 1 };
+            assert_eq!(
+                child.open_conditions().next().unwrap().condition,
+                Fact::new(0, precondition)
+            );
+            assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        }
+        assert_eq!(parent.num_links(), 0);
     }
 
     #[test]
@@ -4733,6 +4814,15 @@ mod tests {
                         plan.next_step_id,
                     )
                     .unwrap(),
+                Chain::new(
+                    CausalLink {
+                        producer: plan.next_step_id,
+                        consumer: open.consumer,
+                        condition: open.condition,
+                        effect: Some(0),
+                    },
+                    plan.links.clone(),
+                ),
             )
             .unwrap();
         assert_eq!(child.threats(&task), child.rediscover_threats(&task));
