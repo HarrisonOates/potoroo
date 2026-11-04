@@ -225,6 +225,14 @@ impl Heuristic {
         self.needs_pg
     }
 
+    /// Whether ranking extracts a relaxed plan, which additionally needs the
+    /// graph's reachable ground actions and their achiever indexes.
+    pub(crate) fn needs_relaxed_plan(&self) -> bool {
+        self.h
+            .iter()
+            .any(|term| matches!(term, HVal::Relax | HVal::RelaxR))
+    }
+
     /// Whether this ranking contains a heuristic defined only for native FDR
     /// POCL nodes rather than the literal partial-plan representation.
     pub fn requires_fdr_pocl(&self) -> bool {

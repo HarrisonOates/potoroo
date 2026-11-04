@@ -422,6 +422,29 @@ impl PlanningGraph {
         cost_model: ActionCost,
         task_costs: bool,
     ) -> PlanningGraph {
+        Self::build_from_schemas_with_relaxed_plan(
+            predicates,
+            init_action,
+            schemas,
+            get_objects,
+            cost_model,
+            task_costs,
+            true,
+        )
+    }
+
+    /// Search only needs to retain reachable ground actions for RELAX/RELAXR.
+    /// Additive ranking, flaw selection and reachability pruning use the
+    /// literal values and indexes, which are built identically in either mode.
+    pub(crate) fn build_from_schemas_with_relaxed_plan(
+        predicates: &PredicateTable,
+        init_action: &Rc<StepAction>,
+        schemas: &[ActionSchema],
+        get_objects: impl Fn(Type) -> Vec<Object>,
+        cost_model: ActionCost,
+        task_costs: bool,
+        include_relaxed_plan: bool,
+    ) -> PlanningGraph {
         let mut pg = PlanningGraph {
             atom_values: FastMap::default(),
             negation_values: FastMap::default(),
@@ -531,6 +554,10 @@ impl PlanningGraph {
         let (negations, negation_index) = group_by_predicate(pg.negation_values.keys());
         pg.predicate_negations = negations;
         pg.negation_index = negation_index;
+
+        if !include_relaxed_plan {
+            return pg;
+        }
 
         // Collect the reachable ground actions for relaxed-plan extraction.
         // Only tuples whose precondition has finite value at convergence are
@@ -1779,4 +1806,110 @@ fn collect_reachable_tuple(
         cost: schema.cost,
         var_types: Vec::new(),
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heuristics::{FlawSelectionOrder, Heuristic};
+    use crate::params::Parameters;
+    use crate::parser::{lower_domain, lower_problem, read_pddl, ParsedUnit};
+    use crate::search::{plan, Outcome, SearchContext};
+
+    fn shared_achiever_task() -> (crate::domain::Domain, crate::problem::Problem) {
+        let ParsedUnit::Domain(parsed) = read_pddl(
+            "(define (domain shared-achiever)
+              (:requirements :strips :typing)
+              (:types item)
+              (:predicates (ready ?x - item) (p ?x - item) (q ?x - item))
+              (:action finish :parameters (?x - item)
+                :precondition (ready ?x)
+                :effect (and (p ?x) (q ?x) (not (ready ?x)))))",
+        )
+        .unwrap() else {
+            panic!("expected domain");
+        };
+        let domain = lower_domain(&parsed).unwrap();
+        let ParsedUnit::Problem(parsed) = read_pddl(
+            "(define (problem shared-achiever) (:domain shared-achiever)
+              (:objects a b - item) (:init (ready a))
+              (:goal (and (p a) (q a))))",
+        )
+        .unwrap() else {
+            panic!("expected problem");
+        };
+        let problem = lower_problem(&parsed, &domain).unwrap();
+        (domain, problem)
+    }
+
+    #[test]
+    fn additive_graph_omits_ground_actions_without_changing_literal_values() {
+        let (domain, problem) = shared_achiever_task();
+        for ground_actions in [false, true] {
+            for heuristic in ["ADD/ADD_COST/ADD_WORK", "ADDR/ADDR_COST/ADDR_WORK", "UCPOP"] {
+                let params = Parameters {
+                    ground_actions,
+                    heuristic: Heuristic::parse(heuristic).unwrap(),
+                    // UCPOP does not request a graph itself, but MW flaw
+                    // selection does. It also needs no relaxed-plan data.
+                    flaw_orders: vec![FlawSelectionOrder::parse("MW").unwrap()],
+                    ..Parameters::default()
+                };
+                let ctx = SearchContext::new(&domain, &problem, &params);
+                let initial = Plan::make_initial_plan(&ctx).unwrap();
+                initial.rank_both(&ctx);
+                initial.get_flaw_with(&ctx, 0);
+                let pg = ctx.planning_graph();
+                assert!(pg.actions.is_empty(), "{heuristic}");
+                assert!(pg.pos_achievers.is_empty(), "{heuristic}");
+                assert!(pg.action_pre_atoms.is_empty(), "{heuristic}");
+
+                // The public full-graph constructor remains usable for callers
+                // that need relaxed-plan extraction independently of ranking.
+                let full = PlanningGraph::build_from_schemas(
+                    &domain.predicates,
+                    &ctx.init_action,
+                    &domain.actions,
+                    |ty| ctx.compatible_objects(ty),
+                    params.action_cost,
+                    false,
+                );
+                assert_eq!(full.actions.len(), 1);
+                assert_eq!(pg.atom_values, full.atom_values);
+                assert_eq!(pg.negation_values, full.negation_values);
+                assert!(!pg.negation_values.is_empty());
+                assert_eq!(full.relaxed_plan_size(&ctx, &initial, false), Some(1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn relaxed_plan_rankings_keep_shared_achievers_in_composed_heuristics() {
+        let (domain, problem) = shared_achiever_task();
+        for ground_actions in [false, true] {
+            for (heuristic, expected) in [
+                ("RELAX", vec![1.0]),
+                ("RELAXR", vec![1.0]),
+                ("ADD/RELAX/RELAXR", vec![2.0, 1.0, 1.0]),
+                ("RELAX/ADD", vec![1.0, 2.0]),
+                ("ADDR/RELAXR", vec![2.0, 1.0]),
+            ] {
+                let params = Parameters {
+                    ground_actions,
+                    heuristic: Heuristic::parse(heuristic).unwrap(),
+                    search_limits: vec![100],
+                    ..Parameters::default()
+                };
+                let ctx = SearchContext::new(&domain, &problem, &params);
+                let initial = Plan::make_initial_plan(&ctx).unwrap();
+                assert_eq!(initial.rank_both(&ctx).0, expected, "{heuristic}");
+                assert_eq!(ctx.planning_graph().actions.len(), 1);
+                let Outcome::Solved(solution) = plan(&ctx) else {
+                    panic!("shared achiever should solve {heuristic}");
+                };
+                assert_eq!(solution.num_steps(), 1);
+                crate::validate::is_valid_solution(&solution, &ctx).unwrap();
+            }
+        }
+    }
 }

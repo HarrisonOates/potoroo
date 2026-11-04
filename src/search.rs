@@ -455,13 +455,14 @@ impl<'a> SearchContext<'a> {
 
     pub fn planning_graph(&self) -> Rc<crate::planning_graph::PlanningGraph> {
         if self.planning_graph.borrow().is_none() {
-            let pg = crate::planning_graph::PlanningGraph::build_from_schemas(
+            let pg = crate::planning_graph::PlanningGraph::build_from_schemas_with_relaxed_plan(
                 &self.domain.predicates,
                 &self.init_action,
                 &self.domain.actions,
                 |ty| self.compatible_objects(ty),
                 self.params.action_cost,
                 self.problem.metric == Some(Metric::MinimizeTotalCost),
+                self.params.heuristic.needs_relaxed_plan(),
             );
             *self.planning_graph.borrow_mut() = Some(Rc::new(pg));
         }
