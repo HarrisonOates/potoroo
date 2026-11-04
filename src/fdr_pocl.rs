@@ -29,6 +29,7 @@ use thiserror::Error;
 
 use crate::chain::{self, Chain};
 use crate::external::FdError;
+use crate::fasthash::FastSet;
 use crate::fdr::{Fact, ParseError, Task};
 use crate::heuristics::{HVal, Heuristic, OrderType, SelectionCriterion};
 use crate::lmcut::{BuildError as LmCutBuildError, FdrLmCut};
@@ -95,7 +96,7 @@ pub struct OrderingDisjunction {
 pub const NO_EFFECT: usize = usize::MAX;
 
 /// An assignment that can occur inside a causal link's protected interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Threat {
     pub step: usize,
     /// Index of the clobbering effect, or [`NO_EFFECT`] for a precondition-based
@@ -1585,6 +1586,19 @@ impl<'a> Planner<'a> {
                 }
                 used
             });
+            // Every new-step alternative adds the same step id before the
+            // same consumer. Share that ordering refinement across siblings;
+            // settling a child's disjunctions can still refine its own copy.
+            let new_step_orderings = plan.orderings.refine_with_step(
+                Ordering::new(
+                    plan.next_step_id,
+                    StepTime::AtEnd,
+                    open.consumer,
+                    StepTime::AtStart,
+                ),
+                plan.next_step_id,
+            );
+            let mut sibling_threats: FastSet<Rc<Vec<Threat>>> = FastSet::default();
             for achiever in achievers {
                 if let (Some(table), Some(used)) = (&self.symmetry, &used) {
                     if !table.canonical(achiever.operator, used) {
@@ -1592,8 +1606,21 @@ impl<'a> Planner<'a> {
                         continue;
                     }
                 }
-                if let Some(child) = self.add_step(plan, &open, achiever) {
-                    children.push(child);
+                if let Some(orderings) = &new_step_orderings {
+                    if let Some(mut child) = self.add_step(plan, &open, achiever, orderings.clone())
+                    {
+                        // Different achievers often introduce the same conflicts.
+                        // Keep one copy per sibling group, after independently
+                        // computing each child's threats and their discovery order.
+                        if achievers.len() > 1 && !child.threats.is_empty() {
+                            if let Some(shared) = sibling_threats.get(&child.threats) {
+                                child.threats = shared.clone();
+                            } else {
+                                sibling_threats.insert(child.threats.clone());
+                            }
+                        }
+                        children.push(child);
+                    }
                 }
             }
 
@@ -1685,12 +1712,9 @@ impl<'a> Planner<'a> {
         plan: &PartialPlan,
         open: &OpenCondition,
         achiever: &Achiever,
+        orderings: Rc<BinaryOrderings>,
     ) -> Option<PartialPlan> {
         let new_id = plan.next_step_id;
-        let orderings = plan.orderings.refine_with_step(
-            Ordering::new(new_id, StepTime::AtEnd, open.consumer, StepTime::AtStart),
-            new_id,
-        )?;
         let operator = &self.task.operators[achiever.operator];
         let effect = &operator.effects[achiever.effect];
 
@@ -3130,6 +3154,96 @@ mod tests {
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
     #[test]
+    fn new_step_siblings_share_orderings_without_sharing_later_refinements() {
+        let mut task = travel_task();
+        // Three distinct achievers for the goal, each requiring location=1.
+        task.operators.push(task.operators[1].clone());
+        task.operators.push(task.operators[1].clone());
+        let planner = Planner::new(&task);
+        let parent = PartialPlan::initial(&task);
+        let children =
+            planner.resolve_open(&parent, parent.open_conditions().next().unwrap().clone());
+        assert_eq!(children.len(), 3);
+        for child in &children {
+            assert!(Rc::ptr_eq(&child.orderings, &children[0].orderings));
+            assert!(!Rc::ptr_eq(&child.orderings, &parent.orderings));
+            assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        }
+
+        let next = planner.resolve_open(
+            &children[0],
+            children[0].open_conditions().next().unwrap().clone(),
+        );
+        assert_eq!(next.len(), 1);
+        assert!(is_ordered_before(&next[0].orderings, 2, 1));
+        assert!(!Rc::ptr_eq(&next[0].orderings, &children[0].orderings));
+        for sibling in &children {
+            assert_eq!(sibling.num_steps(), 1);
+            assert!(!is_ordered_before(&sibling.orderings, 2, 1));
+        }
+        assert_eq!(parent.num_steps(), 0);
+    }
+
+    #[test]
+    fn siblings_share_only_equal_threat_caches_and_keep_them_immutable() {
+        let mut task = travel_task();
+        task.variables.push(Variable {
+            name: "cargo".into(),
+            values: vec!["intact".into(), "damaged".into()],
+        });
+        task.initial.push(0);
+        task.operators.push(task.operators[0].clone());
+        let mut damaging = task.operators[0].clone();
+        damaging.effects.push(Effect {
+            variable: 1,
+            pre: None,
+            post: 1,
+            conditions: vec![],
+        });
+        task.operators.push(damaging);
+        let open = OpenCondition {
+            consumer: GOAL_ID,
+            condition: Fact::new(0, 1),
+        };
+        let orderings = Rc::new(BinaryOrderings::new())
+            .refine_with_step(
+                Ordering::new(1, StepTime::AtEnd, GOAL_ID, StepTime::AtStart),
+                1,
+            )
+            .unwrap();
+        let parent = PartialPlan::assemble(
+            vec![Step { id: 1, operator: 1 }],
+            vec![CausalLink {
+                producer: INIT_ID,
+                consumer: 1,
+                condition: Fact::new(1, 0),
+                effect: None,
+            }],
+            vec![open.clone()],
+            orderings,
+            vec![],
+            1,
+            2,
+        );
+        let planner = Planner::new(&task);
+        let children = planner.resolve_open(&parent, open);
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].threats.len(), 1);
+        assert_eq!(children[2].threats.len(), 2);
+        assert!(Rc::ptr_eq(&children[0].threats, &children[1].threats));
+        assert!(!Rc::ptr_eq(&children[0].threats, &children[2].threats));
+        for child in &children {
+            assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        }
+        let resolved = planner.resolve_threat(&children[0], &children[0].threats[0]);
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|p| p.threats.is_empty()));
+        assert_eq!(children[0].threats.len(), 1);
+        assert_eq!(children[1].threats.len(), 1);
+        assert!(parent.threats.is_empty());
+    }
+
+    #[test]
     fn queue_rank_storage_does_not_allocate() {
         use crate::alloc_test::allocations_during;
         use std::hint::black_box;
@@ -4484,6 +4598,17 @@ mod tests {
                     operator: 0,
                     effect: 0,
                 },
+                plan.orderings
+                    .refine_with_step(
+                        Ordering::new(
+                            plan.next_step_id,
+                            StepTime::AtEnd,
+                            open.consumer,
+                            StepTime::AtStart,
+                        ),
+                        plan.next_step_id,
+                    )
+                    .unwrap(),
             )
             .unwrap();
         assert_eq!(child.threats(&task), child.rediscover_threats(&task));
