@@ -1135,12 +1135,26 @@ impl<'a> OpenConditionCounts<'a> {
                 break;
             };
             let step = &node.head;
-            if !self.plan.orderings.possibly_before(
-                step.id,
-                StepTime::AtEnd,
-                self.open.step_id,
-                self.open.when.start_time(),
-            ) {
+            // A predicate bucket can contain thousands of initial facts.
+            // Reject unrelated actions from their shorter effect lists before
+            // scanning that bucket once for every committed step. Keep the
+            // original bucket and cursor for matching actions so enumeration
+            // order and resumed counts remain unchanged.
+            let unrelated = self.reuse_cursor == 0
+                && step.id != INIT_ID
+                && achievers.len() > step.action.effects.len()
+                && !step.action.effects.iter().any(|effect| {
+                    effect.literal.negative() == literal.negative()
+                        && effect.literal.atom().predicate == literal.atom().predicate
+                });
+            if unrelated
+                || !self.plan.orderings.possibly_before(
+                    step.id,
+                    StepTime::AtEnd,
+                    self.open.step_id,
+                    self.open.when.start_time(),
+                )
+            {
                 self.reuse_step = node.tail.as_deref();
                 self.reuse_cursor = 0;
                 continue;

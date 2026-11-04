@@ -894,6 +894,12 @@ impl Bindings {
         }
         self.try_add(ctx, new_bindings)
             .map(|(varsets, high_step, num_varsets)| {
+                // Reasserting constraints already entailed by this collection
+                // changes neither its history nor its lookup index. Keep the
+                // collection shared instead of allocating a wrapper per child.
+                if num_varsets == self.num_varsets && high_step == self.high_step {
+                    return self.clone();
+                }
                 // Inherit the parent's index: the child chain is the parent chain
                 // plus a few consed varsets, so the parent's table stays valid
                 // behind a scan of the new varsets. Once the prefix's length or
@@ -1014,9 +1020,11 @@ impl Bindings {
             if bind.equality {
                 let comb = match (&vs1, &vs2) {
                     (None, None) => Varset::make(ctx, bind, false),
-                    (Some((i1, n1)), Some((i2, _))) if i1 == i2 => {
-                        // Already bound to each other: reuse existing varset.
-                        Some(n1.head.clone_shallow())
+                    (Some((i1, _)), Some((i2, _))) if i1 == i2 => {
+                        // Already in the same equality class. Consing an
+                        // identical varset would only lengthen the history and
+                        // consume the inherited index's prefix budget.
+                        continue;
                     }
                     (Some((_, n1)), Some((_, n2))) => n1.head.combine(ctx, &n2.head),
                     (None, Some((_, n2))) => n2.head.add_var(ctx, bind.var, bind.var_id),
@@ -1454,6 +1462,70 @@ mod tests {
             IndexState::Built { prefix: 0, .. }
         ));
         result
+    }
+
+    #[test]
+    fn entailed_equalities_share_bindings_without_allocating() {
+        with_context(|ctx| {
+            let parent = indexed_bindings(ctx)
+                .add(
+                    ctx,
+                    &[Binding::new(
+                        Variable(0),
+                        1,
+                        Term::Object(Object(0)),
+                        0,
+                        true,
+                    )],
+                    false,
+                )
+                .unwrap();
+            let repeated = [
+                Binding::new(Variable(1), 1, Term::Variable(Variable(0)), 1, true),
+                Binding::new(Variable(1), 1, Term::Object(Object(0)), 0, true),
+            ];
+            let (child, allocations) = crate::alloc_test::allocations_during(|| {
+                let mut child = parent.clone();
+                for _ in 0..MAX_INDEX_PREFIX + 1 {
+                    child = child.add(ctx, &repeated, false).unwrap();
+                }
+                child
+            });
+            assert!(Rc::ptr_eq(&parent, &child));
+            assert_eq!(allocations, 0);
+            assert_lookups(&child);
+
+            // Equality is scoped to a step: this is a real merge even though
+            // the schema variable has the same name in both occurrences.
+            let mut extended = repeated.to_vec();
+            extended.push(Binding::new(
+                Variable(0),
+                2,
+                Term::Variable(Variable(0)),
+                1,
+                true,
+            ));
+            let merged = child.add(ctx, &extended, false).unwrap();
+            assert_eq!(merged.num_varsets, parent.num_varsets + 1);
+            assert_eq!(
+                merged.binding(Term::Variable(Variable(1)), 2),
+                Term::Object(Object(0))
+            );
+            assert!(parent.binding(Term::Variable(Variable(0)), 2).variable());
+            assert_lookups(&merged);
+
+            // A later contradiction in the same batch must still be checked.
+            extended.push(Binding::new(
+                Variable(1),
+                2,
+                Term::Object(Object(0)),
+                0,
+                false,
+            ));
+            for test_only in [false, true] {
+                assert!(parent.add(ctx, &extended, test_only).is_none());
+            }
+        });
     }
 
     // Compare positions and node identity, including misses, against a full
