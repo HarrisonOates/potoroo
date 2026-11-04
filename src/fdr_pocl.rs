@@ -890,6 +890,60 @@ struct Achiever {
     effect: usize,
 }
 
+/// Open-condition prefixes shared only while producing new-step siblings.
+/// Every sibling has the same new consumer and inherited tail. A node can be
+/// reused exactly when both its fact and its tail match; the cache owns each
+/// node, keeping the tail addresses used as keys valid until it is dropped.
+struct NewStepOpenConditions {
+    consumer: usize,
+    tail: Option<Rc<Chain<OpenCondition>>>,
+    inherited_count: usize,
+    share: bool,
+    prefixes: FastMap<(Fact, *const Chain<OpenCondition>), Rc<Chain<OpenCondition>>>,
+}
+
+impl NewStepOpenConditions {
+    fn new(plan: &PartialPlan, open: &OpenCondition, share: bool) -> Self {
+        let mut base = plan.clone();
+        base.remove_open(open);
+        Self {
+            consumer: plan.next_step_id,
+            tail: base.open_conditions,
+            inherited_count: base.num_open_conditions,
+            share,
+            prefixes: FastMap::default(),
+        }
+    }
+
+    /// Requirements are already deduplicated in their original insertion
+    /// order. The consumer is fresh, so none can occur in the inherited tail.
+    fn extend(&mut self, requirements: &[Fact]) -> (Option<Rc<Chain<OpenCondition>>>, usize) {
+        let mut tail = self.tail.clone();
+        for &condition in requirements {
+            let make_node = || {
+                Chain::new(
+                    OpenCondition {
+                        consumer: self.consumer,
+                        condition,
+                    },
+                    tail.clone(),
+                )
+            };
+            let node = if self.share {
+                let address = tail.as_ref().map_or(std::ptr::null(), Rc::as_ptr);
+                self.prefixes
+                    .entry((condition, address))
+                    .or_insert_with(make_node)
+                    .clone()
+            } else {
+                make_node()
+            };
+            tail = Some(node);
+        }
+        (tail, self.inherited_count + requirements.len())
+    }
+}
+
 struct Planner<'a> {
     task: &'a Task,
     achievers: HashMap<Fact, Vec<Achiever>>,
@@ -1602,6 +1656,7 @@ impl<'a> Planner<'a> {
                 ),
                 plan.next_step_id,
             );
+            let mut sibling_open = NewStepOpenConditions::new(plan, &open, achievers.len() > 1);
             let mut sibling_links: FastMap<usize, Rc<Chain<CausalLink>>> = FastMap::default();
             let mut sibling_threats: FastSet<Rc<Vec<Threat>>> = FastSet::default();
             for achiever in achievers {
@@ -1635,7 +1690,7 @@ impl<'a> Planner<'a> {
                         make_link()
                     };
                     if let Some(mut child) =
-                        self.add_step(plan, &open, achiever, orderings.clone(), link)
+                        self.add_step(plan, achiever, orderings.clone(), link, &mut sibling_open)
                     {
                         // Different achievers often introduce the same conflicts.
                         // Keep one copy per sibling group, after independently
@@ -1738,14 +1793,13 @@ impl<'a> Planner<'a> {
     fn add_step(
         &self,
         plan: &PartialPlan,
-        open: &OpenCondition,
         achiever: &Achiever,
         orderings: Rc<BinaryOrderings>,
         link: Rc<Chain<CausalLink>>,
+        open_conditions: &mut NewStepOpenConditions,
     ) -> Option<PartialPlan> {
         let new_id = plan.next_step_id;
         let operator = &self.task.operators[achiever.operator];
-        let effect = &operator.effects[achiever.effect];
 
         let mut child = plan.clone();
         child.orderings = orderings;
@@ -1757,22 +1811,11 @@ impl<'a> Planner<'a> {
             id: new_id,
             operator: achiever.operator,
         });
-        child.remove_open(open);
         let link_index = child.num_links;
         child.links = Some(link);
         child.num_links += 1;
-        for &condition in &self.operator_preconditions[achiever.operator] {
-            child.push_open(OpenCondition {
-                consumer: new_id,
-                condition,
-            });
-        }
-        for &condition in &effect.conditions {
-            child.push_open(OpenCondition {
-                consumer: new_id,
-                condition,
-            });
-        }
+        (child.open_conditions, child.num_open_conditions) =
+            open_conditions.extend(&self.effect_requirements[achiever.operator][achiever.effect]);
         if !child.settle(self.task) {
             return None;
         }
@@ -3204,6 +3247,99 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn new_step_open_prefixes_share_only_equal_tails_and_survive_removal() {
+        let task = shared_effect_task();
+        let parent = PartialPlan::initial(&task);
+        // Remove the older goal, so the inherited prefix must be rebuilt.
+        let open = parent.open_conditions().nth(1).unwrap().clone();
+        let mut cache = NewStepOpenConditions::new(&parent, &open, true);
+        let (first, count) = cache.extend(&[Fact::new(0, 0), Fact::new(1, 0)]);
+        let (different, _) = cache.extend(&[Fact::new(0, 0), Fact::new(1, 1)]);
+        let (identical, _) = cache.extend(&[Fact::new(0, 0), Fact::new(1, 0)]);
+        let (shorter, shorter_count) = cache.extend(&[Fact::new(1, 0)]);
+        let first = first.unwrap();
+        let different = different.unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(shorter_count, 2);
+        assert!(Rc::ptr_eq(&first, identical.as_ref().unwrap()));
+        assert!(Rc::ptr_eq(
+            first.tail.as_ref().unwrap(),
+            different.tail.as_ref().unwrap()
+        ));
+        assert!(!Rc::ptr_eq(&first, shorter.as_ref().unwrap()));
+        assert_eq!(first.head, shorter.as_ref().unwrap().head);
+        let (empty, empty_count) = cache.extend(&[]);
+        assert_eq!(empty_count, 1);
+        assert!(Rc::ptr_eq(
+            empty.as_ref().unwrap(),
+            first.tail.as_ref().unwrap().tail.as_ref().unwrap()
+        ));
+        assert_eq!(empty.as_ref().unwrap().head.consumer, GOAL_ID);
+        // Releasing the expansion cache leaves every child's shared nodes live.
+        drop(cache);
+        let expected: Vec<_> = first.iter().cloned().collect();
+        let mut child = parent.clone();
+        child.open_conditions = Some(first.clone());
+        child.num_open_conditions = count;
+        child.remove_open(&OpenCondition {
+            consumer: 1,
+            condition: Fact::new(0, 0),
+        });
+        assert_eq!(child.num_open_conditions(), 2);
+        assert_eq!(first.iter().cloned().collect::<Vec<_>>(), expected);
+        assert_eq!(parent.num_open_conditions(), 2);
+        assert_eq!(parent.open_conditions().nth(1), Some(&open));
+    }
+
+    #[test]
+    fn new_step_conditions_preserve_guard_order_and_deduplicate_requirements() {
+        let mut task = conditional_task();
+        task.variables.push(Variable {
+            name: "guard".into(),
+            values: vec!["off".into(), "on".into()],
+        });
+        task.initial.push(1);
+        task.operators[1].prevail.push(Fact::new(1, 1));
+        task.operators[1].effects[0].conditions = vec![
+            Fact::new(1, 1),
+            Fact::new(2, 1),
+            Fact::new(1, 1),
+            Fact::new(2, 1),
+        ];
+        task.operators.push(task.operators[1].clone());
+        let planner = Planner::new(&task);
+        let parent = PartialPlan::initial(&task);
+        let children =
+            planner.resolve_open(&parent, parent.open_conditions().next().unwrap().clone());
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            assert_eq!(child.num_open_conditions(), 3);
+            assert_eq!(
+                child.open_conditions().cloned().collect::<Vec<_>>(),
+                vec![
+                    OpenCondition {
+                        consumer: 1,
+                        condition: Fact::new(2, 1)
+                    },
+                    OpenCondition {
+                        consumer: 1,
+                        condition: Fact::new(1, 1)
+                    },
+                    OpenCondition {
+                        consumer: 1,
+                        condition: Fact::new(0, 0)
+                    },
+                ]
+            );
+            assert_eq!(child.threats(&task), child.rediscover_threats(&task));
+        }
+        assert!(Rc::ptr_eq(
+            children[0].open_conditions.as_ref().unwrap(),
+            children[1].open_conditions.as_ref().unwrap()
+        ));
+    }
 
     #[test]
     fn new_step_siblings_share_storage_without_sharing_later_refinements() {
@@ -4798,7 +4934,6 @@ mod tests {
         let child = planner
             .add_step(
                 &plan,
-                &open,
                 &Achiever {
                     operator: 0,
                     effect: 0,
@@ -4823,6 +4958,7 @@ mod tests {
                     },
                     plan.links.clone(),
                 ),
+                &mut NewStepOpenConditions::new(&plan, &open, false),
             )
             .unwrap();
         assert_eq!(child.threats(&task), child.rediscover_threats(&task));
