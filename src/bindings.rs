@@ -348,63 +348,15 @@ struct VarsetIndex {
 /// amortised over a whole subtree rather than repeated per node.
 const INDEX_THRESHOLD: usize = 8;
 
-/// Number of lookups on one `Bindings` before its chain is worth indexing.
-/// Plans that are ranked once and parked (or expanded with few unifications)
-/// stay on linear scans; lookup-heavy evaluations (e.g. the reuse-aware
-/// heuristics probing every step effect per open condition) promote quickly
-/// and amortise the build.
 /// Longest prefix of not-yet-indexed varsets tolerated in front of an
 /// inherited index before the chain is re-indexed from scratch. Bounds the
 /// per-`resolve_pattern` exclusion scan, while amortising the O(chain)
 /// rebuild over at least this many generations of child bindings.
 const MAX_INDEX_PREFIX: usize = 32;
 
-/// Overlay entry cap; entries are class members, so the overlay can outgrow
-/// the node prefix. Bounds the scan every indexed lookup makes before the
-/// hash maps.
-const MAX_OVERLAY: usize = 96;
-
-/// Lookup entries for the varsets newer than a shared [`VarsetIndex`], as a
-/// persistent chain shared with the parent's overlay: a child conses its new
-/// varsets' members onto the front and the lookups scan head-first, so the
-/// newest class wins exactly as in a head-first scan of the varsets. It used
-/// to be two hash maps cloned whole for every child that added a binding —
-/// on lifted search that is nearly every child, and the clone was the largest
-/// single allocation a node retained. `depth` is the node's distance from the
-/// chain tail — stable as children cons more varsets on — and converts to a
-/// head-relative position as `num_varsets - 1 - depth`.
-#[derive(Debug, Default, Clone)]
-struct Overlay {
-    entries: Option<Rc<Chain<OverlayEntry>>>,
-    len: usize,
-}
-
-#[derive(Debug, Clone)]
-enum OverlayEntry {
-    Var(StepVariable, u32, Rc<Chain<Varset>>),
-    Obj(Object, u32, Rc<Chain<Varset>>),
-}
-
-impl Overlay {
-    fn var(&self, key: StepVariable) -> Option<(u32, Rc<Chain<Varset>>)> {
-        chain::iter(&self.entries).find_map(|entry| match entry {
-            OverlayEntry::Var(var, depth, node) if *var == key => Some((*depth, node.clone())),
-            _ => None,
-        })
-    }
-
-    fn obj(&self, key: Object) -> Option<(u32, Rc<Chain<Varset>>)> {
-        chain::iter(&self.entries).find_map(|entry| match entry {
-            OverlayEntry::Obj(obj, depth, node) if *obj == key => Some((*depth, node.clone())),
-            _ => None,
-        })
-    }
-
-    fn push(&mut self, entry: OverlayEntry) {
-        self.entries = chain::cons(entry, self.entries.take());
-        self.len += 1;
-    }
-}
+/// Maximum number of variables and constants in the unindexed prefix.
+/// Bounds lookup work even when a prefix contains large equality classes.
+const MAX_PREFIX_MEMBERS: usize = 96;
 
 /// Whether a chain is worth indexing (cached alongside the index itself).
 #[derive(Debug, Clone)]
@@ -412,41 +364,34 @@ enum IndexState {
     /// Short chain: linear scans win.
     Small,
     /// Index over a suffix of the chain. The first `prefix` (newest) varsets
-    /// are answered by the flat `overlay` before the index answers for the
-    /// rest; a fresh build has an empty overlay, and children extend it with
-    /// the varsets they cons on (see `Bindings::add`). Index positions are
-    /// relative to the indexed suffix, so `prefix` is added on the way out.
+    /// are scanned directly before the index answers for the rest. Reusing
+    /// the varsets avoids allocating a second chain of lookup entries for
+    /// their members. Index positions are relative to the indexed suffix,
+    /// so `prefix` is added on the way out.
     Built {
         prefix: usize,
-        overlay: Rc<Overlay>,
+        prefix_members: usize,
         ix: Rc<VarsetIndex>,
     },
 }
 
-/// Indexed lookup for a step-variable: checks the overlay (newest first),
-/// then the index with head-relative positions. `num_varsets` is the chain
-/// length of the `Bindings` the state was taken from. Resolution order is
-/// identical to a plain `scan_var`.
+/// Indexed lookup for a step-variable: scans the unindexed prefix (newest
+/// first), then the index with head-relative positions. Resolution order is
+/// identical to a full `scan_var`.
 fn lookup_var_in(
     state: &IndexState,
     varsets: &Option<Rc<Chain<Varset>>>,
-    num_varsets: usize,
     var: Variable,
     step_id: usize,
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     match state {
-        IndexState::Small => scan_var(varsets, var, step_id),
-        IndexState::Built {
-            prefix,
-            overlay,
-            ix,
-        } => {
-            if let Some((depth, node)) = overlay.var((var, step_id)) {
-                return Some((num_varsets - 1 - depth as usize, node));
-            }
-            ix.vars
-                .get(&(var, step_id))
-                .map(|(p, n)| (p + prefix, n.clone()))
+        IndexState::Small => scan_var(varsets, var, step_id, usize::MAX),
+        IndexState::Built { prefix, ix, .. } => {
+            scan_var(varsets, var, step_id, *prefix).or_else(|| {
+                ix.vars
+                    .get(&(var, step_id))
+                    .map(|(p, n)| (p + prefix, n.clone()))
+            })
         }
     }
 }
@@ -455,54 +400,45 @@ fn lookup_var_in(
 fn lookup_obj_in(
     state: &IndexState,
     varsets: &Option<Rc<Chain<Varset>>>,
-    num_varsets: usize,
     obj: Object,
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     match state {
-        IndexState::Small => scan_obj(varsets, obj),
-        IndexState::Built {
-            prefix,
-            overlay,
-            ix,
-        } => {
-            if let Some((depth, node)) = overlay.obj(obj) {
-                return Some((num_varsets - 1 - depth as usize, node));
-            }
-            ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))
-        }
+        IndexState::Small => scan_obj(varsets, obj, usize::MAX),
+        IndexState::Built { prefix, ix, .. } => scan_obj(varsets, obj, *prefix)
+            .or_else(|| ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))),
     }
 }
 
-/// Head-first linear scan for the authoritative varset of a step-variable.
+/// Head-first scan of up to `limit` varsets for a step-variable.
 fn scan_var(
     varsets: &Option<Rc<Chain<Varset>>>,
     var: Variable,
     step_id: usize,
+    limit: usize,
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     let mut cur = varsets;
-    let mut p = 0usize;
-    while let Some(node) = cur {
+    for p in 0..limit {
+        let node = cur.as_ref()?;
         if node.head.includes_var(var, step_id) {
             return Some((p, node.clone()));
         }
-        p += 1;
         cur = &node.tail;
     }
     None
 }
 
-/// Head-first linear scan for the authoritative varset of a pinned constant.
+/// Head-first scan of up to `limit` varsets for a pinned constant.
 fn scan_obj(
     varsets: &Option<Rc<Chain<Varset>>>,
     obj: Object,
+    limit: usize,
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     let mut cur = varsets;
-    let mut p = 0usize;
-    while let Some(node) = cur {
+    for p in 0..limit {
+        let node = cur.as_ref()?;
         if node.head.includes_object(obj) {
             return Some((p, node.clone()));
         }
-        p += 1;
         cur = &node.tail;
     }
     None
@@ -557,11 +493,9 @@ impl Bindings {
     /// cell.
     ///
     /// [`Bindings::index_state`] hands back an owned `IndexState`, which bumps
-    /// and then drops two `Rc`s. That is fine for callers that take it once and
+    /// and then drops an `Rc`. That is fine for callers that take it once and
     /// use it across a region, but `find_var_node` and `find_obj_node` ask per
-    /// lookup, and lookups outnumber index construction roughly 16 to 1 -- so
-    /// that refcount traffic showed up both as time in `index_state` and as
-    /// drop glue for the `Overlay` handle.
+    /// lookup, so borrowing avoids repeated reference-count updates.
     fn with_index_state<R>(&self, f: impl FnOnce(&IndexState) -> R) -> R {
         if self.num_varsets < INDEX_THRESHOLD {
             return f(&IndexState::Small);
@@ -607,7 +541,7 @@ impl Bindings {
             }
             IndexState::Built {
                 prefix: 0,
-                overlay: Rc::new(Overlay::default()),
+                prefix_members: 0,
                 ix: Rc::new(ix),
             }
         }
@@ -616,12 +550,11 @@ impl Bindings {
     /// Finds the authoritative varset node (and its head-relative position)
     /// for a step-variable.
     fn find_var_node(&self, var: Variable, step_id: usize) -> Option<(usize, Rc<Chain<Varset>>)> {
-        let found = self.with_index_state(|state| {
-            lookup_var_in(state, &self.varsets, self.num_varsets, var, step_id)
-        });
+        let found =
+            self.with_index_state(|state| lookup_var_in(state, &self.varsets, var, step_id));
         debug_assert!(
             {
-                let scanned = scan_var(&self.varsets, var, step_id);
+                let scanned = scan_var(&self.varsets, var, step_id, usize::MAX);
                 match (&found, &scanned) {
                     (None, None) => true,
                     (Some((p1, n1)), Some((p2, n2))) => p1 == p2 && Rc::ptr_eq(n1, n2),
@@ -636,11 +569,10 @@ impl Bindings {
     /// Finds the authoritative varset node (and its head-relative position)
     /// for a pinned constant.
     fn find_obj_node(&self, obj: Object) -> Option<(usize, Rc<Chain<Varset>>)> {
-        let found = self
-            .with_index_state(|state| lookup_obj_in(state, &self.varsets, self.num_varsets, obj));
+        let found = self.with_index_state(|state| lookup_obj_in(state, &self.varsets, obj));
         debug_assert!(
             {
-                let scanned = scan_obj(&self.varsets, obj);
+                let scanned = scan_obj(&self.varsets, obj, usize::MAX);
                 match (&found, &scanned) {
                     (None, None) => true,
                     (Some((p1, n1)), Some((p2, n2))) => p1 == p2 && Rc::ptr_eq(n1, n2),
@@ -964,46 +896,30 @@ impl Bindings {
             .map(|(varsets, high_step, num_varsets)| {
                 // Inherit the parent's index: the child chain is the parent chain
                 // plus a few consed varsets, so the parent's table stays valid
-                // behind an overlay extended with the new varsets' members. Once
-                // the prefix or overlay would exceed its cap the child starts
+                // behind a scan of the new varsets. Once the prefix's length or
+                // member count would exceed its cap the child starts
                 // unindexed and the usual promotion path re-indexes from scratch,
                 // resetting both to empty for its own descendants.
                 let index = match self.index.borrow().as_ref() {
                     Some(IndexState::Built {
                         prefix,
-                        overlay,
+                        prefix_members,
                         ix,
                     }) => {
                         let added = num_varsets - self.num_varsets;
                         let p = prefix + added;
                         if p <= MAX_INDEX_PREFIX {
-                            // A shallow clone: the entries are shared with
-                            // the parent and only the new ones are consed on.
-                            let mut ov = (**overlay).clone();
-                            // The added nodes are the first `added` of the child
-                            // chain; append oldest-first so reverse iteration in
-                            // the lookups sees the newest class first.
-                            let mut nodes: Vec<Rc<Chain<Varset>>> = Vec::with_capacity(added);
-                            let mut cur = &varsets;
-                            for _ in 0..added {
-                                let n = cur.as_ref().expect("added exceeds chain length");
-                                nodes.push(n.clone());
-                                cur = &n.tail;
-                            }
-                            // Oldest first, so a newer class overwrites an older
-                            // entry for the same key and wins the lookup.
-                            for (i, n) in nodes.iter().enumerate().rev() {
-                                let depth = (num_varsets - 1 - i) as u32;
-                                for sv in chain::iter(&n.head.cd_set) {
-                                    ov.push(OverlayEntry::Var(*sv, depth, n.clone()));
-                                }
-                                if let Some(c) = n.head.constant {
-                                    ov.push(OverlayEntry::Obj(c, depth, n.clone()));
-                                }
-                            }
-                            (ov.len <= MAX_OVERLAY).then(|| IndexState::Built {
+                            let members = prefix_members
+                                + chain::iter(&varsets)
+                                    .take(added)
+                                    .map(|vs| {
+                                        chain::iter(&vs.cd_set).count()
+                                            + usize::from(vs.constant.is_some())
+                                    })
+                                    .sum::<usize>();
+                            (members <= MAX_PREFIX_MEMBERS).then(|| IndexState::Built {
                                 prefix: p,
-                                overlay: Rc::new(ov),
+                                prefix_members: members,
                                 ix: ix.clone(),
                             })
                         } else {
@@ -1054,9 +970,7 @@ impl Bindings {
                 cur = &node.tail;
             }
             if step_id <= self.high_step {
-                if let Some((p, node)) =
-                    lookup_var_in(&state, &self.varsets, self.num_varsets, var, step_id)
-                {
+                if let Some((p, node)) = lookup_var_in(&state, &self.varsets, var, step_id) {
                     return Some((p + delta, node));
                 }
             }
@@ -1074,7 +988,7 @@ impl Bindings {
                 }
                 cur = &node.tail;
             }
-            if let Some((p, node)) = lookup_obj_in(&state, &self.varsets, self.num_varsets, obj) {
+            if let Some((p, node)) = lookup_obj_in(&state, &self.varsets, obj) {
                 return Some((p + delta, node));
             }
             None
@@ -1501,4 +1415,232 @@ impl Clone for Varset {
 /// Whether all of an atom's terms are objects (fully instantiated).
 fn is_ground(a: &crate::formula::Atom) -> bool {
     a.terms.iter().all(|t| t.object())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::OBJECT;
+
+    struct ObjectVariables;
+    impl StepVarTypes for ObjectVariables {
+        fn var_type(&self, _: Variable, _: usize) -> Type {
+            OBJECT
+        }
+    }
+
+    fn with_context(f: impl FnOnce(&TypeContext)) {
+        let types = Types::new();
+        let constants = TermTable::new();
+        let mut objects = TermTable::with_parent(&constants);
+        for name in ["a", "b", "c"] {
+            objects.add_object(name, OBJECT);
+        }
+        f(&TypeContext {
+            types: &types,
+            objects: &objects,
+            constants: &constants,
+            step_vars: &ObjectVariables,
+        });
+    }
+
+    fn indexed_bindings(ctx: &TypeContext) -> Rc<Bindings> {
+        let bindings: Vec<_> = (1..=INDEX_THRESHOLD)
+            .map(|step| Binding::new(Variable(0), step, Term::Variable(Variable(1)), step, true))
+            .collect();
+        let result = Bindings::empty().add(ctx, &bindings, false).unwrap();
+        assert!(matches!(
+            result.index_state(),
+            IndexState::Built { prefix: 0, .. }
+        ));
+        result
+    }
+
+    // Compare positions and node identity, including misses, against a full
+    // head-first scan independent of the inherited index and its prefix.
+    fn assert_lookups(bindings: &Bindings) {
+        let same = |found: Option<(usize, Rc<Chain<Varset>>)>,
+                    scanned: Option<(usize, Rc<Chain<Varset>>)>| {
+            match (found, scanned) {
+                (Some((p, n)), Some((q, m))) => assert!(p == q && Rc::ptr_eq(&n, &m)),
+                (None, None) => {}
+                _ => panic!("indexed lookup disagrees with full scan"),
+            }
+        };
+        for step in 0..=bindings.high_step + 1 {
+            for var in [Variable(0), Variable(1), Variable(2)] {
+                same(
+                    bindings.find_var_node(var, step),
+                    scan_var(&bindings.varsets, var, step, usize::MAX),
+                );
+            }
+        }
+        for obj in [Object(0), Object(1), Object(2)] {
+            same(
+                bindings.find_obj_node(obj),
+                scan_obj(&bindings.varsets, obj, usize::MAX),
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_prefix_shadows_classes_and_preserves_siblings() {
+        with_context(|ctx| {
+            let parent = indexed_bindings(ctx);
+            let child = parent
+                .add(
+                    ctx,
+                    &[
+                        Binding::new(Variable(0), 1, Term::Object(Object(0)), 0, true),
+                        Binding::new(Variable(0), 2, Term::Variable(Variable(0)), 1, true),
+                    ],
+                    false,
+                )
+                .unwrap();
+            let sibling = parent
+                .add(
+                    ctx,
+                    &[Binding::new(
+                        Variable(0),
+                        1,
+                        Term::Object(Object(1)),
+                        0,
+                        true,
+                    )],
+                    false,
+                )
+                .unwrap();
+            let IndexState::Built { ix, .. } = parent.index_state() else {
+                panic!()
+            };
+            for bindings in [&parent, &child, &sibling] {
+                assert_lookups(bindings);
+                let IndexState::Built { ix: shared, .. } = bindings.index_state() else {
+                    panic!()
+                };
+                assert!(Rc::ptr_eq(&ix, &shared));
+            }
+            for step in [1, 2] {
+                for var in [Variable(0), Variable(1)] {
+                    assert_eq!(
+                        child.binding(Term::Variable(var), step),
+                        Term::Object(Object(0))
+                    );
+                    assert_eq!(child.find_var_node(var, step).unwrap().0, 0);
+                    assert!(parent.binding(Term::Variable(var), step).variable());
+                }
+            }
+            assert_eq!(child.find_obj_node(Object(0)).unwrap().0, 0);
+            assert_eq!(
+                sibling.binding(Term::Variable(Variable(1)), 1),
+                Term::Object(Object(1))
+            );
+            assert!(child
+                .add(
+                    ctx,
+                    &[Binding::new(
+                        Variable(1),
+                        2,
+                        Term::Object(Object(1)),
+                        0,
+                        true
+                    ),],
+                    false
+                )
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn inherited_index_rebuilds_at_both_prefix_limits() {
+        with_context(|ctx| {
+            for grow_class in [false, true] {
+                let parent = indexed_bindings(ctx);
+                let mut bindings = parent.clone();
+                let mut prefix = 0;
+                let mut members = 0;
+                let mut rebuilds = 0;
+                for added in 1..=MAX_INDEX_PREFIX + 1 {
+                    let step = INDEX_THRESHOLD + added;
+                    let (term, term_step, class_size) = if grow_class {
+                        (Variable(0), 1, 2 + added)
+                    } else {
+                        (Variable(1), step, 2)
+                    };
+                    bindings = bindings
+                        .add(
+                            ctx,
+                            &[Binding::new(
+                                Variable(0),
+                                step,
+                                Term::Variable(term),
+                                term_step,
+                                true,
+                            )],
+                            false,
+                        )
+                        .unwrap();
+                    prefix += 1;
+                    members += class_size;
+                    if prefix > MAX_INDEX_PREFIX || members > MAX_PREFIX_MEMBERS {
+                        assert!(bindings.index.borrow().is_none());
+                        prefix = 0;
+                        members = 0;
+                        rebuilds += 1;
+                    }
+                    assert_lookups(&bindings);
+                    assert!(matches!(bindings.index_state(), IndexState::Built {
+                        prefix: p, prefix_members: m, ..
+                    } if p == prefix && m == members));
+                }
+                assert!(rebuilds > 0);
+                assert_lookups(&parent);
+            }
+        });
+    }
+
+    #[test]
+    fn pattern_exclusions_combine_index_and_prefix() {
+        with_context(|ctx| {
+            let mut initial: Vec<_> = (1..=INDEX_THRESHOLD)
+                .map(|step| {
+                    Binding::new(Variable(0), step, Term::Variable(Variable(1)), step, true)
+                })
+                .collect();
+            initial.push(Binding::new(
+                Variable(0),
+                1,
+                Term::Object(Object(0)),
+                0,
+                false,
+            ));
+            let parent = Bindings::empty().add(ctx, &initial, false).unwrap();
+            assert_lookups(&parent); // Index the first exclusion.
+            let child = parent
+                .add(
+                    ctx,
+                    &[Binding::new(
+                        Variable(1),
+                        1,
+                        Term::Object(Object(1)),
+                        0,
+                        false,
+                    )],
+                    false,
+                )
+                .unwrap();
+            assert_lookups(&child);
+            let terms = [Term::Variable(Variable(0)), Term::Variable(Variable(1))];
+            let mut parent_pattern = parent.resolve_pattern(ctx, &terms, 1);
+            let mut child_pattern = child.resolve_pattern(ctx, &terms, 1);
+            for (obj, parent_ok, child_ok) in [(0, false, false), (1, true, false), (2, true, true)]
+            {
+                let tuple = [Term::Object(Object(obj)); 2];
+                assert_eq!(parent_pattern.matches(ctx, &tuple), parent_ok);
+                assert_eq!(child_pattern.matches(ctx, &tuple), child_ok);
+                let pin = [Binding::new(Variable(0), 1, tuple[0], 0, true)];
+                assert_eq!(child.add(ctx, &pin, true).is_some(), child_ok);
+            }
+        });
+    }
 }
