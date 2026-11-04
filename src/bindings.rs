@@ -10,10 +10,11 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::chain::{self, Chain};
-use crate::fasthash::FastMap;
+use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Formula, Literal};
 use crate::terms::{Object, Term, TermTable, Variable};
 use crate::types::{Type, Types};
@@ -329,6 +330,31 @@ impl Varset {
     }
 }
 
+/// An index key and its class ID in one hash-table entry. Equality and hashing
+/// use only the step-variable: inserting an older occurrence must preserve the
+/// class already recorded for the newest one. Keeping the ID beside the u32
+/// variable uses the padding a `(Variable, usize)` key would otherwise need.
+#[derive(Debug)]
+struct IndexedVariable {
+    var: Variable,
+    class: u32,
+    step_id: usize,
+}
+
+impl PartialEq for IndexedVariable {
+    fn eq(&self, other: &Self) -> bool {
+        self.var == other.var && self.step_id == other.step_id
+    }
+}
+
+impl Eq for IndexedVariable {}
+
+impl Hash for IndexedVariable {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.var, self.step_id).hash(state);
+    }
+}
+
 /// Lazily-built lookup index over an immutable varset chain: the authoritative
 /// (newest) varset node per step-variable and per pinned constant, plus the
 /// constants excluded per step-variable through pinned classes'
@@ -337,8 +363,11 @@ impl Varset {
 /// entries never win.
 #[derive(Debug, Default)]
 struct VarsetIndex {
-    vars: FastMap<StepVariable, (usize, Rc<Chain<Varset>>)>,
-    objs: FastMap<Object, (usize, Rc<Chain<Varset>>)>,
+    vars: FastSet<IndexedVariable>,
+    objs: FastMap<Object, u32>,
+    /// Store a position and node reference once per authoritative class rather
+    /// than repeating them for every variable and constant in that class.
+    classes: Box<[(usize, Rc<Chain<Varset>>)]>,
     ncd_constants: FastMap<StepVariable, Vec<Object>>,
 }
 
@@ -361,7 +390,7 @@ const MAX_PREFIX_MEMBERS: usize = 96;
 /// Whether a chain is worth indexing (cached alongside the index itself).
 #[derive(Debug, Clone)]
 enum IndexState {
-    /// Short chain: linear scans win.
+    /// Scan directly: short chains, or an index too large for u32 class IDs.
     Small,
     /// Index over a suffix of the chain. The first `prefix` (newest) varsets
     /// are scanned directly before the index answers for the rest. Reusing
@@ -389,8 +418,15 @@ fn lookup_var_in(
         IndexState::Built { prefix, ix, .. } => {
             scan_var(varsets, var, step_id, *prefix).or_else(|| {
                 ix.vars
-                    .get(&(var, step_id))
-                    .map(|(p, n)| (p + prefix, n.clone()))
+                    .get(&IndexedVariable {
+                        var,
+                        class: 0,
+                        step_id,
+                    })
+                    .map(|entry| {
+                        let (p, n) = &ix.classes[entry.class as usize];
+                        (p + prefix, n.clone())
+                    })
             })
         }
     }
@@ -404,8 +440,12 @@ fn lookup_obj_in(
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     match state {
         IndexState::Small => scan_obj(varsets, obj, usize::MAX),
-        IndexState::Built { prefix, ix, .. } => scan_obj(varsets, obj, *prefix)
-            .or_else(|| ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))),
+        IndexState::Built { prefix, ix, .. } => scan_obj(varsets, obj, *prefix).or_else(|| {
+            ix.objs.get(&obj).map(|&class| {
+                let (p, n) = &ix.classes[class as usize];
+                (p + prefix, n.clone())
+            })
+        }),
     }
 }
 
@@ -515,16 +555,30 @@ impl Bindings {
     fn build_index(&self) -> IndexState {
         {
             let mut ix = VarsetIndex::default();
+            let mut classes = Vec::new();
             let mut pos = 0usize;
             let mut cur = self.varsets.clone();
             while let Some(node) = cur {
+                let Ok(class) = u32::try_from(classes.len()) else {
+                    // Preserve correctness even for histories too large to
+                    // index compactly; never truncate a class or a step ID.
+                    return IndexState::Small;
+                };
                 let vs = &node.head;
-                for sv in chain::iter(&vs.cd_set) {
+                let mut used = false;
+                for &(var, step_id) in chain::iter(&vs.cd_set) {
                     // First (newest) entry wins: it is the authoritative class.
-                    ix.vars.entry(*sv).or_insert_with(|| (pos, node.clone()));
+                    used |= ix.vars.insert(IndexedVariable {
+                        var,
+                        class,
+                        step_id,
+                    });
                 }
                 if let Some(c) = vs.constant {
-                    ix.objs.entry(c).or_insert_with(|| (pos, node.clone()));
+                    if let std::collections::hash_map::Entry::Vacant(entry) = ix.objs.entry(c) {
+                        entry.insert(class);
+                        used = true;
+                    }
                     // Record the pinned constant against every step-variable
                     // its class non-codesignates (stale entries carry subsets
                     // of the authoritative lists, so duplicates are the only
@@ -536,9 +590,13 @@ impl Bindings {
                         }
                     }
                 }
+                if used {
+                    classes.push((pos, node.clone()));
+                }
                 pos += 1;
                 cur = node.tail.clone();
             }
+            ix.classes = classes.into_boxed_slice();
             IndexState::Built {
                 prefix: 0,
                 prefix_members: 0,
@@ -1462,6 +1520,74 @@ mod tests {
             IndexState::Built { prefix: 0, .. }
         ));
         result
+    }
+
+    #[test]
+    fn compact_index_shares_one_record_for_a_large_equality_class() {
+        with_context(|ctx| {
+            let constraints: Vec<_> = (1..=64)
+                .map(|step| Binding::new(Variable(0), step, Term::Object(Object(0)), 0, true))
+                .collect();
+            let bindings = Bindings::empty().add(ctx, &constraints, false).unwrap();
+            let IndexState::Built { ix, .. } = bindings.index_state() else {
+                panic!("long binding history should be indexed");
+            };
+            // All 64 variables and their constant share the newest node; the
+            // older, shadowed classes must not consume additional records.
+            assert_eq!(ix.classes.len(), 1);
+            assert_eq!(ix.vars.len(), 64);
+            assert_eq!(ix.objs.len(), 1);
+            assert_lookups(&bindings);
+            for step in 1..=64 {
+                assert_eq!(
+                    bindings.binding(Term::Variable(Variable(0)), step),
+                    Term::Object(Object(0))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn compact_index_preserves_full_width_step_and_variable_ids() {
+        with_context(|ctx| {
+            let mut constraints: Vec<_> = (1..=INDEX_THRESHOLD)
+                .map(|step| Binding::new(Variable(0), step, Term::Object(Object(0)), 0, true))
+                .collect();
+            let mut cases = vec![
+                (Variable(0), 1, Object(0)),
+                (Variable(0), crate::plan::GOAL_ID, Object(1)),
+                (Variable(u32::MAX), usize::MAX - 1, Object(2)),
+                (Variable(u32::MAX), 1, Object(1)),
+            ];
+            if usize::BITS > 32 {
+                cases.push((Variable(0), u32::MAX as usize, Object(2)));
+            }
+            for &(var, step, obj) in &cases {
+                constraints.push(Binding::new(var, step, Term::Object(obj), 0, true));
+            }
+            let bindings = Bindings::empty().add(ctx, &constraints, false).unwrap();
+            assert!(matches!(bindings.index_state(), IndexState::Built { .. }));
+            for (var, step, obj) in cases {
+                assert_eq!(
+                    bindings.binding(Term::Variable(var), step),
+                    Term::Object(obj)
+                );
+                let (p, node) = bindings.find_var_node(var, step).unwrap();
+                let (q, scanned) = scan_var(&bindings.varsets, var, step, usize::MAX).unwrap();
+                assert_eq!(p, q);
+                assert!(Rc::ptr_eq(&node, &scanned));
+                assert!(bindings
+                    .add(
+                        ctx,
+                        &[Binding::new(var, step, Term::Object(obj), 0, false)],
+                        true
+                    )
+                    .is_none());
+            }
+            assert!(bindings
+                .find_var_node(Variable(1), crate::plan::GOAL_ID)
+                .is_none());
+        });
     }
 
     #[test]
