@@ -374,13 +374,14 @@ fn e_deletion_sees_a_threat_the_classical_test_misses() {
         }
         (a, b) => panic!("expected both runs to solve, got {a:?} and {b:?}"),
     }
-    // `peek_on` requiring v0 = on is a threat to the link protecting v0 = off
-    // for `use_off`, and only e-deletion reports it.
+    // `peek_on` requiring v0 = on adds a precondition threat to the link
+    // protecting v0 = off for `use_off`. Unrepairable threats are discarded
+    // before expansion, so their rejection need not raise max_threats.
     assert!(
-        edelete_stats.max_threats > baseline_stats.max_threats,
-        "e-deletion found no extra threats: {} vs {}",
-        edelete_stats.max_threats,
-        baseline_stats.max_threats
+        edelete_stats.pruned > baseline_stats.pruned,
+        "e-deletion rejected no extra refinements: {} vs {}",
+        edelete_stats.pruned,
+        baseline_stats.pruned
     );
 }
 
@@ -535,12 +536,16 @@ fn minimality_pruning_carries_over_to_finite_domains() {
     );
     let (solved, cost, pruned) = fdr_run("gripper-domain", "gripper-6", minimality, 30_000);
     assert!(base_solved && solved, "gripper-6 should solve both ways");
-    assert_eq!(base_pruned, 0, "the baseline must prune nothing");
     assert_eq!(
         base_cost, cost,
         "minimality pruning changed the optimal cost"
     );
-    assert!(pruned > 0, "minimality pruning fired on nothing");
+    // The baseline already rejects unresolvable threats. The optional rule
+    // must reject additional refinements on this fixture.
+    assert!(
+        pruned > base_pruned,
+        "minimality rejected no extra refinements"
+    );
 }
 
 /// Lifted cutset pruning uses schema-derived mutex groups.

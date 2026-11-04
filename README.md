@@ -54,7 +54,7 @@ skip automatically when it is unavailable.
 ./target/release/potoroo examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
 
 # Greedy search
-./target/release/potoroo -s GBFS examples/gripper-domain.pddl examples/gripper-20.pddl
+./target/release/potoroo -s GBFS -h ADD examples/gripper-domain.pddl examples/gripper-4.pddl
 
 # Ground actions with the Lplan LP heuristic
 ./target/release/potoroo -g -h LPLAN examples/blocks-world-domain.pddl examples/sussman-anomaly.pddl
