@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo +stable fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: Tests (${{ matrix.configuration }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - configuration: default
+            features: ''
+            fast_downward: false
+          - configuration: fast-downward
+            features: ''
+            fast_downward: true
+          - configuration: fast-downward-highs
+            features: highs-lp
+            fast_downward: true
+    env:
+      CARGO_FEATURES: ${{ matrix.features }}
+      # LP-heavy regressions need optimisation; test assertions remain enabled.
+      CARGO_PROFILE_TEST_OPT_LEVEL: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      POTOROO_FD: ${{ github.workspace }}/.ci/downward/fast-downward.py
+      POTOROO_DOWNWARD: ${{ github.workspace }}/.ci/downward/builds/release/bin/downward
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check out Fast Downward
+        if: matrix.fast_downward
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: aibasel/downward
+          ref: acc6438c7c927ac4de45c2baf263956bfba189e0
+          path: .ci/downward
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.configuration }}-acc6438c7c927ac4de45c2baf263956bfba189e0
+          cache-directories: ${{ matrix.fast_downward && '.ci/downward/builds' || '' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install native build dependencies
+        if: matrix.fast_downward
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake g++ libclang-dev
+      - name: Build Fast Downward
+        if: matrix.fast_downward
+        run: python3 .ci/downward/build.py release -j2
+      - name: Require Fast Downward for integration tests
+        if: matrix.fast_downward
+        run: |
+          "$POTOROO_FD" --help > /dev/null
+          "$POTOROO_DOWNWARD" --help > /dev/null
+      - name: Test standalone build
+        if: ${{ !matrix.fast_downward }}
+        # This LP regression is slow without FD's grounding; both integration jobs run it.
+        run: cargo +stable test --locked -- --skip lifted_cutset_preserves_optimal_ground_plans
+      - name: Test Fast Downward integration
+        if: matrix.fast_downward
+        run: cargo +stable test --locked --features "$CARGO_FEATURES"
