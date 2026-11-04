@@ -503,10 +503,7 @@ impl Heuristic {
                 }
             }
         }
-        // GBFS tiebreakers: prefer fewer remaining flaws (progress towards
-        // completion), then newest-generated (LIFO). Ascending serial numbers
-        // would sweep h-plateaus breadth-first, which is exactly where greedy
-        // search stalls; diving on the newest plan escapes them.
+        // GBFS ties prefer fewer remaining flaws, then newer plans (LIFO).
         grank.push(plan.num_open_conds() as f32);
         grank.push_lifo(plan.serial_no());
         (rank, grank)
@@ -547,10 +544,8 @@ fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuris
     if ctx.failed_compile_backends.borrow().contains(&backend) {
         return plan.cost() as f32;
     }
-    // Ground search: take the fast path — ground the task ourselves into FDR and
-    // invoke only the `downward` C++ binary, skipping FD's Python translator
-    // (~95% of the per-node cost). Lifted search: emit PDDL and run the full
-    // driver (the translator is needed to ground the lifted task).
+    // Ground search emits SAS+ directly for the C++ evaluator.
+    // Lifted search emits PDDL and uses the translator to ground it.
     let result = if ctx.params.ground_actions {
         crate::compile::ground_task(plan, ctx).heuristic(backend)
     } else {

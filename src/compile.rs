@@ -451,18 +451,9 @@ pub fn parse_backend(name: &str) -> Option<FdHeuristic> {
     }
 }
 
-// ==========================================================================
-// Direct SAS⁺ grounding (Phase 1-opt fast path, ground search only).
-//
-// Grounds the same Bercher-2013 + Prop-1 encoding into an all-binary FDR task
-// (`crate::sas::GroundTask`), so the heuristic is evaluated by the `downward`
-// C++ binary directly — skipping Fast Downward's Python translator (~95% of the
-// per-node cost). Restricted to ground search: committed steps and original
-// actions are already ground, so there is no lifted-variable expansion. The
-// polynomial causal-link guards collapse to plain ground preconditions here
-// (the disjunctive `(or guard (not (= …)))` is decided once arguments are
-// ground), which is the faithful Prop-1 encoding at the ground level.
-// ==========================================================================
+// Direct SAS+ grounding for ground search. Binary fact variables and
+// ground causal-link guards let the C++ evaluator consume the compiled task
+// without invoking Fast Downward's Python translator.
 
 /// Interns ground facts (by canonical name) into a [`GroundTask`].
 struct Interner<'a> {
@@ -554,8 +545,7 @@ fn flatten_pre(int: &mut Interner, f: &Rc<Formula>) -> Option<Vec<(usize, bool)>
                 _ => true,
             },
             Formula::Conjunction(cs) => cs.iter().all(|c| go(int, c, out)),
-            // Disjunctions / quantifiers do not occur in the ground benchmark
-            // preconditions we target; treat as no constraint (a relaxation).
+            // Ignore disjunctions and quantifiers as a relaxation.
             _ => true,
         }
     }

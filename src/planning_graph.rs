@@ -963,18 +963,13 @@ pub fn formula_value(
 }
 
 impl PlanningGraph {
-    /// Extracts a delete-relaxed plan achieving the partial plan's open
-    /// conditions and returns the number of actions in it that are **not already
-    /// in the partial plan** — the Relax / RePOP heuristic (after Nguyen &
-    /// Kambhampati 2001, adapting FF to partial plans). Returns `None` if some
-    /// open condition is unreachable in the relaxed graph (a dead end).
+    /// Extract a delete-relaxed plan for the open conditions, returning the
+    /// number of actions not already committed (Relax / RePOP; Nguyen &
+    /// Kambhampati, 2001). Return `None` for an unreachable open condition.
     ///
-    /// Greedy extraction over the additive cost graph: process the highest-cost
-    /// subgoal first, support it with its cheapest achiever, regress on that
-    /// action's (positive) preconditions. Goals already true in the initial
-    /// state, or — when `reuse` is set — already established by an existing plan
-    /// step, are free and add no action. Negative subgoals are treated as free
-    /// (a relaxation; the classical benchmark goals are positive).
+    /// Process highest-cost subgoals first and regress through cheapest achievers.
+    /// Initial facts and, when `reuse` is set, committed-step effects are free.
+    /// Negative subgoals are free as a relaxation.
     pub fn relaxed_plan_size(
         &self,
         search_ctx: &crate::search::SearchContext,

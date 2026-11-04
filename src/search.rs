@@ -1351,11 +1351,8 @@ fn plan_impl(
                         ctx.pruned.set(ctx.pruned.get() + 1);
                         continue;
                     }
-                    // Lazy: use parent's rank[0] as a cheap h proxy, with the
-                    // same tiebreakers as `plan_rank_gbfs`: fewer remaining
-                    // flaws, then newest-generated (LIFO). Ascending plan ids
-                    // would sweep proxy-plateaus breadth-first — exactly where
-                    // lazy GBFS stalls.
+                    // Use the parent's rank[0] as a lazy h estimate.
+                    // Break ties by fewer flaws, then newer plans (LIFO).
                     (
                         Rank::lazy_proxy(
                             current_rank0,

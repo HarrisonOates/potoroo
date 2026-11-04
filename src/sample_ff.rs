@@ -1,36 +1,12 @@
-//! The Sample-FF heuristic for partial-order causal-link plans (Bercher, Geier,
-//! Richter & Biundo, 2013: "On Delete Relaxation in Partial-Order Causal-Link
-//! Planning"). Unlike the Relax heuristic — which delete-relaxes the *whole*
-//! partial plan, ignoring the plan steps' negative effects and quantities —
-//! Sample-FF keeps the committed plan steps non-relaxed and uses delete
-//! relaxation only to fill the gaps between them.
+//! Sample-FF for partial-order plans (Bercher et al., 2013).
 //!
-//! ## Algorithm (paper §IV)
-//! For a partial plan `P = (PS, ≺, CL)`:
-//! 1. **Sample** a constant `K` of total-order linearizations of the committed
-//!    steps consistent with `≺` (the paper uses MCMC over the linearization
-//!    graph for near-uniform sampling; we use randomized topological sort, which
-//!    is cheaper and sufficient here).
-//! 2. **Estimate** each linearization `z = init, a₁, …, aₙ, goal`. Build a
-//!    saturated relaxed planning graph from `init`; its last (fixpoint) fact
-//!    layer `F₀` must contain `pre(a₁)`, else `z` is infeasible. Apply `a₁`
-//!    *non-relaxed* in that layer — `s₁ = (F₀ \ del(a₁)) ∪ add(a₁)` — and build
-//!    `F₁` from `s₁`; and so on. `z` is feasible iff every `pre(aᵢ₊₁) ⊆ Fᵢ` and
-//!    the goal `⊆ Fₙ`. The estimate is the total number of relaxed plan steps
-//!    needed to fill all the gaps, computed by a back-to-front chained FF
-//!    extraction: extract a relaxed plan for the goal in `Fₙ`; the base facts it
-//!    bottoms out on that are *not* provided by `aₙ`'s adds — together with
-//!    `pre(aₙ)` — become the goals for `Fₙ₋₁`; recurse to `F₀`.
-//! 3. **Combine** by the minimum over the sampled linearizations. If *none* is
-//!    feasible we cannot conclude the plan is dead (sampling is not exhaustive),
-//!    so — like the paper — we fall back to the number of open conditions rather
-//!    than `∞`.
+//! Sample topological orderings of committed steps. Apply each committed
+//! step without delete relaxation and fill the gaps with relaxed plans.
+//! Backwards extraction carries required facts into preceding gaps.
 //!
-//! This first implementation targets the paper's best configuration: ground
-//! representation, no causal-link filtering ("front: ⊥ end: ⊥"), `K = 10`
-//! samples. Causal-link respecting (the `active`-links action filtering of §IV-D)
-//! and lifted partial plans (the paper's stated future work) are not yet done; in
-//! lifted search the heuristic falls back to the open-condition count.
+//! Return the minimum estimate across sampled orderings. If none is feasible,
+//! fall back to the open-condition count: sampling cannot prove a dead end.
+//! Lifted search also uses that fallback. Causal-link filtering is not applied.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

@@ -1,26 +1,8 @@
-//! Shelling out to an external classical planner (Fast Downward) to evaluate a
-//! state-based heuristic on the initial state of a compiled classical problem.
+//! External Fast Downward heuristic evaluation for compiled tasks.
 //!
-//! This is the "external solver" plumbing (Phase 0c). It is consumed by the
-//! causal-link compilation heuristic (Phase 1): a partial POCL plan is compiled
-//! to a classical STRIPS problem (`crate::compile`), and that problem's initial
-//! heuristic value — computed by Fast Downward — is the partial plan's rank.
-//!
-//! Design notes:
-//! - We *shell out* (write PDDL, spawn `fast-downward.py`, parse stdout). There
-//!   is therefore no compile-time dependency on any planner, so this module is
-//!   always compiled (`std` + `thiserror` only). The roadmap's optional `external`
-//!   Cargo feature is deferred to phases that link a real library (OR-tools /
-//!   tch/ONNX); shelling out does not need it.
-//! - The Fast Downward executable is found via the `POTOROO_FD` environment
-//!   variable, falling back to `fast-downward.py` on `PATH`.
-//! - `run_fd_heuristic` is *memoized* by a hash of (domain, problem, heuristic).
-//!   The paper notes that the per-node external-call overhead dominated the
-//!   Bercher–Geier–Biundo (2013) compilation approach, so caching identical
-//!   compiled problems is essential.
-//! - The output parser (`parse_initial_h`) is a pure function, unit-tested
-//!   against captured Fast Downward output so it is verifiable without FD
-//!   installed.
+//! Invoke the planner, parse its initial heuristic value, and cache results
+//! by task and heuristic. The output parser can be tested without installing
+//! Fast Downward.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -344,10 +326,8 @@ pub fn run_h_server_eval(sas: &str, heur: FdHeuristic) -> Result<HResult, FdErro
     unreachable!("h-server retry loop returns on both attempts")
 }
 
-/// Evaluates `heur` on the initial state of an FDR/SAS+ task given as text, by
-/// invoking only the `downward` C++ binary (no Python translator). This is the
-/// fast path: feeding FD's *input* directly skips the ~95% of per-node cost the
-/// translator otherwise incurs (measured: 202 ms translate vs 9 ms search).
+/// Evaluate `heur` on an SAS+ task's initial state using the `downward`
+/// C++ executable directly.
 pub fn run_downward_sas(sas: &str, heur: FdHeuristic) -> Result<HResult, FdError> {
     use std::io::Write;
     // Memoize by a hash of (SAS⁺ text, heuristic): different search nodes can

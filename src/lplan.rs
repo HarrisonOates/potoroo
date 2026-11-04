@@ -1,33 +1,10 @@
-//! The Lplan linear-programming heuristic (Bylander, AAAI 1997: "A Linear
-//! Programming Heuristic for Optimal Planning") applied to our causal-link
-//! compilation.
+//! Bylander's Lplan heuristic (AAAI 1997) over the causal-link compilation.
 //!
-//! Bylander translates a propositional STRIPS instance with a plan-length bound
-//! `l` into a time-indexed 0-1 integer program — conditions `p(t)` and operators
-//! `op(t)` at each time point, with precondition, frame-axiom and "at most one
-//! operator per step" constraints — and *relaxes* it to a linear program over
-//! `[0,1]`. If the relaxed LP at length `l` is infeasible then no plan of length
-//! `≤ l` exists, so the smallest `l` whose relaxed LP is feasible is an
-//! **admissible** lower bound on the plan length. This was the first non-trivial
-//! admissible heuristic for partial-order planning.
-//!
-//! ## Using our causal-link compilation
-//! Rather than re-deriving Bylander's separate partial-order ordering-constraint
-//! LP, we feed his *state-based* encoding the **ground causal-link compilation**
-//! (`crate::compile::ground_task`). That compilation already bakes the partial
-//! plan into a classical task: the committed steps become forced operators (their
-//! `exec-pos` indicators are goals), the partial order becomes predecessor
-//! preconditions, and the causal links become guard preconditions. So the
-//! smallest horizon `l` for which the compiled task's relaxed LP reaches the
-//! goal `g'` is an admissible estimate of the *total* length of any completion of
-//! the partial plan — exactly the position paper's "Lplan with our causal-link
-//! compilation".
-//!
-//! The smallest feasible horizon `l*` is normally close to the committed-step
-//! count (a completion adds only a few new steps), so we scan `l` upward from
-//! that lower bound — building the smallest LPs first — and stop at the first
-//! feasible one. Ground search only (the compilation's fast ground path); lifted
-//! falls back to the open-condition count.
+//! Time-indexed fact and operator variables are relaxed to [0, 1]. An
+//! infeasible horizon rules out completions of that length, making the first
+//! feasible horizon an admissible lower bound on total plan length.
+//! Ground search uses this encoding; lifted search falls back to the
+//! open-condition count.
 
 use good_lp::constraint::{eq, geq, leq};
 #[cfg(feature = "highs-lp")]

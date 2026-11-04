@@ -1,18 +1,8 @@
-//! A minimal finite-domain (FDR / SAS⁺) task representation and encoder, plus a
-//! direct path to Fast Downward's `downward` C++ binary.
+//! Finite-domain (SAS+) tasks and direct Fast Downward encoding.
 //!
-//! This is the fast heuristic-evaluation path for the causal-link compilation
-//! (Phase 1-opt): instead of emitting PDDL and paying Fast Downward's Python
-//! translator on every search node (~95% of the per-node cost — measured 202 ms
-//! translate vs 9 ms search), we ground the compiled task ourselves and write
-//! FD's *input* representation (SAS⁺) directly, invoking only `downward`.
-//!
-//! Encoding choice: **all-binary**. Every ground fact becomes its own two-valued
-//! SAS⁺ variable (`Atom <name>` = value 0 = true, `NegatedAtom <name>` = value 1
-//! = false). This skips the translator's mutex-group / invariant synthesis; the
-//! resulting task is valid (FD heuristics work on it, just without mutex
-//! information). Grounding the compiled task — including folding the polynomial
-//! causal-link guards into ground preconditions — lives in `crate::compile`.
+//! The causal-link compilation uses one binary variable per ground fact:
+//! value 0 is true and value 1 is false. It does not synthesize mutex groups.
+//! Compiled-task grounding is implemented in `crate::compile`.
 
 use std::fmt::Write;
 
