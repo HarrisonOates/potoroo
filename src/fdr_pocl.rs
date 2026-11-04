@@ -19,7 +19,7 @@
 //! reported as a threat.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
@@ -1237,6 +1237,24 @@ impl<'a> Planner<'a> {
     fn solve(
         &self,
         params: &Parameters,
+        progress: Option<&mut dyn FnMut(SearchProgress)>,
+    ) -> (Outcome, SearchStats) {
+        // Lazy search pops children to score them before deciding to expand.
+        // Reconstructing at that first pop loses the storage benefit, so keep
+        // its original plan pointers and smaller queue entries.
+        if matches!(
+            params.search_algorithm,
+            SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
+        ) {
+            self.solve_with_queue::<Rc<PartialPlan>>(params, progress)
+        } else {
+            self.solve_with_queue::<QueuedState>(params, progress)
+        }
+    }
+
+    fn solve_with_queue<P: QueueStorage>(
+        &self,
+        params: &Parameters,
         mut progress: Option<&mut dyn FnMut(SearchProgress)>,
     ) -> (Outcome, SearchStats) {
         let search_started = Instant::now();
@@ -1277,9 +1295,9 @@ impl<'a> Planner<'a> {
         let mut initial_plan = PartialPlan::initial(self.task);
         initial_plan.edelete = self.edelete.clone();
         let initial = Rc::new(initial_plan);
-        let mut queues: Vec<BinaryHeap<QueuedPlan>> =
+        let mut queues: Vec<BinaryHeap<QueuedPlan<P>>> =
             (0..n_orders).map(|_| BinaryHeap::new()).collect();
-        let mut secondary_queues: Vec<BinaryHeap<QueuedPlan>> = if is_dual || is_alt {
+        let mut secondary_queues: Vec<BinaryHeap<QueuedPlan<P>>> = if is_dual || is_alt {
             (0..n_orders).map(|_| BinaryHeap::new()).collect()
         } else {
             Vec::new()
@@ -1390,8 +1408,10 @@ impl<'a> Planner<'a> {
                 }
 
                 let children = self.refinements(&plan, &params.flaw_orders[current_order]);
+                let mut new_step_bases = FastMap::default();
                 let order_index = current_order;
                 for mut child in children {
+                    let forced_before = stats.supporter_forced;
                     if params.prune.supporters {
                         if let Some(reason) = stop_expired!() {
                             stopped = Some(reason);
@@ -1437,7 +1457,6 @@ impl<'a> Planner<'a> {
                     // A child is a clone of its parent, which is being
                     // expanded right now.
                     child.expanded = Cell::new(false);
-                    let child = Rc::new(child);
                     let mut alt_gbfs_rank = None;
                     let (rank, lazy_push) = if is_bfs {
                         (Rank::bfs(child.num_steps(), child.id), false)
@@ -1470,10 +1489,16 @@ impl<'a> Planner<'a> {
                             next_f_limit = next_f_limit.min(primary);
                             continue;
                         }
+                        let child = P::store(
+                            child,
+                            &plan,
+                            &mut new_step_bases,
+                            stats.supporter_forced == forced_before,
+                        );
                         if is_dual {
                             secondary_queues[order_index].push(QueuedPlan {
                                 plan: child.clone(),
-                                rank: Rank::fifo(child.id),
+                                rank: Rank::fifo(child.id()),
                                 is_lazy: lazy_push,
                             });
                         } else if is_alt {
@@ -2771,10 +2796,10 @@ impl<'a> Planner<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn pop_next(
+    fn pop_next<P: QueueStorage>(
         &self,
-        primary: &mut BinaryHeap<QueuedPlan>,
-        mut secondary: Option<&mut BinaryHeap<QueuedPlan>>,
+        primary: &mut BinaryHeap<QueuedPlan<P>>,
+        mut secondary: Option<&mut BinaryHeap<QueuedPlan<P>>>,
         params: &Parameters,
         is_lazy: bool,
         is_gbfs: bool,
@@ -2815,21 +2840,22 @@ impl<'a> Planner<'a> {
             let Some(queued) = queued else {
                 return (None, RankTerm::ZERO);
             };
-            if (is_dual || is_alt) && queued.plan.expanded.get() {
+            if (is_dual || is_alt) && queued.plan.expanded() {
                 continue;
             }
             if !is_lazy || !queued.is_lazy {
-                let primary = queued.rank.primary(queued.plan.id);
-                return (Some(queued.plan), primary);
+                let primary = queued.rank.primary(queued.plan.id());
+                return (Some(queued.plan.materialize(self)), primary);
             }
+            let plan = queued.plan.materialize(self);
             let rank = if is_gbfs {
-                self.rank_both(&queued.plan, params, stats).1
+                self.rank_both(&plan, params, stats).1
             } else {
-                self.rank_both(&queued.plan, params, stats).0
+                self.rank_both(&plan, params, stats).0
             };
-            if rank.primary(queued.plan.id).is_finite() {
+            if rank.primary(plan.id).is_finite() {
                 primary.push(QueuedPlan {
-                    plan: queued.plan,
+                    plan: P::ready(plan),
                     rank,
                     is_lazy: false,
                 });
@@ -3206,30 +3232,198 @@ fn push_add_rank(
     }
 }
 
-struct QueuedPlan {
-    plan: Rc<PartialPlan>,
+/// Choose queue storage once per search, keeping lazy entries at their
+/// original size rather than charging them for an unused deferred variant.
+trait QueueStorage: Clone {
+    fn ready(plan: Rc<PartialPlan>) -> Self;
+    fn id(&self) -> usize;
+    fn expanded(&self) -> bool;
+    fn materialize(self, planner: &Planner<'_>) -> Rc<PartialPlan>;
+    fn store(
+        child: PartialPlan,
+        _parent: &Rc<PartialPlan>,
+        _bases: &mut FastMap<usize, Rc<NewStepBase>>,
+        _can_defer: bool,
+    ) -> Self {
+        Self::ready(Rc::new(child))
+    }
+}
+
+impl QueueStorage for Rc<PartialPlan> {
+    fn ready(plan: Rc<PartialPlan>) -> Self {
+        plan
+    }
+    fn id(&self) -> usize {
+        self.id
+    }
+    fn expanded(&self) -> bool {
+        self.expanded.get()
+    }
+    fn materialize(self, _planner: &Planner<'_>) -> Rc<PartialPlan> {
+        self
+    }
+}
+
+/// Shared reconstruction inputs for new-step siblings supporting the same link.
+struct NewStepBase {
+    parent: Rc<PartialPlan>,
+    link: Rc<Chain<CausalLink>>,
+    orderings: Rc<BinaryOrderings>,
+    open_tail: Option<Rc<Chain<OpenCondition>>>,
+    open_count: usize,
+}
+
+impl NewStepBase {
+    fn new(parent: Rc<PartialPlan>, link: Rc<Chain<CausalLink>>) -> Self {
+        let open = OpenCondition {
+            consumer: link.head.consumer,
+            condition: link.head.condition,
+        };
+        let opens = NewStepOpenConditions::new(&parent, &open, false);
+        let orderings = parent
+            .orderings
+            .refine_with_step(
+                Ordering::new(
+                    parent.next_step_id(),
+                    StepTime::AtEnd,
+                    open.consumer,
+                    StepTime::AtStart,
+                ),
+                parent.next_step_id(),
+            )
+            .expect("an admitted new-step child has consistent orderings");
+        Self {
+            parent,
+            link,
+            orderings,
+            open_tail: opens.tail,
+            open_count: opens.inherited_count,
+        }
+    }
+}
+
+/// An already checked and ranked child, retained as a small recipe until pop.
+struct DeferredNewStep {
+    base: Rc<NewStepBase>,
+    operator: usize,
+    id: usize,
+    // Dual queues must share the same expanded flag after the first pop.
+    materialized: OnceCell<Rc<PartialPlan>>,
+}
+
+#[derive(Clone)]
+enum QueuedState {
+    Materialized(Rc<PartialPlan>),
+    NewStep(Rc<DeferredNewStep>),
+}
+
+impl QueueStorage for QueuedState {
+    fn ready(plan: Rc<PartialPlan>) -> Self {
+        Self::Materialized(plan)
+    }
+
+    fn store(
+        child: PartialPlan,
+        parent: &Rc<PartialPlan>,
+        bases: &mut FastMap<usize, Rc<NewStepBase>>,
+        can_defer: bool,
+    ) -> Self {
+        // A single-step recipe cannot reproduce additional
+        // refinements made by forced-support propagation.
+        if can_defer && child.num_steps() == parent.num_steps() + 1 {
+            let link = child.links.as_ref().expect("new step adds a link");
+            let effect = link.head.effect.expect("new step has a supporting effect");
+            let base = bases
+                .entry(effect)
+                .or_insert_with(|| Rc::new(NewStepBase::new(parent.clone(), link.clone())));
+            debug_assert_eq!(base.link.head, link.head);
+            QueuedState::NewStep(Rc::new(DeferredNewStep {
+                base: base.clone(),
+                operator: child.steps.as_ref().unwrap().head.operator,
+                id: child.id,
+                materialized: OnceCell::new(),
+            }))
+        } else {
+            QueuedState::Materialized(Rc::new(child))
+        }
+    }
+
+    fn id(&self) -> usize {
+        match self {
+            Self::Materialized(plan) => plan.id,
+            Self::NewStep(delta) => delta.id,
+        }
+    }
+
+    fn expanded(&self) -> bool {
+        match self {
+            Self::Materialized(plan) => plan.expanded.get(),
+            Self::NewStep(delta) => delta
+                .materialized
+                .get()
+                .is_some_and(|plan| plan.expanded.get()),
+        }
+    }
+
+    fn materialize(self, planner: &Planner<'_>) -> Rc<PartialPlan> {
+        match self {
+            Self::Materialized(plan) => plan,
+            Self::NewStep(delta) => delta
+                .materialized
+                .get_or_init(|| {
+                    let base = &delta.base;
+                    let mut opens = NewStepOpenConditions {
+                        consumer: base.parent.next_step_id(),
+                        tail: base.open_tail.clone(),
+                        inherited_count: base.open_count,
+                        share: false,
+                        prefixes: FastMap::default(),
+                    };
+                    let mut child = planner
+                        .add_step(
+                            &base.parent,
+                            &Achiever {
+                                operator: delta.operator,
+                                effect: base.link.head.effect.unwrap(),
+                            },
+                            base.orderings.clone(),
+                            base.link.clone(),
+                            &mut opens,
+                        )
+                        .expect("replaying an admitted child must succeed");
+                    child.id = delta.id;
+                    child.expanded = Cell::new(false);
+                    Rc::new(child)
+                })
+                .clone(),
+        }
+    }
+}
+
+struct QueuedPlan<P: QueueStorage = QueuedState> {
+    plan: P,
     rank: Rank,
     is_lazy: bool,
 }
 
-impl PartialEq for QueuedPlan {
+impl<P: QueueStorage> PartialEq for QueuedPlan<P> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == CmpOrdering::Equal
     }
 }
 
-impl Eq for QueuedPlan {}
+impl<P: QueueStorage> Eq for QueuedPlan<P> {}
 
-impl PartialOrd for QueuedPlan {
+impl<P: QueueStorage> PartialOrd for QueuedPlan<P> {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for QueuedPlan {
+impl<P: QueueStorage> Ord for QueuedPlan<P> {
     fn cmp(&self, other: &Self) -> CmpOrdering {
         self.rank
-            .better_first(&other.rank, || self.plan.id, || other.plan.id)
+            .better_first(&other.rank, || self.plan.id(), || other.plan.id())
     }
 }
 
@@ -3248,6 +3442,167 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn full_and_deferred_queues_preserve_search() {
+        if usize::BITS == 64 {
+            assert_eq!(std::mem::size_of::<QueuedPlan<Rc<PartialPlan>>>(), 40);
+            assert_eq!(std::mem::size_of::<QueuedPlan<QueuedState>>(), 48);
+        }
+        for task in [
+            travel_task(),
+            conditional_task(),
+            breaker_task(),
+            shared_effect_task(),
+        ] {
+            for algorithm in [
+                SearchAlgorithm::A,
+                SearchAlgorithm::Gbfs,
+                SearchAlgorithm::Bfs,
+                SearchAlgorithm::Alt,
+            ] {
+                for pruning in ["none", "supporters", "edelete,disjunctive"] {
+                    let params = Parameters {
+                        search_algorithm: algorithm,
+                        search_limits: vec![1_000],
+                        flaw_orders: vec![FlawSelectionOrder::parse("ZLIFO").unwrap()],
+                        heuristic: Heuristic::parse("ADD/LIFO").unwrap(),
+                        prune: crate::pruning::PruneOptions::parse(pruning).unwrap(),
+                        ..Parameters::default()
+                    };
+                    let planner = Planner::new(&task).with_pruning(params.prune);
+                    let (full, a) = planner.solve_with_queue::<Rc<PartialPlan>>(&params, None);
+                    let (deferred, b) = planner.solve_with_queue::<QueuedState>(&params, None);
+                    assert_eq!(
+                        (
+                            a.nodes_generated,
+                            a.nodes_visited,
+                            a.pruned,
+                            a.h_evals,
+                            a.max_queued,
+                            a.supporter_forced
+                        ),
+                        (
+                            b.nodes_generated,
+                            b.nodes_visited,
+                            b.pruned,
+                            b.h_evals,
+                            b.max_queued,
+                            b.supporter_forced
+                        )
+                    );
+                    match (full, deferred) {
+                        (Outcome::Solved(a), Outcome::Solved(b)) => {
+                            assert_eq!(a.operators, b.operators);
+                            assert_eq!(a.plan.cost, b.plan.cost);
+                        }
+                        (Outcome::NoSolution, Outcome::NoSolution)
+                        | (Outcome::LimitReached, Outcome::LimitReached) => {}
+                        _ => panic!("queue storage changed the search outcome"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_steps_replay_exactly_and_share_expansion_state() {
+        let mut checked = 0;
+        for task in [
+            travel_task(),
+            conditional_task(),
+            breaker_task(),
+            shared_effect_task(),
+        ] {
+            for pruning in ["none", "disjunctive", "edelete,disjunctive"] {
+                let planner = Planner::new(&task)
+                    .with_pruning(crate::pruning::PruneOptions::parse(pruning).unwrap());
+                let mut initial = PartialPlan::initial(&task);
+                initial.edelete = planner.edelete.clone();
+                let mut parents = vec![Rc::new(initial)];
+                for _ in 0..6 {
+                    let mut next = Vec::new();
+                    for parent in parents {
+                        if parent.complete(&task) {
+                            continue;
+                        }
+                        for mut child in planner
+                            .refinements(&parent, &FlawSelectionOrder::parse("ZLIFO").unwrap())
+                        {
+                            child.id = usize::MAX - checked;
+                            child.expanded = Cell::new(false);
+                            if child.num_steps() == parent.num_steps() + 1 {
+                                let queued = QueuedState::NewStep(Rc::new(DeferredNewStep {
+                                    base: Rc::new(NewStepBase::new(
+                                        parent.clone(),
+                                        child.links.as_ref().unwrap().clone(),
+                                    )),
+                                    operator: child.steps.as_ref().unwrap().head.operator,
+                                    id: child.id,
+                                    materialized: OnceCell::new(),
+                                }));
+                                assert_eq!(queued.id(), child.id);
+                                assert!(!queued.expanded());
+                                let replay = queued.clone().materialize(&planner);
+                                assert_eq!(
+                                    replay.steps().collect::<Vec<_>>(),
+                                    child.steps().collect::<Vec<_>>()
+                                );
+                                assert_eq!(
+                                    replay.links().collect::<Vec<_>>(),
+                                    child.links().collect::<Vec<_>>()
+                                );
+                                assert_eq!(
+                                    replay.open_conditions().collect::<Vec<_>>(),
+                                    child.open_conditions().collect::<Vec<_>>()
+                                );
+                                assert_eq!(replay.num_links, child.num_links);
+                                assert_eq!(replay.num_open_conditions, child.num_open_conditions);
+                                assert_eq!(replay.cost, child.cost);
+                                assert_eq!(replay.threats, child.threats);
+                                assert_eq!(replay.disjunctions, child.disjunctions);
+                                assert_eq!(replay.suppressed, child.suppressed);
+                                assert_eq!(replay.id, child.id);
+                                let ids: Vec<_> =
+                                    (0..=child.num_steps()).chain([GOAL_ID]).collect();
+                                for &a in &ids {
+                                    for &b in &ids {
+                                        assert_eq!(
+                                            replay.orderings.possibly_before(
+                                                a,
+                                                StepTime::AtEnd,
+                                                b,
+                                                StepTime::AtStart
+                                            ),
+                                            child.orderings.possibly_before(
+                                                a,
+                                                StepTime::AtEnd,
+                                                b,
+                                                StepTime::AtStart
+                                            )
+                                        );
+                                    }
+                                }
+                                assert!(Rc::ptr_eq(&replay, &queued.clone().materialize(&planner)));
+                                replay.expanded.set(true);
+                                assert!(queued.expanded());
+                                assert!(!parent.expanded.get());
+                                checked += 1;
+                            }
+                            if next.len() < 32 {
+                                next.push(Rc::new(child));
+                            }
+                        }
+                    }
+                    parents = next;
+                }
+            }
+        }
+        assert!(
+            checked >= 30,
+            "checked only {checked} reconstructed children"
+        );
+    }
 
     #[test]
     fn step_counts_and_ids_survive_new_steps_and_support_refinements() {
@@ -3590,7 +3945,7 @@ mod tests {
                                 }
                             };
                             queue.push(QueuedPlan {
-                                plan: Rc::new(plan),
+                                plan: QueuedState::Materialized(Rc::new(plan)),
                                 rank,
                                 is_lazy: lazy,
                             });
