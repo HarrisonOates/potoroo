@@ -132,7 +132,6 @@ fn extend_cow<T: Clone>(slot: &mut Rc<Vec<T>>, items: Vec<T>) {
 #[derive(Debug, Clone)]
 pub struct PartialPlan {
     steps: Option<Rc<Chain<Step>>>,
-    num_steps: usize,
     links: Option<Rc<Chain<CausalLink>>>,
     num_links: usize,
     open_conditions: Option<Rc<Chain<OpenCondition>>>,
@@ -156,7 +155,6 @@ pub struct PartialPlan {
     /// variable another value" test. See [`crate::cutset::FactMutexes`] and
     /// `Planner::with_pruning`.
     edelete: Option<Rc<crate::cutset::FactMutexes>>,
-    next_step_id: usize,
     id: usize,
     /// Set once the search has expanded this plan; see `Plan::expanded`.
     expanded: Cell<bool>,
@@ -166,7 +164,6 @@ impl PartialPlan {
     pub fn initial(task: &Task) -> Self {
         let mut plan = PartialPlan {
             steps: None,
-            num_steps: 0,
             links: None,
             num_links: 0,
             open_conditions: None,
@@ -177,7 +174,6 @@ impl PartialPlan {
             cost: 0,
             disjunctions: Rc::new(Vec::new()),
             edelete: None,
-            next_step_id: 1,
             id: 0,
             expanded: Cell::new(false),
         };
@@ -204,7 +200,6 @@ impl PartialPlan {
     ) -> Self {
         let mut plan = PartialPlan {
             steps: None,
-            num_steps: 0,
             links: None,
             num_links: 0,
             open_conditions: None,
@@ -215,7 +210,6 @@ impl PartialPlan {
             cost,
             disjunctions: Rc::new(Vec::new()),
             edelete: None,
-            next_step_id,
             id: 0,
             expanded: Cell::new(false),
         };
@@ -228,6 +222,7 @@ impl PartialPlan {
         for open in open_conditions {
             plan.push_open(open);
         }
+        assert_eq!(plan.next_step_id(), next_step_id);
         plan
     }
 
@@ -273,8 +268,8 @@ impl PartialPlan {
     }
 
     fn push_step(&mut self, step: Step) {
+        debug_assert_eq!(step.id, self.next_step_id());
         self.steps = chain::cons(step, self.steps.take());
-        self.num_steps += 1;
     }
 
     fn push_link(&mut self, link: CausalLink) {
@@ -361,7 +356,7 @@ impl PartialPlan {
     /// The committed step with the given id. Steps are only ever appended and
     /// ids are dense, so the step sits `num_steps - id` hops from the newest.
     fn step(&self, id: usize) -> Option<&Step> {
-        let hops = self.num_steps.checked_sub(id)?;
+        let hops = self.num_steps().checked_sub(id)?;
         self.steps().nth(hops).filter(|step| step.id == id)
     }
 
@@ -718,7 +713,14 @@ impl PartialPlan {
     }
 
     pub fn num_steps(&self) -> usize {
-        self.num_steps
+        // Steps are never removed and have dense IDs starting at one. The
+        // newest step therefore carries both the count and the next ID,
+        // saving two usize fields on every queued plan.
+        self.steps.as_ref().map_or(0, |steps| steps.head.id)
+    }
+
+    fn next_step_id(&self) -> usize {
+        self.num_steps() + 1
     }
 
     pub fn cost(&self) -> usize {
@@ -907,7 +909,7 @@ impl NewStepOpenConditions {
         let mut base = plan.clone();
         base.remove_open(open);
         Self {
-            consumer: plan.next_step_id,
+            consumer: plan.next_step_id(),
             tail: base.open_conditions,
             inherited_count: base.num_open_conditions,
             share,
@@ -1649,12 +1651,12 @@ impl<'a> Planner<'a> {
             // settling a child's disjunctions can still refine its own copy.
             let new_step_orderings = plan.orderings.refine_with_step(
                 Ordering::new(
-                    plan.next_step_id,
+                    plan.next_step_id(),
                     StepTime::AtEnd,
                     open.consumer,
                     StepTime::AtStart,
                 ),
-                plan.next_step_id,
+                plan.next_step_id(),
             );
             let mut sibling_open = NewStepOpenConditions::new(plan, &open, achievers.len() > 1);
             let mut sibling_links: FastMap<usize, Rc<Chain<CausalLink>>> = FastMap::default();
@@ -1673,7 +1675,7 @@ impl<'a> Planner<'a> {
                     let make_link = || {
                         Chain::new(
                             CausalLink {
-                                producer: plan.next_step_id,
+                                producer: plan.next_step_id(),
                                 consumer: open.consumer,
                                 condition: open.condition,
                                 effect: Some(achiever.effect),
@@ -1798,12 +1800,11 @@ impl<'a> Planner<'a> {
         link: Rc<Chain<CausalLink>>,
         open_conditions: &mut NewStepOpenConditions,
     ) -> Option<PartialPlan> {
-        let new_id = plan.next_step_id;
+        let new_id = plan.next_step_id();
         let operator = &self.task.operators[achiever.operator];
 
         let mut child = plan.clone();
         child.orderings = orderings;
-        child.next_step_id += 1;
         child.cost = child
             .cost
             .saturating_add(self.action_cost.resolve(operator.cost));
@@ -3249,6 +3250,39 @@ mod tests {
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
 
     #[test]
+    fn step_counts_and_ids_survive_new_steps_and_support_refinements() {
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        let mut plans = vec![PartialPlan::initial(&task)];
+        // Insert two actions, then support the oldest action from INIT.
+        for expected in [1, 2, 2] {
+            let parent = plans.last().unwrap();
+            let open = parent.open_conditions().next().unwrap().clone();
+            let mut children = planner.resolve_open(parent, open);
+            assert_eq!(children.len(), 1);
+            let child = children.pop().unwrap();
+            assert_eq!(child.num_steps(), expected);
+            plans.push(child);
+        }
+        // Descendants must not change the counts or IDs of shared ancestors.
+        for (plan, expected) in plans.iter().zip([0, 1, 2, 2]) {
+            assert_eq!(plan.num_steps(), expected);
+            assert_eq!(plan.steps().count(), expected);
+            assert_eq!(plan.next_step_id(), expected + 1);
+            for id in 1..=expected {
+                assert_eq!(plan.step(id).unwrap().id, id);
+            }
+            assert!(plan.step(INIT_ID).is_none());
+            assert!(plan.step(GOAL_ID).is_none());
+            assert!(plan.step(expected + 1).is_none());
+        }
+        assert_eq!(
+            linearize_and_validate(plans.last().unwrap(), &task),
+            Some(vec![0, 1])
+        );
+    }
+
+    #[test]
     fn new_step_open_prefixes_share_only_equal_tails_and_survive_removal() {
         let task = shared_effect_task();
         let parent = PartialPlan::initial(&task);
@@ -3741,7 +3775,6 @@ mod tests {
             )
             .unwrap();
         plan.push_step(Step { id: 1, operator: 0 });
-        plan.next_step_id = 2;
         // Both a fresh drive occurrence and the already committed one can
         // support the goal. Uniqueness of its action type does not force reuse.
         assert_eq!(
@@ -4941,17 +4974,17 @@ mod tests {
                 plan.orderings
                     .refine_with_step(
                         Ordering::new(
-                            plan.next_step_id,
+                            plan.next_step_id(),
                             StepTime::AtEnd,
                             open.consumer,
                             StepTime::AtStart,
                         ),
-                        plan.next_step_id,
+                        plan.next_step_id(),
                     )
                     .unwrap(),
                 Chain::new(
                     CausalLink {
-                        producer: plan.next_step_id,
+                        producer: plan.next_step_id(),
                         consumer: open.consumer,
                         condition: open.condition,
                         effect: Some(0),
