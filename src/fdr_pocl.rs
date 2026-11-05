@@ -1247,8 +1247,11 @@ impl<'a> Planner<'a> {
             SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
         ) {
             self.solve_with_queue::<Rc<PartialPlan>>(params, progress)
-        } else {
+        } else if params.search_algorithm == SearchAlgorithm::Alt {
+            // Alternating queues must share materialization and expansion state.
             self.solve_with_queue::<QueuedState>(params, progress)
+        } else {
+            self.solve_with_queue::<InlineQueuedState>(params, progress)
         }
     }
 
@@ -3274,6 +3277,45 @@ struct NewStepBase {
 }
 
 impl NewStepBase {
+    fn for_child(
+        child: &PartialPlan,
+        parent: &Rc<PartialPlan>,
+        bases: &mut FastMap<usize, Rc<NewStepBase>>,
+    ) -> Rc<Self> {
+        let link = child.links.as_ref().expect("new step adds a link");
+        let effect = link.head.effect.expect("new step has a supporting effect");
+        let base = bases
+            .entry(effect)
+            .or_insert_with(|| Rc::new(Self::new(parent.clone(), link.clone())));
+        debug_assert_eq!(base.link.head, link.head);
+        base.clone()
+    }
+
+    fn materialize(&self, planner: &Planner<'_>, operator: usize, id: usize) -> Rc<PartialPlan> {
+        let mut opens = NewStepOpenConditions {
+            consumer: self.parent.next_step_id(),
+            tail: self.open_tail.clone(),
+            inherited_count: self.open_count,
+            share: false,
+            prefixes: FastMap::default(),
+        };
+        let mut child = planner
+            .add_step(
+                &self.parent,
+                &Achiever {
+                    operator,
+                    effect: self.link.head.effect.unwrap(),
+                },
+                self.orderings.clone(),
+                self.link.clone(),
+                &mut opens,
+            )
+            .expect("replaying an admitted child must succeed");
+        child.id = id;
+        child.expanded = Cell::new(false);
+        Rc::new(child)
+    }
+
     fn new(parent: Rc<PartialPlan>, link: Rc<Chain<CausalLink>>) -> Self {
         let open = OpenCondition {
             consumer: link.head.consumer,
@@ -3331,14 +3373,9 @@ impl QueueStorage for QueuedState {
         // A single-step recipe cannot reproduce additional
         // refinements made by forced-support propagation.
         if can_defer && child.num_steps() == parent.num_steps() + 1 {
-            let link = child.links.as_ref().expect("new step adds a link");
-            let effect = link.head.effect.expect("new step has a supporting effect");
-            let base = bases
-                .entry(effect)
-                .or_insert_with(|| Rc::new(NewStepBase::new(parent.clone(), link.clone())));
-            debug_assert_eq!(base.link.head, link.head);
+            let base = NewStepBase::for_child(&child, parent, bases);
             QueuedState::NewStep(Rc::new(DeferredNewStep {
-                base: base.clone(),
+                base,
                 operator: child.steps.as_ref().unwrap().head.operator,
                 id: child.id,
                 materialized: OnceCell::new(),
@@ -3370,32 +3407,66 @@ impl QueueStorage for QueuedState {
             Self::Materialized(plan) => plan,
             Self::NewStep(delta) => delta
                 .materialized
-                .get_or_init(|| {
-                    let base = &delta.base;
-                    let mut opens = NewStepOpenConditions {
-                        consumer: base.parent.next_step_id(),
-                        tail: base.open_tail.clone(),
-                        inherited_count: base.open_count,
-                        share: false,
-                        prefixes: FastMap::default(),
-                    };
-                    let mut child = planner
-                        .add_step(
-                            &base.parent,
-                            &Achiever {
-                                operator: delta.operator,
-                                effect: base.link.head.effect.unwrap(),
-                            },
-                            base.orderings.clone(),
-                            base.link.clone(),
-                            &mut opens,
-                        )
-                        .expect("replaying an admitted child must succeed");
-                    child.id = delta.id;
-                    child.expanded = Cell::new(false);
-                    Rc::new(child)
-                })
+                .get_or_init(|| delta.base.materialize(planner, delta.operator, delta.id))
                 .clone(),
+        }
+    }
+}
+
+/// Single-queue entries keep the recipe in the heap, avoiding an allocation
+/// and Rc counters for every deferred child. No clone may enter a second queue:
+/// unlike QueuedState, these recipes do not share a materialization cache.
+#[derive(Clone)]
+enum InlineQueuedState {
+    Materialized(Rc<PartialPlan>),
+    NewStep {
+        base: Rc<NewStepBase>,
+        operator: usize,
+        id: usize,
+    },
+}
+
+impl QueueStorage for InlineQueuedState {
+    fn ready(plan: Rc<PartialPlan>) -> Self {
+        Self::Materialized(plan)
+    }
+
+    fn store(
+        child: PartialPlan,
+        parent: &Rc<PartialPlan>,
+        bases: &mut FastMap<usize, Rc<NewStepBase>>,
+        can_defer: bool,
+    ) -> Self {
+        // Forced-support propagation can make changes beyond this recipe.
+        if can_defer && child.num_steps() == parent.num_steps() + 1 {
+            Self::NewStep {
+                base: NewStepBase::for_child(&child, parent, bases),
+                operator: child.steps.as_ref().unwrap().head.operator,
+                id: child.id,
+            }
+        } else {
+            Self::Materialized(Rc::new(child))
+        }
+    }
+
+    fn id(&self) -> usize {
+        match self {
+            Self::Materialized(plan) => plan.id,
+            Self::NewStep { id, .. } => *id,
+        }
+    }
+
+    fn expanded(&self) -> bool {
+        match self {
+            Self::Materialized(plan) => plan.expanded.get(),
+            Self::NewStep { .. } => false,
+        }
+    }
+
+    fn materialize(self, planner: &Planner<'_>) -> Rc<PartialPlan> {
+        match self {
+            Self::Materialized(plan) => plan,
+            Self::NewStep { base, operator, id } => base.materialize(planner, operator, id),
         }
     }
 }
@@ -3448,6 +3519,7 @@ mod tests {
         if usize::BITS == 64 {
             assert_eq!(std::mem::size_of::<QueuedPlan<Rc<PartialPlan>>>(), 40);
             assert_eq!(std::mem::size_of::<QueuedPlan<QueuedState>>(), 48);
+            assert_eq!(std::mem::size_of::<QueuedPlan<InlineQueuedState>>(), 56);
         }
         for task in [
             travel_task(),
@@ -3460,45 +3532,92 @@ mod tests {
                 SearchAlgorithm::Gbfs,
                 SearchAlgorithm::Bfs,
                 SearchAlgorithm::Alt,
+                SearchAlgorithm::Ida,
+                SearchAlgorithm::LazyGbfs,
+                SearchAlgorithm::LazyGbfsDual,
             ] {
-                for pruning in ["none", "supporters", "edelete,disjunctive"] {
-                    let params = Parameters {
-                        search_algorithm: algorithm,
-                        search_limits: vec![1_000],
-                        flaw_orders: vec![FlawSelectionOrder::parse("ZLIFO").unwrap()],
-                        heuristic: Heuristic::parse("ADD/LIFO").unwrap(),
-                        prune: crate::pruning::PruneOptions::parse(pruning).unwrap(),
-                        ..Parameters::default()
-                    };
-                    let planner = Planner::new(&task).with_pruning(params.prune);
-                    let (full, a) = planner.solve_with_queue::<Rc<PartialPlan>>(&params, None);
-                    let (deferred, b) = planner.solve_with_queue::<QueuedState>(&params, None);
-                    assert_eq!(
-                        (
-                            a.nodes_generated,
-                            a.nodes_visited,
-                            a.pruned,
-                            a.h_evals,
-                            a.max_queued,
-                            a.supporter_forced
-                        ),
-                        (
-                            b.nodes_generated,
-                            b.nodes_visited,
-                            b.pruned,
-                            b.h_evals,
-                            b.max_queued,
-                            b.supporter_forced
-                        )
-                    );
-                    match (full, deferred) {
-                        (Outcome::Solved(a), Outcome::Solved(b)) => {
-                            assert_eq!(a.operators, b.operators);
-                            assert_eq!(a.plan.cost, b.plan.cost);
+                for flaws in [vec!["ZLIFO"], vec!["UCPOP"], vec!["ZLIFO", "UCPOP"]] {
+                    for pruning in ["none", "supporters", "edelete,disjunctive"] {
+                        let params = Parameters {
+                            search_algorithm: algorithm,
+                            search_limits: vec![1_000; flaws.len()],
+                            flaw_orders: flaws
+                                .iter()
+                                .map(|f| FlawSelectionOrder::parse(f).unwrap())
+                                .collect(),
+                            heuristic: Heuristic::parse("ADD/LIFO").unwrap(),
+                            prune: crate::pruning::PruneOptions::parse(pruning).unwrap(),
+                            ..Parameters::default()
+                        };
+                        let planner = Planner::new(&task).with_pruning(params.prune);
+                        let (full, a) = planner.solve_with_queue::<Rc<PartialPlan>>(&params, None);
+                        let (deferred, b) = planner.solve_with_queue::<QueuedState>(&params, None);
+                        // Exercise production dispatch, including inline storage,
+                        // lazy pointers and ALT's shared expansion flag.
+                        let (selected, c) = planner.solve(&params, None);
+                        assert_eq!(
+                            (
+                                a.nodes_generated,
+                                a.nodes_visited,
+                                a.pruned,
+                                a.h_evals,
+                                a.max_queued,
+                                a.supporter_forced,
+                                a.max_steps,
+                                a.max_open_conditions,
+                                a.max_threats,
+                                a.max_disjunctions
+                            ),
+                            (
+                                c.nodes_generated,
+                                c.nodes_visited,
+                                c.pruned,
+                                c.h_evals,
+                                c.max_queued,
+                                c.supporter_forced,
+                                c.max_steps,
+                                c.max_open_conditions,
+                                c.max_threats,
+                                c.max_disjunctions
+                            ),
+                            "{algorithm:?} {flaws:?} {pruning}"
+                        );
+                        match (&full, selected) {
+                            (Outcome::Solved(a), Outcome::Solved(c)) => {
+                                assert_eq!(a.operators, c.operators);
+                                assert_eq!(a.plan.cost, c.plan.cost);
+                            }
+                            (Outcome::NoSolution, Outcome::NoSolution)
+                            | (Outcome::LimitReached, Outcome::LimitReached) => {}
+                            _ => panic!("selected queue storage changed the outcome"),
                         }
-                        (Outcome::NoSolution, Outcome::NoSolution)
-                        | (Outcome::LimitReached, Outcome::LimitReached) => {}
-                        _ => panic!("queue storage changed the search outcome"),
+                        assert_eq!(
+                            (
+                                a.nodes_generated,
+                                a.nodes_visited,
+                                a.pruned,
+                                a.h_evals,
+                                a.max_queued,
+                                a.supporter_forced
+                            ),
+                            (
+                                b.nodes_generated,
+                                b.nodes_visited,
+                                b.pruned,
+                                b.h_evals,
+                                b.max_queued,
+                                b.supporter_forced
+                            )
+                        );
+                        match (full, deferred) {
+                            (Outcome::Solved(a), Outcome::Solved(b)) => {
+                                assert_eq!(a.operators, b.operators);
+                                assert_eq!(a.plan.cost, b.plan.cost);
+                            }
+                            (Outcome::NoSolution, Outcome::NoSolution)
+                            | (Outcome::LimitReached, Outcome::LimitReached) => {}
+                            _ => panic!("queue storage changed the search outcome"),
+                        }
                     }
                 }
             }
@@ -3544,43 +3663,66 @@ mod tests {
                                 assert_eq!(queued.id(), child.id);
                                 assert!(!queued.expanded());
                                 let replay = queued.clone().materialize(&planner);
-                                assert_eq!(
-                                    replay.steps().collect::<Vec<_>>(),
-                                    child.steps().collect::<Vec<_>>()
+                                let mut bases = FastMap::default();
+                                let inline = InlineQueuedState::store(
+                                    child.clone(),
+                                    &parent,
+                                    &mut bases,
+                                    true,
                                 );
-                                assert_eq!(
-                                    replay.links().collect::<Vec<_>>(),
-                                    child.links().collect::<Vec<_>>()
+                                assert!(matches!(inline, InlineQueuedState::NewStep { .. }));
+                                let forced = InlineQueuedState::store(
+                                    child.clone(),
+                                    &parent,
+                                    &mut bases,
+                                    false,
                                 );
-                                assert_eq!(
-                                    replay.open_conditions().collect::<Vec<_>>(),
-                                    child.open_conditions().collect::<Vec<_>>()
-                                );
-                                assert_eq!(replay.num_links, child.num_links);
-                                assert_eq!(replay.num_open_conditions, child.num_open_conditions);
-                                assert_eq!(replay.cost, child.cost);
-                                assert_eq!(replay.threats, child.threats);
-                                assert_eq!(replay.disjunctions, child.disjunctions);
-                                assert_eq!(replay.suppressed, child.suppressed);
-                                assert_eq!(replay.id, child.id);
-                                let ids: Vec<_> =
-                                    (0..=child.num_steps()).chain([GOAL_ID]).collect();
-                                for &a in &ids {
-                                    for &b in &ids {
-                                        assert_eq!(
-                                            replay.orderings.possibly_before(
-                                                a,
-                                                StepTime::AtEnd,
-                                                b,
-                                                StepTime::AtStart
-                                            ),
-                                            child.orderings.possibly_before(
-                                                a,
-                                                StepTime::AtEnd,
-                                                b,
-                                                StepTime::AtStart
-                                            )
-                                        );
+                                assert!(matches!(forced, InlineQueuedState::Materialized(_)));
+                                // Compare both reconstructions against the
+                                // actual generated child, including threats,
+                                // condition order and transitive orderings.
+                                for replay in [&replay, &inline.materialize(&planner)] {
+                                    assert_eq!(
+                                        replay.steps().collect::<Vec<_>>(),
+                                        child.steps().collect::<Vec<_>>()
+                                    );
+                                    assert_eq!(
+                                        replay.links().collect::<Vec<_>>(),
+                                        child.links().collect::<Vec<_>>()
+                                    );
+                                    assert_eq!(
+                                        replay.open_conditions().collect::<Vec<_>>(),
+                                        child.open_conditions().collect::<Vec<_>>()
+                                    );
+                                    assert_eq!(replay.num_links, child.num_links);
+                                    assert_eq!(
+                                        replay.num_open_conditions,
+                                        child.num_open_conditions
+                                    );
+                                    assert_eq!(replay.cost, child.cost);
+                                    assert_eq!(replay.threats, child.threats);
+                                    assert_eq!(replay.disjunctions, child.disjunctions);
+                                    assert_eq!(replay.suppressed, child.suppressed);
+                                    assert_eq!(replay.id, child.id);
+                                    let ids: Vec<_> =
+                                        (0..=child.num_steps()).chain([GOAL_ID]).collect();
+                                    for &a in &ids {
+                                        for &b in &ids {
+                                            assert_eq!(
+                                                replay.orderings.possibly_before(
+                                                    a,
+                                                    StepTime::AtEnd,
+                                                    b,
+                                                    StepTime::AtStart
+                                                ),
+                                                child.orderings.possibly_before(
+                                                    a,
+                                                    StepTime::AtEnd,
+                                                    b,
+                                                    StepTime::AtStart
+                                                )
+                                            );
+                                        }
                                     }
                                 }
                                 assert!(Rc::ptr_eq(&replay, &queued.clone().materialize(&planner)));
