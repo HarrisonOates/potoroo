@@ -598,8 +598,9 @@ impl PlanningGraph {
     }
 
     /// Compact reachable parameter relations, without materialising ground
-    /// actions or their effects. An oversized relation is omitted in full:
-    /// keeping only its prefix would make pruning unsound.
+    /// actions or their effects. Simple independent precondition groups avoid
+    /// enumeration of their Cartesian product. An oversized logical relation
+    /// is still omitted in full: keeping a prefix would make pruning unsound.
     pub(crate) fn joint_parameter_domains(
         &self,
         schemas: &[ActionSchema],
@@ -614,7 +615,29 @@ impl PlanningGraph {
         schemas: &[ActionSchema],
         predicates: &PredicateTable,
         get_objects: impl Fn(Type) -> Vec<Object>,
+        remaining_cells: usize,
+    ) -> crate::joint_domains::JointDomains {
+        self.joint_parameter_domains_impl(schemas, predicates, get_objects, remaining_cells, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joint_parameter_domains_reference(
+        &self,
+        schemas: &[ActionSchema],
+        predicates: &PredicateTable,
+        get_objects: impl Fn(Type) -> Vec<Object>,
+        remaining_cells: usize,
+    ) -> crate::joint_domains::JointDomains {
+        self.joint_parameter_domains_impl(schemas, predicates, get_objects, remaining_cells, false)
+    }
+
+    fn joint_parameter_domains_impl(
+        &self,
+        schemas: &[ActionSchema],
+        predicates: &PredicateTable,
+        get_objects: impl Fn(Type) -> Vec<Object>,
         mut remaining_cells: usize,
+        direct_groups: bool,
     ) -> crate::joint_domains::JointDomains {
         let mut type_domains = FastMap::default();
         for schema in schemas {
@@ -639,6 +662,61 @@ impl PlanningGraph {
             let arity = schema.parameters.len();
             // AtomPattern uses u8 equality-class IDs.
             if arity > 256 || remaining_cells == 0 {
+                continue;
+            }
+            if let Some(parts) = direct_groups
+                .then(|| parameter_components(schema))
+                .flatten()
+            {
+                let mut groups = Vec::new();
+                let row_limit = remaining_cells / arity;
+                for part in parts {
+                    let mut cells = Vec::new();
+                    let mut rows = 0;
+                    let mut join = JoinEnum::over(
+                        &schema.var_types,
+                        &part.params,
+                        &part.precondition,
+                        &atoms,
+                        &type_domains,
+                        &type_sets,
+                    );
+                    join.run(&mut |subst, tuple| {
+                        if rows > row_limit || !precondition_consistent(&part.precondition, subst) {
+                            return;
+                        }
+                        let pre = instantiate_formula_expanded(
+                            &part.precondition,
+                            &mut subst.to_vec(),
+                            &schema.var_types,
+                            &type_domains,
+                        );
+                        if self.ground_formula_value(predicates, &pre).0.infinite() {
+                            return;
+                        }
+                        rows += 1;
+                        if rows <= row_limit {
+                            cells.extend_from_slice(tuple);
+                        }
+                    });
+                    groups.push(crate::joint_domains::ParameterGroup {
+                        columns: part.columns,
+                        cells,
+                        rows,
+                    });
+                }
+                // Even if one factor exceeded the budget, an empty factor makes
+                // the whole product empty. Preserve that rejection and charge
+                // the same logical Cartesian size as the original constructor.
+                let rows = if groups.iter().any(|g| g.rows == 0) {
+                    Some(0)
+                } else {
+                    groups.iter().try_fold(1usize, |n, g| n.checked_mul(g.rows))
+                };
+                if let Some(rows) = rows.filter(|&n| n <= row_limit) {
+                    remaining_cells -= rows * arity;
+                    domains.insert_product(schema.name.clone(), arity, groups, rows);
+                }
                 continue;
             }
             let mut tuples = Vec::new();
@@ -1385,6 +1463,105 @@ fn collect_join_atoms<'a>(f: &'a Formula, out: &mut Vec<&'a Atom>) {
         }
         _ => {}
     }
+}
+
+struct ParameterComponent {
+    columns: Vec<usize>,
+    params: Vec<Variable>,
+    precondition: Rc<Formula>,
+}
+
+/// Partition a simple conjunction by parameter co-occurrence. Every literal
+/// (including negative literals and equalities) stays wholly within one part.
+/// The conjunction's reachable relation is therefore the exact product of the
+/// parts' relations. Unsupported formulas retain the original full constructor.
+fn parameter_components(schema: &ActionSchema) -> Option<Vec<ParameterComponent>> {
+    let arity = schema.parameters.len();
+    if !(2..=8).contains(&arity) {
+        return None;
+    }
+    fn conjuncts(f: &Rc<Formula>, out: &mut Vec<Rc<Formula>>) -> Option<()> {
+        match f.as_ref() {
+            Formula::Conjunction(cs) => {
+                for c in cs {
+                    conjuncts(c, out)?;
+                }
+            }
+            Formula::True
+            | Formula::False
+            | Formula::Atom(_)
+            | Formula::Negation(_)
+            | Formula::Equality { .. }
+            | Formula::Inequality { .. } => out.push(f.clone()),
+            _ => return None,
+        }
+        Some(())
+    }
+    fn root(parent: &[usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            i = parent[i];
+        }
+        i
+    }
+    let mut clauses = Vec::new();
+    conjuncts(&schema.precondition, &mut clauses)?;
+    let mut parent: Vec<_> = (0..arity).collect();
+    let mut positions = Vec::new();
+    for clause in &clauses {
+        let terms: Vec<_> = match clause.as_ref() {
+            Formula::Atom(a) | Formula::Negation(a) => a.terms.clone(),
+            Formula::Equality { left, right, .. } | Formula::Inequality { left, right, .. } => {
+                vec![*left, *right]
+            }
+            _ => Vec::new(),
+        };
+        let mut columns = Vec::new();
+        for term in terms {
+            if let Term::Variable(v) = term {
+                columns.push(schema.parameters.iter().position(|&p| p == v)?);
+            }
+        }
+        if let Some(&first) = columns.first() {
+            for &other in &columns[1..] {
+                let a = root(&parent, first);
+                let b = root(&parent, other);
+                parent[b] = a;
+            }
+        }
+        positions.push(columns);
+    }
+    let mut roots = Vec::new();
+    let mut components: Vec<ParameterComponent> = Vec::new();
+    let mut group_of = vec![0; arity];
+    for (i, &var) in schema.parameters.iter().enumerate() {
+        let r = root(&parent, i);
+        let group = roots.iter().position(|&p| p == r).unwrap_or_else(|| {
+            roots.push(r);
+            components.push(ParameterComponent {
+                columns: Vec::new(),
+                params: Vec::new(),
+                precondition: Rc::new(Formula::True),
+            });
+            roots.len() - 1
+        });
+        group_of[i] = group;
+        components[group].columns.push(i);
+        components[group].params.push(var);
+    }
+    if components.len() < 2 {
+        return None;
+    }
+    let mut grouped_clauses = vec![Vec::new(); components.len()];
+    for (clause, columns) in clauses.into_iter().zip(positions) {
+        // Parameter-free requirements constrain the entire action. Evaluate
+        // them in the first group; false makes that group (and product) empty.
+        let group = columns.first().map_or(0, |&i| group_of[i]);
+        grouped_clauses[group].push(clause);
+    }
+    for (part, clauses) in components.iter_mut().zip(grouped_clauses) {
+        part.precondition = Formula::conjoin_all(clauses);
+    }
+    Some(components)
 }
 
 /// Backtracking join enumerating every parameter tuple of a schema whose

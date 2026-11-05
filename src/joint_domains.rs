@@ -1,13 +1,14 @@
 //! Joint operator parameter domains (Younes & Simmons, AIPS 2002).
 //!
-//! Each shared table contains complete, relaxed-reachable argument tuples.
+//! Shared relations represent complete, relaxed-reachable argument tuples.
 //! Filter these by bindings and propagate column supports through equality
 //! classes to a fixpoint. Empty relations reject the plan; singleton projections
 //! become ordinary bindings. An expansion-local snapshot shares unchanged row
 //! domains across siblings. A worklist revisits only affected constraints.
 //! Queued plans retain bindings, but no row domains or propagation worklists.
 //! Exact Cartesian factors avoid scanning independent parameter combinations.
-//! Binding constraints that couple factors fall back to the complete table.
+//! Independent precondition groups can be constructed without their product;
+//! binding constraints that couple factors materialize the complete table.
 //!
 //! This is local consistency, not a complete CSP solver. Non-singleton domain
 //! reductions are reconstructed when a queued plan is expanded; heuristic
@@ -29,6 +30,8 @@ pub(crate) struct JointDomains {
     tables: FastMap<String, Table>,
     cache_budget: CacheBudget,
     factor_work: Cell<usize>,
+    #[cfg(test)]
+    reference: OnceCell<Box<JointDomains>>,
 }
 
 impl Default for JointDomains {
@@ -38,6 +41,8 @@ impl Default for JointDomains {
             cache_budget: CacheBudget::default(),
             // Bound the optional decomposition analysis across all schemas.
             factor_work: Cell::new(4 * 1024 * 1024),
+            #[cfg(test)]
+            reference: OnceCell::new(),
         }
     }
 }
@@ -58,14 +63,24 @@ impl Default for CacheBudget {
 
 struct Table {
     arity: usize,
-    cells: Box<[Object]>,
     rows: usize,
-    // Sorted (object, row) pairs: eight bytes per cell, with no per-object
-    // hash bucket or allocation. Equal-object postings form a contiguous run.
-    columns: Vec<Box<[(Object, u32)]>>,
+    data: OnceCell<TableData>,
     full: OnceCell<Rc<RowDomain>>,
     memo: RefCell<FastMap<AtomPatternKey, Rc<RowDomain>>>,
     factors: OnceCell<Factorization>,
+}
+
+struct TableData {
+    cells: Box<[Object]>,
+    // Sorted (object, row) pairs: eight bytes per cell, with no per-object
+    // hash bucket or allocation. Equal-object postings form a contiguous run.
+    columns: Vec<Box<[(Object, u32)]>>,
+}
+
+pub(crate) struct ParameterGroup {
+    pub columns: Vec<usize>,
+    pub cells: Vec<Object>,
+    pub rows: usize,
 }
 
 #[derive(Default)]
@@ -85,9 +100,70 @@ impl JointDomains {
     pub(crate) fn insert(&mut self, name: String, arity: usize, cells: Vec<Object>, rows: usize) {
         self.tables.insert(name, Table::new(arity, cells, rows));
     }
+
+    /// The caller proves that the precondition separates across these groups.
+    /// Charge the full Cartesian size to the original storage budget, but only
+    /// materialize that product if binding constraints later connect groups.
+    pub(crate) fn insert_product(
+        &mut self,
+        name: String,
+        arity: usize,
+        groups: Vec<ParameterGroup>,
+        rows: usize,
+    ) {
+        if rows == 0 {
+            self.insert(name, arity, Vec::new(), 0);
+            return;
+        }
+        let mut parts = Vec::new();
+        for group in groups {
+            let mut table = Table::new(group.columns.len(), group.cells, group.rows);
+            // A syntactic group may itself contain independent projections in
+            // this task's reachable relation. Analyze only that smaller table.
+            if !table.factors(&self.factor_work).parts.is_empty() {
+                for part in table.factors.take().unwrap().parts {
+                    parts.push(Factor {
+                        columns: part.columns.iter().map(|&i| group.columns[i]).collect(),
+                        table: part.table,
+                    });
+                }
+            } else {
+                parts.push(Factor {
+                    columns: group.columns,
+                    table,
+                });
+            }
+        }
+        let mut mapping = vec![0; arity];
+        for (i, part) in parts.iter().enumerate() {
+            for &column in &part.columns {
+                mapping[column] = i;
+            }
+        }
+        let mut table = Table {
+            arity,
+            rows,
+            data: OnceCell::new(),
+            full: OnceCell::new(),
+            memo: RefCell::new(FastMap::default()),
+            factors: OnceCell::from(Factorization {
+                parts,
+                groups: mapping,
+            }),
+        };
+        // A few KiB of tuple storage is cheaper than extra constraints on each
+        // refinement. Keep the original fast path available for small tables.
+        if rows * arity <= 1024 {
+            table.data();
+        }
+        if rows < 64 {
+            table.factors = OnceCell::from(Factorization::default());
+        }
+        self.tables.insert(name, table);
+    }
 }
 
-impl Table {
+impl TableData {
     fn new(arity: usize, cells: Vec<Object>, rows: usize) -> Self {
         assert_eq!(cells.len(), arity * rows);
         let columns = (0..arity)
@@ -105,14 +181,44 @@ impl Table {
             })
             .collect();
         Self {
-            arity,
             cells: cells.into(),
-            rows,
             columns,
+        }
+    }
+}
+
+impl Table {
+    fn new(arity: usize, cells: Vec<Object>, rows: usize) -> Self {
+        Self {
+            arity,
+            rows,
+            data: OnceCell::from(TableData::new(arity, cells, rows)),
             full: OnceCell::new(),
             memo: RefCell::new(FastMap::default()),
             factors: OnceCell::new(),
         }
+    }
+
+    fn data(&self) -> &TableData {
+        self.data.get_or_init(|| {
+            let parts = &self
+                .factors
+                .get()
+                .expect("deferred table needs factors")
+                .parts;
+            let mut cells = vec![Object(0); self.arity * self.rows];
+            for (row, tuple) in cells.chunks_exact_mut(self.arity).enumerate() {
+                let mut remainder = row;
+                for part in parts.iter().rev() {
+                    let id = remainder % part.table.rows;
+                    remainder /= part.table.rows;
+                    for (&column, &object) in part.columns.iter().zip(part.table.tuple(id as u32)) {
+                        tuple[column] = object;
+                    }
+                }
+            }
+            TableData::new(self.arity, cells, self.rows)
+        })
     }
 
     fn factors(&self, budget: &Cell<usize>) -> &Factorization {
@@ -121,12 +227,13 @@ impl Table {
             // exhausted analysis budgets retain the original complete table.
             if !(2..=8).contains(&self.arity)
                 || !(64..=262_144).contains(&self.rows)
-                || self.cells.len() > budget.get()
+                || self.arity * self.rows > budget.get()
             {
                 return Factorization::default();
             }
-            budget.set(budget.get() - self.cells.len());
+            budget.set(budget.get() - self.arity * self.rows);
             let rows: FastSet<_> = self
+                .data()
                 .cells
                 .chunks_exact(self.arity)
                 .map(|tuple| {
@@ -174,13 +281,13 @@ impl Table {
 
     fn tuple(&self, row: u32) -> &[Object] {
         let start = row as usize * self.arity;
-        &self.cells[start..start + self.arity]
+        &self.data().cells[start..start + self.arity]
     }
 
     fn candidates(&self, bound: impl Iterator<Item = (usize, Object)>) -> Option<&[(Object, u32)]> {
         let mut best: Option<&[(Object, u32)]> = None;
         for (column, object) in bound {
-            let postings = &self.columns[column];
+            let postings = &self.data().columns[column];
             let start = postings.partition_point(|(value, _)| *value < object);
             let end = postings.partition_point(|(value, _)| *value <= object);
             let rows = &postings[start..end];
@@ -501,7 +608,9 @@ fn run(
                 }
             }
             let factored = !factors.parts.is_empty()
-                && (inherited_factored || active_groups.count_ones() > 1)
+                && (inherited_factored
+                    || active_groups.count_ones() > 1
+                    || table.data.get().is_none())
                 && if dirty {
                     !bindings
                         .resolve_pattern(&types, &terms, step.id)
@@ -756,7 +865,17 @@ mod reference {
     /// Returns the strengthened bindings, or None if no allowed tuple remains.
     /// Register this plan's step types before calling, just as for ranking it.
     pub(super) fn propagate_reference(ctx: &SearchContext, plan: &Plan) -> Option<Rc<Bindings>> {
-        let tables = ctx.joint_domains();
+        // Independent constructor as well as independent propagation. Do not
+        // materialize the candidate's lazy products while checking its result.
+        let candidate = ctx.joint_domains();
+        let tables = candidate.reference.get_or_init(|| {
+            Box::new(ctx.planning_graph().joint_parameter_domains_reference(
+                &ctx.domain.actions,
+                &ctx.domain.predicates,
+                |ty| ctx.compatible_objects(ty),
+                2 * 1024 * 1024,
+            ))
+        });
         let types = ctx.type_ctx();
         let mut bindings = plan.bindings.clone();
         loop {
@@ -1022,6 +1141,98 @@ mod tests {
     }
 
     #[test]
+    fn direct_products_match_full_enumeration_and_storage_decisions() {
+        let names: Vec<_> = (0..10).map(|i| format!("o{i}")).collect();
+        let facts = names
+            .iter()
+            .map(|s| format!("(edge {s} {s}) (pick {s})"))
+            .collect::<String>();
+        for (parameters, precondition) in [
+            ("?a ?b ?c ?d - item", "(and (edge ?a ?c) (edge ?b ?d))"),
+            (
+                "?a ?b ?c ?d - item",
+                "(and (edge ?a ?c) (not (blocked ?b)) (not (= ?b ?d)))",
+            ),
+            ("?a ?b ?c ?d - item", "(and (edge ?a ?c) (= ?b ?d))"),
+            (
+                "?a ?b ?c ?d - item",
+                "(and (edge ?a ?c) (edge ?b ?d) (flag))",
+            ),
+            (
+                "?a ?b ?c ?d - item",
+                "(and (edge ?a ?c) (edge ?b ?d) (not (flag)))",
+            ),
+            ("?a ?b ?c ?d - item", "(and)"),
+            ("?a ?b ?c ?d - item", "(and (= ?a anchor) (edge ?b ?d))"),
+            // The first relation exceeds tiny budgets before the empty typed
+            // group is found. The product must still be retained as empty.
+            (
+                "?a ?c - item ?b ?d - empty",
+                "(and (edge ?a ?c) (edge ?b ?d))",
+            ),
+            // These keep the original constructor, including quantifier scope.
+            ("?a ?b ?c ?d - item", "(or (edge ?a ?b) (edge ?c ?d))"),
+            (
+                "?a ?b ?c ?d - item",
+                "(and (edge ?a ?c) (exists (?x - item) (edge ?b ?x)))",
+            ),
+            (
+                "?a ?b ?c ?d - item",
+                "(and (edge ?a ?c) (forall (?x - empty) (edge ?b ?x)))",
+            ),
+        ] {
+            let ParsedUnit::Domain(parsed) = read_pddl(&format!(
+                "(define (domain products) (:requirements :adl :typing) (:types item empty)
+                 (:constants anchor - item)
+                 (:predicates (edge ?x ?y - item) (pick ?x - item) (blocked ?x - item) (flag) (done))
+                 (:action product :parameters ({parameters}) :precondition {precondition} :effect (done))
+                 (:action choice :parameters (?x - item) :precondition (pick ?x) :effect (done)))"
+            )).unwrap() else { panic!() };
+            let domain = lower_domain(&parsed).unwrap();
+            let ParsedUnit::Problem(parsed) = read_pddl(&format!(
+                "(define (problem test) (:domain products) (:objects {} - item)
+                 (:init {facts} (blocked o0) (flag)) (:goal (done)))",
+                names.join(" ")
+            ))
+            .unwrap() else {
+                panic!()
+            };
+            let problem = lower_problem(&parsed, &domain).unwrap();
+            let params = Parameters::default();
+            let ctx = SearchContext::new(&domain, &problem, &params);
+            for budget in [0, 1, 9, 399, 400, 4_000, 100_000] {
+                let candidate = ctx.planning_graph().joint_parameter_domains_with_limit(
+                    &domain.actions,
+                    &domain.predicates,
+                    |ty| ctx.compatible_objects(ty),
+                    budget,
+                );
+                let reference = ctx.planning_graph().joint_parameter_domains_reference(
+                    &domain.actions,
+                    &domain.predicates,
+                    |ty| ctx.compatible_objects(ty),
+                    budget,
+                );
+                assert_eq!(
+                    candidate.tables.len(),
+                    reference.tables.len(),
+                    "{precondition}, budget {budget}"
+                );
+                for (name, a) in &candidate.tables {
+                    let b = &reference.tables[name];
+                    assert_eq!(a.rows, b.rows, "{precondition}, budget {budget}");
+                    let tuples = |t: &Table| -> FastSet<Vec<Object>> {
+                        (0..t.rows as u32)
+                            .map(|row| t.tuple(row).to_vec())
+                            .collect()
+                    };
+                    assert_eq!(tuples(a), tuples(b), "{precondition}, budget {budget}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn grouped_propagation_matches_full_tables_through_binding_changes() {
         let ParsedUnit::Domain(parsed) = read_pddl(
             "(define (domain groups) (:requirements :strips :equality)
@@ -1034,7 +1245,7 @@ mod tests {
             panic!()
         };
         let domain = lower_domain(&parsed).unwrap();
-        let names: Vec<_> = (0..10).map(|i| format!("o{i}")).collect();
+        let names: Vec<_> = (0..20).map(|i| format!("o{i}")).collect();
         let facts = names
             .iter()
             .map(|s| format!("(pair {s} {s})"))
@@ -1051,7 +1262,31 @@ mod tests {
         let params = Parameters::default();
         let ctx = SearchContext::new(&domain, &problem, &params);
         let parent = steps(&ctx, &[0, 0, 1]);
+        assert!(ctx.joint_domains().tables["product"].data.get().is_none());
         let cache = prepare(&ctx, &parent).unwrap();
+        assert!(ctx.joint_domains().tables["product"].data.get().is_none());
+        // One unbound group, or a fully bound step, must not force construction
+        // just to use the old single-constraint fast path.
+        let one_group = bind(
+            &ctx,
+            parent.clone(),
+            &[
+                eq(0, 1, Term::Object(object(&ctx, "o0")), 0),
+                eq(2, 1, Term::Object(object(&ctx, "o0")), 0),
+            ],
+        );
+        assert!(propagate_incremental(&ctx, &one_group, Some(&cache)).is_some());
+        assert!(ctx.joint_domains().tables["product"].data.get().is_none());
+        let ground = bind(
+            &ctx,
+            one_group,
+            &[
+                eq(1, 1, Term::Object(object(&ctx, "o1")), 0),
+                eq(3, 1, Term::Object(object(&ctx, "o1")), 0),
+            ],
+        );
+        assert!(propagate_incremental(&ctx, &ground, Some(&cache)).is_some());
+        assert!(ctx.joint_domains().tables["product"].data.get().is_none());
         assert!(cache.domains.contains_key(&(1, 1)));
         assert!(!cache.domains.contains_key(&(1, 0)));
         // Cross-factor equality and inequality must both use the full relation.
@@ -1059,6 +1294,7 @@ mod tests {
             let binding = Binding::new(Variable(0), 1, Term::Variable(Variable(1)), 1, equal);
             let child = bind(&ctx, parent.clone(), &[binding]);
             assert!(propagate_incremental(&ctx, &child, Some(&cache)).is_some());
+            assert!(ctx.joint_domains().tables["product"].data.get().is_some());
             let (_, snapshot) = run(&ctx, &child, Some(&cache), true).unwrap();
             let snapshot = snapshot.unwrap();
             assert!(snapshot.domains.contains_key(&(1, 0)));
