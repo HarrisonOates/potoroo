@@ -14,8 +14,8 @@ use crate::effect::Effect;
 use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Atom, Formula, Literal};
 use crate::instantiate::{
-    instantiate_atom, instantiate_effect, instantiate_formula, instantiate_formula_expanded,
-    precondition_consistent, quantified_variables,
+    instantiate_effect, instantiate_formula, instantiate_formula_expanded, precondition_consistent,
+    quantified_variables, resolve,
 };
 use crate::params::ActionCost;
 use crate::plan::{Plan, StepAction, INIT_ID};
@@ -504,6 +504,14 @@ impl PlanningGraph {
             .map(|(ty, objs)| (*ty, objs.iter().copied().collect()))
             .collect();
 
+        // Normalise ordinary formulas once, instead of allocating a ground
+        // formula for every tuple on every fixpoint iteration.
+        let formulas: Vec<_> = schemas.iter().map(SchemaFormulas::new).collect();
+        let mut scratch = Atom {
+            predicate: Predicate(0),
+            terms: Vec::new(),
+        };
+
         // Fixpoint.
         loop {
             let mut changed = false;
@@ -511,7 +519,7 @@ impl PlanningGraph {
             let mut new_negation_values: FastMap<Atom, HeuristicValue> = FastMap::default();
             let atoms_by_pred = atoms_by_predicate(&pg.atom_values, predicates.len());
 
-            for schema in schemas {
+            for (schema, formulas) in schemas.iter().zip(&formulas) {
                 let action_cost = if task_costs {
                     cost_model.resolve(schema.cost)
                 } else {
@@ -523,6 +531,8 @@ impl PlanningGraph {
                         schema,
                         action_cost,
                         subst,
+                        formulas,
+                        &mut scratch,
                         &pg,
                         predicates,
                         &atoms_by_pred,
@@ -1838,6 +1848,135 @@ fn atoms_by_predicate(
         .collect()
 }
 
+/// A schema formula evaluated repeatedly under complete tuple substitutions.
+/// Quantifiers retain the existing expansion, simplification and budget rules.
+struct TupleFormula {
+    formula: Rc<Formula>,
+    quantified: bool,
+}
+
+impl TupleFormula {
+    fn new(formula: &Rc<Formula>) -> Self {
+        // An empty binder also needs expansion. Check the formula's structure
+        // rather than relying only on the list of quantified variables.
+        fn has_quantifier(f: &Formula) -> bool {
+            match f {
+                Formula::Exists { .. } | Formula::Forall { .. } => true,
+                Formula::Conjunction(fs) | Formula::Disjunction(fs) => {
+                    fs.iter().any(|f| has_quantifier(f))
+                }
+                _ => false,
+            }
+        }
+        let quantified = has_quantifier(formula);
+        Self {
+            formula: if quantified {
+                formula.clone()
+            } else {
+                // Substitution cannot simplify an atom or (in)equality. The
+                // constructor's flattening and True/False simplification are
+                // therefore independent of the tuple and can happen once.
+                instantiate_formula(formula, &[])
+            },
+            quantified,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn value(
+        &self,
+        subst: &[Option<Object>],
+        scratch: &mut Atom,
+        pg: &PlanningGraph,
+        predicates: &PredicateTable,
+        var_types: &[Type],
+        type_domains: &FastMap<Type, Vec<Object>>,
+    ) -> HeuristicValue {
+        if self.quantified {
+            let ground = instantiate_formula_expanded(
+                &self.formula,
+                &mut subst.to_vec(),
+                var_types,
+                type_domains,
+            );
+            return pg.ground_formula_value(predicates, &ground).0;
+        }
+        fn evaluate(
+            f: &Formula,
+            subst: &[Option<Object>],
+            scratch: &mut Atom,
+            pg: &PlanningGraph,
+        ) -> HeuristicValue {
+            match f {
+                Formula::Atom(a) => {
+                    substitute_atom(a, subst, scratch);
+                    pg.heuristic_value_atom(scratch, 0, None)
+                }
+                Formula::Negation(a) => {
+                    substitute_atom(a, subst, scratch);
+                    pg.heuristic_value_negation(scratch, 0, None)
+                }
+                Formula::Conjunction(fs) => {
+                    let mut h = HeuristicValue::ZERO;
+                    for f in fs {
+                        if h.infinite() {
+                            break;
+                        }
+                        h.add_assign(&evaluate(f, subst, scratch, pg));
+                    }
+                    h
+                }
+                Formula::Disjunction(fs) => {
+                    let mut h = HeuristicValue::INFINITE;
+                    for f in fs {
+                        if h.zero() {
+                            break;
+                        }
+                        h = hv_min(h, evaluate(f, subst, scratch, pg));
+                    }
+                    h
+                }
+                // Match ground_formula_value: tuple consistency is checked
+                // separately, and constants/(in)equalities have zero value.
+                Formula::True
+                | Formula::False
+                | Formula::Equality { .. }
+                | Formula::Inequality { .. } => HeuristicValue::ZERO,
+                Formula::Exists { .. } | Formula::Forall { .. } => unreachable!(),
+            }
+        }
+        evaluate(&self.formula, subst, scratch, pg)
+    }
+}
+
+struct SchemaFormulas {
+    precondition: TupleFormula,
+    conditions: Vec<TupleFormula>,
+}
+
+impl SchemaFormulas {
+    fn new(schema: &ActionSchema) -> Self {
+        Self {
+            precondition: TupleFormula::new(&schema.precondition),
+            conditions: schema
+                .effects
+                .iter()
+                .map(|e| TupleFormula::new(&e.condition))
+                .collect(),
+        }
+    }
+}
+
+/// Reuse the terms buffer for transient graph lookups. Only an effect that
+/// improves a value needs an owned copy for insertion into the next layer.
+fn substitute_atom(atom: &Atom, subst: &[Option<Object>], scratch: &mut Atom) {
+    scratch.predicate = atom.predicate;
+    scratch.terms.clear();
+    scratch
+        .terms
+        .extend(atom.terms.iter().map(|&t| resolve(t, subst)));
+}
+
 /// Per-tuple processing of `apply_schema_tuples`: updates `new_atom_values` /
 /// `new_negation_values` with the cost of each reachable effect of a
 /// statically-consistent tuple whose precondition has a finite value in `pg`.
@@ -1846,6 +1985,8 @@ fn apply_schema_tuple(
     schema: &ActionSchema,
     action_cost: usize,
     subst: &[Option<Object>],
+    formulas: &SchemaFormulas,
+    scratch: &mut Atom,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
     atoms_by_pred: &[Option<JoinRelation<'_>>],
@@ -1859,24 +2000,26 @@ fn apply_schema_tuple(
         return;
     }
 
-    let mut expanded = subst.to_vec();
-    let ground_pre = instantiate_formula_expanded(
-        &schema.precondition,
-        &mut expanded,
+    let pre_value = formulas.precondition.value(
+        subst,
+        scratch,
+        pg,
+        predicates,
         &schema.var_types,
         type_domains,
     );
-    let (pre_value, _) = pg.ground_formula_value(predicates, &ground_pre);
     if pre_value.infinite() {
         return;
     }
 
-    for effect in &schema.effects {
+    for (effect, condition) in schema.effects.iter().zip(&formulas.conditions) {
         if effect.parameters.is_empty() {
             apply_effect_tuple(
                 effect,
                 action_cost,
                 subst,
+                condition,
+                scratch,
                 &pre_value,
                 pg,
                 predicates,
@@ -1904,6 +2047,8 @@ fn apply_schema_tuple(
                 effect,
                 action_cost,
                 effect_subst,
+                condition,
+                scratch,
                 &pre_value,
                 pg,
                 predicates,
@@ -1925,6 +2070,8 @@ fn apply_effect_tuple(
     effect: &Effect,
     action_cost: usize,
     subst: &[Option<Object>],
+    condition: &TupleFormula,
+    scratch: &mut Atom,
     pre_value: &HeuristicValue,
     pg: &PlanningGraph,
     predicates: &PredicateTable,
@@ -1934,10 +2081,7 @@ fn apply_effect_tuple(
     new_negation_values: &mut FastMap<Atom, HeuristicValue>,
     changed: &mut bool,
 ) {
-    let mut expanded = subst.to_vec();
-    let ground_cond =
-        instantiate_formula_expanded(&effect.condition, &mut expanded, var_types, type_domains);
-    let (mut cond_value, _) = pg.ground_formula_value(predicates, &ground_cond);
+    let mut cond_value = condition.value(subst, scratch, pg, predicates, var_types, type_domains);
     if cond_value.infinite() {
         return;
     }
@@ -1945,59 +2089,47 @@ fn apply_effect_tuple(
     cond_value.increase_makespan(THRESHOLD);
     cond_value.increase_cost(action_cost as f32);
 
-    let lit = match &effect.literal {
-        Literal::Atom(a) => {
-            let ga = instantiate_atom(a, subst);
-            // A quantified variable the join left unbound cannot name a
-            // ground atom; nothing to record.
-            if ga.terms.iter().any(|t| t.variable()) {
-                return;
-            }
-            Literal::Atom(ga)
-        }
-        Literal::Negation(a) => {
-            let ga = instantiate_atom(a, subst);
-            if ga.terms.iter().any(|t| t.variable()) {
-                return;
-            }
-            Literal::Negation(ga)
-        }
-    };
+    substitute_atom(effect.literal.atom(), subst, scratch);
+    // A quantified variable the join left unbound cannot name a ground atom.
+    if !scratch.ground() {
+        return;
+    }
+    let atom = &*scratch;
 
-    match lit {
-        Literal::Atom(atom) => {
+    match &effect.literal {
+        Literal::Atom(_) => {
             let existing = new_atom_values
-                .get(&atom)
-                .or_else(|| pg.atom_values.get(&atom))
+                .get(atom)
+                .or_else(|| pg.atom_values.get(atom))
                 .copied();
             let mut new_value = cond_value;
             new_value.increment_work();
             match existing {
                 None => {
-                    new_atom_values.insert(atom, new_value);
+                    new_atom_values.insert(atom.clone(), new_value);
                     *changed = true;
                 }
                 Some(old_value) => {
                     let merged = hv_min(new_value, old_value);
                     if merged != old_value {
-                        new_atom_values.insert(atom, merged);
+                        new_atom_values.insert(atom.clone(), merged);
                         *changed = true;
                     }
                 }
             }
         }
-        Literal::Negation(atom) => {
+        Literal::Negation(_) => {
             let existing = new_negation_values
-                .get(&atom)
-                .or_else(|| pg.negation_values.get(&atom))
+                .get(atom)
+                .or_else(|| pg.negation_values.get(atom))
                 .copied();
             match existing {
                 None => {
                     // A negation is free unless the atom starts true.
-                    if pg.init_atoms.contains(&atom) {
+                    if pg.init_atoms.contains(atom) {
                         let mut new_value = cond_value;
                         new_value.increment_work();
-                        new_negation_values.insert(atom, new_value);
+                        new_negation_values.insert(atom.clone(), new_value);
                         *changed = true;
                     }
                 }
@@ -2006,7 +2138,7 @@ fn apply_effect_tuple(
                     new_value.increment_work();
                     let merged = hv_min(new_value, old_value);
                     if merged != old_value {
-                        new_negation_values.insert(atom, merged);
+                        new_negation_values.insert(atom.clone(), merged);
                         *changed = true;
                     }
                 }
@@ -2094,6 +2226,155 @@ mod tests {
         };
         let problem = lower_problem(&parsed, &domain).unwrap();
         (domain, problem)
+    }
+
+    #[test]
+    fn tuple_formula_values_match_ground_expansion_without_transient_allocations() {
+        let (domain, problem) = shared_achiever_task();
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let mut pg = PlanningGraph::build_from_schemas(
+            &domain.predicates,
+            &ctx.init_action,
+            &[],
+            |ty| ctx.compatible_objects(ty),
+            params.action_cost,
+            false,
+        );
+        pg.atom_values.clear();
+        pg.init_atoms.clear();
+        // Include zero-cost values with different work, infinities, and costs
+        // sensitive to floating-point addition order after flattening.
+        let values = [
+            HeuristicValue::ZERO,
+            HeuristicValue::new(0.0, 9, 2.0),
+            HeuristicValue::new(1.0, 3, 0.5),
+            HeuristicValue::new(16_777_216.0, 1, 1.0),
+        ];
+        for x in 0..4 {
+            for y in 0..4 {
+                let atom = Atom {
+                    predicate: Predicate(0),
+                    terms: vec![Term::Object(Object(x)), Term::Object(Object(y))],
+                };
+                pg.atom_values.insert(atom.clone(), values[x as usize]);
+                if y % 2 == 0 {
+                    pg.init_atoms.insert(atom.clone());
+                    if x % 2 == 0 {
+                        pg.negation_values.insert(atom, values[y as usize]);
+                    }
+                }
+            }
+        }
+        let x = Term::Variable(Variable(0));
+        let y = Term::Variable(Variable(1));
+        let atom = |a, b| Atom {
+            predicate: Predicate(0),
+            terms: vec![a, b],
+        };
+        let leaves = vec![
+            Rc::new(Formula::True),
+            Rc::new(Formula::False),
+            Rc::new(Formula::Atom(atom(x, y))),
+            Rc::new(Formula::Negation(atom(x, y))),
+            Rc::new(Formula::Atom(atom(x, x))),
+            Rc::new(Formula::Atom(atom(Term::Object(Object(3)), y))),
+            Rc::new(Formula::Atom(atom(Term::Object(Object(4)), y))),
+            Formula::equality(x, y),
+            Formula::inequality(x, y),
+        ];
+        let mut formulas = leaves.clone();
+        for a in &leaves {
+            for b in &leaves {
+                // Deliberately bypass constructors to check normalization of
+                // nested conjunctions/disjunctions and embedded constants.
+                formulas.push(Rc::new(Formula::Conjunction(vec![
+                    a.clone(),
+                    Rc::new(Formula::Conjunction(vec![b.clone(), leaves[2].clone()])),
+                ])));
+                formulas.push(Rc::new(Formula::Disjunction(vec![
+                    a.clone(),
+                    Rc::new(Formula::Disjunction(vec![b.clone(), leaves[3].clone()])),
+                ])));
+                formulas.push(Rc::new(Formula::Conjunction(vec![
+                    a.clone(),
+                    Rc::new(Formula::Disjunction(vec![b.clone(), leaves[2].clone()])),
+                ])));
+            }
+        }
+        let var_types = vec![Type(0); 3];
+        let mut domains = FastMap::default();
+        domains.insert(Type(0), (0..4).map(Object).collect());
+        let mut scratch = atom(x, y);
+        for f in &formulas {
+            let prepared = TupleFormula::new(f);
+            assert!(!prepared.quantified);
+            for x in [None, Some(Object(0)), Some(Object(2)), Some(Object(3))] {
+                for y in [Some(Object(0)), Some(Object(1)), Some(Object(4))] {
+                    let subst = vec![x, y, None];
+                    let ground =
+                        instantiate_formula_expanded(f, &mut subst.clone(), &var_types, &domains);
+                    let expected = pg.ground_formula_value(&domain.predicates, &ground).0;
+                    let (actual, allocations) = crate::alloc_test::allocations_during(|| {
+                        prepared.value(
+                            &subst,
+                            &mut scratch,
+                            &pg,
+                            &domain.predicates,
+                            &var_types,
+                            &domains,
+                        )
+                    });
+                    assert_eq!(actual, expected, "{f:?} with {subst:?}");
+                    assert_eq!(allocations, 0, "{f:?}");
+                }
+            }
+        }
+
+        // Quantified formulas must keep exactly the old expansion behavior,
+        // including empty/unknown domains, empty binders and the budget cap.
+        for size in [None, Some(0), Some(3), Some(4097)] {
+            domains.clear();
+            if let Some(size) = size {
+                domains.insert(Type(0), (0..size).map(Object).collect());
+            }
+            for params in [vec![], vec![Variable(1)], vec![Variable(1), Variable(2)]] {
+                for existential in [false, true] {
+                    let body = Rc::new(Formula::Disjunction(vec![
+                        leaves[2].clone(),
+                        leaves[3].clone(),
+                    ]));
+                    let quantified = Rc::new(if existential {
+                        Formula::Exists {
+                            params: params.clone(),
+                            body,
+                        }
+                    } else {
+                        Formula::Forall {
+                            params: params.clone(),
+                            body,
+                        }
+                    });
+                    let f = Rc::new(Formula::Conjunction(vec![leaves[2].clone(), quantified]));
+                    let prepared = TupleFormula::new(&f);
+                    assert!(prepared.quantified);
+                    let subst = vec![Some(Object(0)), Some(Object(1)), None];
+                    let ground =
+                        instantiate_formula_expanded(&f, &mut subst.clone(), &var_types, &domains);
+                    assert_eq!(
+                        prepared.value(
+                            &subst,
+                            &mut scratch,
+                            &pg,
+                            &domain.predicates,
+                            &var_types,
+                            &domains
+                        ),
+                        pg.ground_formula_value(&domain.predicates, &ground).0,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
