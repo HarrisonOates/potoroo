@@ -1499,12 +1499,14 @@ impl<'a> Planner<'a> {
                             stats.supporter_forced == forced_before,
                         );
                         if is_dual {
+                            reserve_queue_entry(&mut secondary_queues[order_index]);
                             secondary_queues[order_index].push(QueuedPlan {
                                 plan: child.clone(),
                                 rank: Rank::fifo(child.id()),
                                 is_lazy: lazy_push,
                             });
                         } else if is_alt {
+                            reserve_queue_entry(&mut secondary_queues[order_index]);
                             secondary_queues[order_index].push(QueuedPlan {
                                 plan: child.clone(),
                                 rank: alt_gbfs_rank
@@ -1513,6 +1515,7 @@ impl<'a> Planner<'a> {
                                 is_lazy: false,
                             });
                         }
+                        reserve_queue_entry(&mut queues[order_index]);
                         queues[order_index].push(QueuedPlan {
                             plan: child,
                             rank,
@@ -2857,6 +2860,7 @@ impl<'a> Planner<'a> {
                 self.rank_both(&plan, params, stats).0
             };
             if rank.primary(plan.id).is_finite() {
+                reserve_queue_entry(primary);
                 primary.push(QueuedPlan {
                     plan: P::ready(plan),
                     rank,
@@ -3471,6 +3475,15 @@ impl QueueStorage for InlineQueuedState {
     }
 }
 
+/// Avoid doubling a large heap's allocation just to admit its next entry.
+/// Small queues retain Vec's amortized growth; large queues grow by 12.5%.
+/// Reserving capacity neither discards alternatives nor changes their order.
+fn reserve_queue_entry<T: Ord>(queue: &mut BinaryHeap<T>) {
+    if queue.len() == queue.capacity() && queue.capacity() >= (1 << 20) {
+        queue.reserve_exact(queue.capacity() / 8);
+    }
+}
+
 struct QueuedPlan<P: QueueStorage = QueuedState> {
     plan: P,
     rank: Rank,
@@ -3513,6 +3526,30 @@ mod tests {
     use super::*;
     use crate::fdr::{Effect, Operator, Variable};
     use crate::heuristics::{FlawSelectionOrder, Heuristic};
+
+    #[test]
+    fn large_queue_growth_preserves_every_entry_and_its_order() {
+        let threshold = 1 << 20;
+        let mut queue = BinaryHeap::from((0..threshold).collect::<Vec<_>>());
+        let old_capacity = queue.capacity();
+        assert_eq!(queue.len(), old_capacity);
+        reserve_queue_entry(&mut queue);
+        assert_eq!(queue.len(), threshold);
+        assert!(queue.capacity() >= old_capacity + old_capacity / 8);
+        assert!(queue.capacity() < 2 * old_capacity);
+        queue.push(threshold);
+        let capacity = queue.capacity();
+        reserve_queue_entry(&mut queue);
+        assert_eq!(queue.capacity(), capacity);
+        for expected in (0..=threshold).rev() {
+            assert_eq!(queue.pop(), Some(expected));
+        }
+        assert!(queue.is_empty());
+        let mut small = BinaryHeap::from(vec![1, 2, 3, 4]);
+        let capacity = small.capacity();
+        reserve_queue_entry(&mut small);
+        assert_eq!(small.capacity(), capacity);
+    }
 
     #[test]
     fn full_and_deferred_queues_preserve_search() {

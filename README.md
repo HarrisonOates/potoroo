@@ -97,6 +97,12 @@ Use `-H` for help (`-h` selects a heuristic) and `-V` for the version.
 `--max-queued` and `--mem-mb` discard search states and make search incomplete.
 RSS limits are sampled, so the process can exceed them between checks.
 
+Finite-domain search stores deferred new-step recipes directly in eager
+single-queue entries. Alternating queues share recipes so they can recognize
+already-expanded plans; lazy search retains materialized plan pointers.
+Large finite-domain queues grow their capacity in smaller increments. These
+storage changes preserve search order and retain all admitted alternatives.
+
 ### Search algorithms
 
 | `-s` | Behaviour |
