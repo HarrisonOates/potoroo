@@ -113,6 +113,34 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Strengthen a generated plan before ranking it. Existing threats remain
+    /// conservative: restricting bindings cannot introduce a new unifier.
+    pub(crate) fn with_bindings(self: Rc<Self>, bindings: Rc<Bindings>) -> Rc<Self> {
+        if Rc::ptr_eq(&self.bindings, &bindings) {
+            return self;
+        }
+        let mut plan = self;
+        if let Some(unique) = Rc::get_mut(&mut plan) {
+            unique.bindings = bindings;
+            return plan;
+        }
+        let updated = Self::new(
+            plan.steps.clone(),
+            plan.num_steps,
+            plan.cost,
+            plan.links.clone(),
+            plan.num_links,
+            plan.orderings.clone(),
+            bindings,
+            plan.unsafes.clone(),
+            plan.num_unsafes,
+            plan.open_conds.clone(),
+            plan.num_open_conds,
+        );
+        updated.id.set(plan.id.get());
+        updated
+    }
+
     pub fn num_steps(&self) -> usize {
         self.num_steps
     }

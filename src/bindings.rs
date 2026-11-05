@@ -16,6 +16,7 @@ use std::rc::Rc;
 use crate::chain::{self, Chain};
 use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Formula, Literal};
+use crate::object_set::ObjectSet;
 use crate::terms::{Object, Term, TermTable, Variable};
 use crate::types::{Type, Types};
 
@@ -666,6 +667,40 @@ impl Bindings {
         term
     }
 
+    /// A representative shared by all members of an equality class in this
+    /// snapshot. Used by transient joint-domain propagation across steps.
+    pub(crate) fn representative(&self, var: Variable, step_id: usize) -> StepVariable {
+        self.find_var_node(var, step_id)
+            .and_then(|(_, node)| node.head.cd_set.as_ref().map(|members| members.head))
+            .unwrap_or((var, step_id))
+    }
+
+    /// Classes touched since an ancestor snapshot, including both sides of
+    /// inequalities. None means the histories are unrelated, so a caller must
+    /// recompute rather than reuse restrictions from another branch.
+    pub(crate) fn changed_classes_since(
+        &self,
+        ancestor: &Bindings,
+    ) -> Option<FastSet<StepVariable>> {
+        let added = self.num_varsets.checked_sub(ancestor.num_varsets)?;
+        let mut tail = &self.varsets;
+        for _ in 0..added {
+            tail = &tail.as_ref()?.tail;
+        }
+        match (tail, &ancestor.varsets) {
+            (None, None) => {}
+            (Some(a), Some(b)) if Rc::ptr_eq(a, b) => {}
+            _ => return None,
+        }
+        let mut changed = FastSet::default();
+        for varset in chain::iter(&self.varsets).take(added) {
+            for &(var, step) in chain::iter(&varset.cd_set).chain(chain::iter(&varset.ncd_set)) {
+                changed.insert(self.representative(var, step));
+            }
+        }
+        Some(changed)
+    }
+
     /// Equality already entailed by the bindings, rather than equality that
     /// could be imposed by a future refinement. Variable scope is essential:
     /// the same schema variable in two occurrences need not denote one object.
@@ -1179,7 +1214,7 @@ impl Bindings {
 /* Resolved atom patterns: fast lifted-vs-ground matching. */
 
 /// One position of an [`AtomPattern`]: a term resolved through the bindings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PatTerm {
     /// Resolved to a constant object.
     Obj(Object),
@@ -1206,7 +1241,138 @@ pub struct AtomPattern {
     assignment: Vec<Option<Object>>,
 }
 
+/// Step-independent identity of all constraints used by an atom matcher.
+/// Equality classes are numbered by first occurrence in the argument list.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) struct AtomPatternKey {
+    terms: Vec<PatTerm>,
+    excluded: Vec<Vec<Object>>,
+    ncd_pairs: Vec<(u8, u8)>,
+}
+
+impl AtomPatternKey {
+    pub(crate) fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.terms.capacity() * std::mem::size_of::<PatTerm>()
+            + self.excluded.capacity() * std::mem::size_of::<Vec<Object>>()
+            + self
+                .excluded
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<Object>())
+                .sum::<usize>()
+            + self.ncd_pairs.capacity() * std::mem::size_of::<(u8, u8)>()
+    }
+}
+
+/// Checks left after resolving types and exclusions against a table's known
+/// column values. Unlike a general atom matcher, unrestricted positions cost
+/// nothing per row, and repeated variables need no scratch assignments.
+pub(crate) struct ObjectTablePattern {
+    bound: Vec<(usize, Object)>,
+    allowed: Vec<(usize, ObjectSet)>,
+    equal: Vec<(usize, usize)>,
+    unequal: Vec<(usize, usize)>,
+}
+
+impl ObjectTablePattern {
+    pub(crate) fn unrestricted(&self) -> bool {
+        self.bound.is_empty()
+            && self.allowed.is_empty()
+            && self.equal.is_empty()
+            && self.unequal.is_empty()
+    }
+
+    pub(crate) fn matches(&self, row: &[Object]) -> bool {
+        self.bound.iter().all(|&(i, object)| row[i] == object)
+            && self
+                .allowed
+                .iter()
+                .all(|(i, objects)| objects.contains(row[*i]))
+            && self.equal.iter().all(|&(a, b)| row[a] == row[b])
+            && self.unequal.iter().all(|&(a, b)| row[a] != row[b])
+    }
+}
+
 impl AtomPattern {
+    pub(crate) fn table_cache_key(&self) -> AtomPatternKey {
+        let mut excluded = self.excluded.clone();
+        for values in &mut excluded {
+            values.sort_unstable();
+            values.dedup();
+        }
+        AtomPatternKey {
+            terms: self.terms.clone(),
+            excluded,
+            ncd_pairs: self.ncd_pairs.clone(),
+        }
+    }
+
+    pub(crate) fn for_object_table(
+        &self,
+        ctx: &TypeContext,
+        columns: &[ObjectSet],
+        declared_types: impl Iterator<Item = Type>,
+    ) -> Option<ObjectTablePattern> {
+        let mut result = ObjectTablePattern {
+            bound: Vec::new(),
+            allowed: Vec::new(),
+            equal: Vec::new(),
+            unequal: Vec::new(),
+        };
+        let mut first = vec![None; self.assignment.len()];
+        for (i, ((term, values), declared)) in self
+            .terms
+            .iter()
+            .zip(columns)
+            .zip(declared_types)
+            .enumerate()
+        {
+            match term {
+                PatTerm::Obj(object) => {
+                    if !values.contains(*object) {
+                        return None;
+                    }
+                    if values.len() > 1 {
+                        result.bound.push((i, *object));
+                    }
+                }
+                PatTerm::Var { class, ty } => {
+                    let class = *class as usize;
+                    // Complete parameter tables already obey the schema's
+                    // declared types. Only a narrower equality class needs
+                    // per-object type checks.
+                    let type_ok = ctx.types.subtype(declared, *ty);
+                    if !type_ok || self.excluded[class].iter().any(|o| values.contains(*o)) {
+                        let allowed: ObjectSet = values
+                            .iter()
+                            .filter(|&object| {
+                                (type_ok || ctx.types.subtype(ctx.object_type(object), *ty))
+                                    && !self.excluded[class].contains(&object)
+                            })
+                            .collect();
+                        if allowed.is_empty() {
+                            return None;
+                        }
+                        if allowed.len() < values.len() {
+                            result.allowed.push((i, allowed));
+                        }
+                    }
+                    if let Some(previous) = first[class] {
+                        result.equal.push((previous, i));
+                    } else {
+                        first[class] = Some(i);
+                    }
+                }
+            }
+        }
+        result.unequal.extend(
+            self.ncd_pairs
+                .iter()
+                .map(|&(a, b)| (first[a as usize].unwrap(), first[b as usize].unwrap())),
+        );
+        Some(result)
+    }
+
     /// True iff every position is already fixed to an object. Allocation-free,
     /// so callers can test before paying for [`AtomPattern::object_terms`].
     #[inline]
@@ -1279,12 +1445,29 @@ impl AtomPattern {
     /// bindings it was resolved against.
     pub fn matches(&mut self, ctx: &TypeContext, ground_terms: &[Term]) -> bool {
         debug_assert_eq!(ground_terms.len(), self.terms.len());
+        self.matches_objects_iter(
+            ctx,
+            ground_terms.iter().map(|term| match term {
+                Term::Object(object) => Some(*object),
+                Term::Variable(_) => None,
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_objects(&mut self, ctx: &TypeContext, objects: &[Object]) -> bool {
+        debug_assert_eq!(objects.len(), self.terms.len());
+        self.matches_objects_iter(ctx, objects.iter().copied().map(Some))
+    }
+
+    fn matches_objects_iter(
+        &mut self,
+        ctx: &TypeContext,
+        objects: impl Iterator<Item = Option<Object>>,
+    ) -> bool {
         self.assignment.iter_mut().for_each(|a| *a = None);
-        for (pt, gt) in self.terms.iter().zip(ground_terms) {
-            let o = match gt {
-                Term::Object(o) => *o,
-                Term::Variable(_) => return false,
-            };
+        for (pt, object) in self.terms.iter().zip(objects) {
+            let Some(o) = object else { return false };
             match pt {
                 PatTerm::Obj(p) => {
                     if *p != o {

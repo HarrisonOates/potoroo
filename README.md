@@ -155,12 +155,24 @@ Pruning is off by default. Select rules with `-p cutset,edelete`, use `all` or
 | Rules | Where they apply |
 |---|---|
 | `cutset`, `edelete`, `recursion`, `minimality` | All representations. |
-| `params` | Literal representations. |
+| `params`, `joint` | Literal representations. |
 | `symbolic` | Lifted cutset checks. |
 | `supporters`, `h2`, `disjunctive` | Finite-domain search. |
 | `symmetry` | Ground literal and finite-domain search. |
 
 Rules have different costs and can change the returned plan.
+
+`params` uses independent parameter domains. `joint` instead filters complete
+relaxed-reachable argument tuples, propagates their supports through shared
+variables, and binds singleton domains. For example, use `-f ZLIFO -p joint`.
+Tuple tables are shared across the search. During expansion, sibling refinements
+reuse unaffected domains and propagate changes through a constraint worklist.
+Small value domains use bitsets, and a bounded shared cache reuses table filters
+across expansions (at most 512 entries, with a 4 MiB payload allowance).
+Queued plans retain only forced bindings; non-singleton domains are reconstructed
+when a plan is expanded, and the temporary cache is released after its children.
+Tables exceeding the storage budget are omitted in full, weakening pruning
+without excluding solutions. `joint` is experimental and off by default.
 
 ### Restart portfolios
 

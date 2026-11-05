@@ -597,6 +597,82 @@ impl PlanningGraph {
         pg
     }
 
+    /// Compact reachable parameter relations, without materialising ground
+    /// actions or their effects. An oversized relation is omitted in full:
+    /// keeping only its prefix would make pruning unsound.
+    pub(crate) fn joint_parameter_domains(
+        &self,
+        schemas: &[ActionSchema],
+        predicates: &PredicateTable,
+        get_objects: impl Fn(Type) -> Vec<Object>,
+    ) -> crate::joint_domains::JointDomains {
+        self.joint_parameter_domains_with_limit(schemas, predicates, get_objects, 2 * 1024 * 1024)
+    }
+
+    pub(crate) fn joint_parameter_domains_with_limit(
+        &self,
+        schemas: &[ActionSchema],
+        predicates: &PredicateTable,
+        get_objects: impl Fn(Type) -> Vec<Object>,
+        mut remaining_cells: usize,
+    ) -> crate::joint_domains::JointDomains {
+        let mut type_domains = FastMap::default();
+        for schema in schemas {
+            let mut vars = schema.parameters.clone();
+            quantified_variables(&schema.precondition, &mut vars);
+            for var in vars {
+                let ty = schema.var_types[var.0 as usize];
+                type_domains.entry(ty).or_insert_with(|| get_objects(ty));
+            }
+        }
+        let type_sets = type_domains
+            .iter()
+            .map(|(ty, objects)| (*ty, objects.iter().copied().collect()))
+            .collect();
+        let atoms = atoms_by_predicate(&self.atom_values, predicates.len());
+        let mut domains = crate::joint_domains::JointDomains::default();
+        // The default budget retains at most 8 MiB of tuple cells and 16 MiB
+        // of positional postings, plus per-schema metadata. This bounds table
+        // storage, not the work of reachability enumeration.
+        for schema in schemas {
+            let arity = schema.parameters.len();
+            // AtomPattern uses u8 equality-class IDs.
+            if arity > 256 || remaining_cells == 0 {
+                continue;
+            }
+            let mut tuples = Vec::new();
+            let mut rows = 0;
+            let mut overflow = false;
+            let mut join = JoinEnum::new(schema, &atoms, &type_domains, &type_sets);
+            join.run(&mut |subst, tuple| {
+                if overflow || !precondition_consistent(&schema.precondition, subst) {
+                    return;
+                }
+                let mut expanded = subst.to_vec();
+                let pre = instantiate_formula_expanded(
+                    &schema.precondition,
+                    &mut expanded,
+                    &schema.var_types,
+                    &type_domains,
+                );
+                if self.ground_formula_value(predicates, &pre).0.infinite() {
+                    return;
+                }
+                if (rows + 1) * arity.max(1) > remaining_cells {
+                    overflow = true;
+                    return;
+                }
+                tuples.extend_from_slice(tuple);
+                rows += 1;
+            });
+            if !overflow {
+                remaining_cells -= rows * arity.max(1);
+                domains.insert(schema.name.clone(), arity, tuples, rows);
+            }
+        }
+        domains
+    }
+
     /// Visits the reachable atoms of `predicate` that unify with `pattern`,
     /// narrowing the scan through the positional index whenever the pattern
     /// fixes an argument; `visit` returns `false` to stop early. Visit order

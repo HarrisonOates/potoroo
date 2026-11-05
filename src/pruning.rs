@@ -35,6 +35,9 @@ pub struct PruneOptions {
     /// outside the constants that can reach that parameter. See
     /// [`crate::param_domains`].
     pub params: bool,
+    /// Reachable joint parameter tuples, with propagation through shared
+    /// variables and forced bindings. See [`crate::joint_domains`].
+    pub joint: bool,
     /// Recursion suspension and its two pruning theorems. See
     /// [`crate::opgraph`].
     pub recursion: bool,
@@ -56,6 +59,7 @@ impl PruneOptions {
             edelete: true,
             disjunctive: true,
             params: true,
+            joint: true,
             recursion: true,
             minimality: true,
             symmetry: true,
@@ -71,6 +75,7 @@ impl PruneOptions {
             || self.edelete
             || self.disjunctive
             || self.params
+            || self.joint
             || self.recursion
             || self.minimality
             || self.symmetry
@@ -107,13 +112,14 @@ impl PruneOptions {
                 "edelete" | "e-deletion" | "edeletion" => options.edelete = on,
                 "disjunctive" | "disjunctions" => options.disjunctive = on,
                 "params" | "parameters" | "param-domains" => options.params = on,
+                "joint" | "joint-domains" => options.joint = on,
                 "recursion" | "recursive" => options.recursion = on,
                 "minimality" | "minimal" => options.minimality = on,
                 "symmetry" | "symmetries" | "objects" => options.symmetry = on,
                 other => {
                     return Err(format!(
                         "unknown pruning rule `{other}` (expected cutset, edelete, \
-                         symbolic, supporters, h2, disjunctive, params, recursion, minimality, symmetry, all or none)"
+                         symbolic, supporters, h2, disjunctive, params, joint, recursion, minimality, symmetry, all or none)"
                     ))
                 }
             }
@@ -128,6 +134,9 @@ impl PruneOptions {
         let mut names = Vec::new();
         if self.params {
             names.push("params");
+        }
+        if self.joint {
+            names.push("joint");
         }
         if self.symbolic {
             names.push("symbolic");
@@ -184,6 +193,9 @@ impl PruneOptions {
         if self.params {
             names.push("params");
         }
+        if self.joint {
+            names.push("joint");
+        }
         if self.recursion {
             names.push("recursion");
         }
@@ -228,6 +240,7 @@ mod tests {
                 "edelete",
                 "disjunctive",
                 "params",
+                "joint",
                 "recursion",
                 "symmetry"
             ]
