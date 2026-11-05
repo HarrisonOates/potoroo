@@ -6,6 +6,8 @@
 //! become ordinary bindings. An expansion-local snapshot shares unchanged row
 //! domains across siblings. A worklist revisits only affected constraints.
 //! Queued plans retain bindings, but no row domains or propagation worklists.
+//! Exact Cartesian factors avoid scanning independent parameter combinations.
+//! Binding constraints that couple factors fall back to the complete table.
 //!
 //! This is local consistency, not a complete CSP solver. Non-singleton domain
 //! reductions are reconstructed when a queued plan is expanded; heuristic
@@ -17,18 +19,27 @@ use std::rc::Rc;
 
 use crate::bindings::{AtomPatternKey, Binding, Bindings, StepVariable, TypeContext};
 use crate::chain::{self, Chain};
-use crate::fasthash::FastMap;
-#[cfg(test)]
-use crate::fasthash::FastSet;
+use crate::fasthash::{FastMap, FastSet};
 use crate::object_set::ObjectSet;
 use crate::plan::{Plan, Step};
 use crate::search::SearchContext;
 use crate::terms::{Object, Term};
 
-#[derive(Default)]
 pub(crate) struct JointDomains {
     tables: FastMap<String, Table>,
     cache_budget: CacheBudget,
+    factor_work: Cell<usize>,
+}
+
+impl Default for JointDomains {
+    fn default() -> Self {
+        Self {
+            tables: FastMap::default(),
+            cache_budget: CacheBudget::default(),
+            // Bound the optional decomposition analysis across all schemas.
+            factor_work: Cell::new(4 * 1024 * 1024),
+        }
+    }
 }
 
 struct CacheBudget {
@@ -54,10 +65,30 @@ struct Table {
     columns: Vec<Box<[(Object, u32)]>>,
     full: OnceCell<Rc<RowDomain>>,
     memo: RefCell<FastMap<AtomPatternKey, Rc<RowDomain>>>,
+    factors: OnceCell<Factorization>,
+}
+
+#[derive(Default)]
+struct Factorization {
+    parts: Vec<Factor>,
+    // Original column -> factor, used to detect binding constraints that
+    // couple otherwise independent factors.
+    groups: Vec<usize>,
+}
+
+struct Factor {
+    columns: Vec<usize>,
+    table: Table,
 }
 
 impl JointDomains {
     pub(crate) fn insert(&mut self, name: String, arity: usize, cells: Vec<Object>, rows: usize) {
+        self.tables.insert(name, Table::new(arity, cells, rows));
+    }
+}
+
+impl Table {
+    fn new(arity: usize, cells: Vec<Object>, rows: usize) -> Self {
         assert_eq!(cells.len(), arity * rows);
         let columns = (0..arity)
             .map(|column| {
@@ -73,21 +104,69 @@ impl JointDomains {
                 postings.into_boxed_slice()
             })
             .collect();
-        self.tables.insert(
-            name,
-            Table {
-                arity,
-                cells: cells.into(),
-                rows,
-                columns,
-                full: OnceCell::new(),
-                memo: RefCell::new(FastMap::default()),
-            },
-        );
+        Self {
+            arity,
+            cells: cells.into(),
+            rows,
+            columns,
+            full: OnceCell::new(),
+            memo: RefCell::new(FastMap::default()),
+            factors: OnceCell::new(),
+        }
     }
-}
 
-impl Table {
+    fn factors(&self, budget: &Cell<usize>) -> &Factorization {
+        self.factors.get_or_init(|| {
+            // Small tables are cheaper to filter directly. Larger arities and
+            // exhausted analysis budgets retain the original complete table.
+            if !(2..=8).contains(&self.arity)
+                || !(64..=262_144).contains(&self.rows)
+                || self.cells.len() > budget.get()
+            {
+                return Factorization::default();
+            }
+            budget.set(budget.get() - self.cells.len());
+            let rows: FastSet<_> = self
+                .cells
+                .chunks_exact(self.arity)
+                .map(|tuple| {
+                    let mut row = [Object(0); 8];
+                    row[..self.arity].copy_from_slice(tuple);
+                    row
+                })
+                .collect();
+            let mut parts = Vec::new();
+            split_factors((0..self.arity).collect(), rows, budget, &mut parts);
+            if parts.len() < 2 {
+                return Factorization::default();
+            }
+            let parts: Vec<_> = parts
+                .into_iter()
+                .map(|(columns, rows)| {
+                    let arity = columns.len();
+                    let mut rows: Vec<_> = rows.into_iter().collect();
+                    rows.sort_unstable();
+                    let count = rows.len();
+                    let cells = rows
+                        .into_iter()
+                        .flat_map(|row| row.into_iter().take(arity))
+                        .collect();
+                    Factor {
+                        columns,
+                        table: Table::new(arity, cells, count),
+                    }
+                })
+                .collect();
+            let mut groups = vec![0; self.arity];
+            for (group, factor) in parts.iter().enumerate() {
+                for &column in &factor.columns {
+                    groups[column] = group;
+                }
+            }
+            Factorization { parts, groups }
+        })
+    }
+
     fn full_domain(&self) -> &Rc<RowDomain> {
         self.full
             .get_or_init(|| Rc::new(RowDomain::new(self, (0..self.rows as u32).collect())))
@@ -111,6 +190,61 @@ impl Table {
         }
         best
     }
+}
+
+/// A relation is contained in the Cartesian product of any two disjoint
+/// projections. Equal cardinalities prove equality with that product. Count
+/// DISTINCT tuples, so duplicate input rows cannot falsely prove independence.
+/// Every accepted split is exact; stopping early only misses an optimization.
+fn split_factors(
+    columns: Vec<usize>,
+    rows: FastSet<[Object; 8]>,
+    budget: &Cell<usize>,
+    parts: &mut Vec<(Vec<usize>, FastSet<[Object; 8]>)>,
+) {
+    let arity = columns.len();
+    // Complementary partitions are equivalent: consider only masks with bit 0.
+    // Try balanced splits first: they usually remove the largest products.
+    let mut masks: Vec<usize> = (1..(1 << arity) - 1).step_by(2).collect();
+    masks.sort_unstable_by_key(|m| {
+        let size = m.count_ones() as usize;
+        (size.abs_diff(arity - size), *m)
+    });
+    for mask in masks {
+        let work = rows.len() * arity;
+        if work > budget.get() {
+            break;
+        }
+        budget.set(budget.get() - work);
+        let left: Vec<_> = (0..arity).filter(|i| mask & (1 << i) != 0).collect();
+        let right: Vec<_> = (0..arity).filter(|i| mask & (1 << i) == 0).collect();
+        let project = |positions: &[usize]| -> FastSet<[Object; 8]> {
+            // Do not reserve the full relation's row count: successful factors
+            // can have orders of magnitude fewer distinct projected tuples.
+            let mut result = FastSet::default();
+            for row in &rows {
+                let mut projected = [Object(0); 8];
+                for (i, &column) in positions.iter().enumerate() {
+                    projected[i] = row[column];
+                }
+                result.insert(projected);
+            }
+            result
+        };
+        let a = project(&left);
+        let b = project(&right);
+        if a.len().checked_mul(b.len()) == Some(rows.len()) {
+            split_factors(left.iter().map(|&i| columns[i]).collect(), a, budget, parts);
+            split_factors(
+                right.iter().map(|&i| columns[i]).collect(),
+                b,
+                budget,
+                parts,
+            );
+            return;
+        }
+    }
+    parts.push((columns, rows));
 }
 
 /// Immutable, sorted surviving row IDs and their cached column projections.
@@ -150,7 +284,7 @@ pub(crate) struct Snapshot {
     steps: Option<Rc<Chain<Step>>>,
     num_steps: usize,
     bindings: Rc<Bindings>,
-    domains: FastMap<usize, Rc<RowDomain>>,
+    domains: FastMap<(usize, usize), Rc<RowDomain>>,
 }
 
 impl Snapshot {
@@ -175,16 +309,14 @@ impl Snapshot {
             steps: plan.steps.clone(),
             num_steps: plan.num_steps,
             bindings,
-            domains: constraints
-                .into_iter()
-                .map(|c| (c.step_id, c.domain))
-                .collect(),
+            domains: constraints.into_iter().map(|c| (c.key, c.domain)).collect(),
         }
     }
 }
 
 struct Constraint<'a> {
-    step_id: usize,
+    // (step, part): part zero denotes the complete relation.
+    key: (usize, usize),
     table: &'a Table,
     domain: Rc<RowDomain>,
     variables: Vec<Option<usize>>,
@@ -313,7 +445,6 @@ fn run(
             let Some(table) = tables.tables.get(&action.name) else {
                 continue;
             };
-            let inherited = base.and_then(|s| s.domains.get(&step.id));
             let terms: Vec<_> = if !action.arguments.is_empty() {
                 action.arguments.iter().copied().map(Term::Object).collect()
             } else {
@@ -324,9 +455,13 @@ fn run(
                     .map(Term::Variable)
                     .collect()
             };
-            let dirty = inherited.is_none()
+            let factors = table.factors(&tables.factor_work);
+            let inherited_full = base.and_then(|s| s.domains.get(&(step.id, 0)));
+            let inherited_factored = !factors.parts.is_empty()
+                && base.is_some_and(|s| s.domains.contains_key(&(step.id, 1)));
+            let dirty = (inherited_full.is_none() && !inherited_factored)
                 || terms.iter().any(|term| {
-                    let base = base.expect("inherited domains require an ancestor");
+                    let base = base.unwrap();
                     match bindings.binding(*term, step.id) {
                         // A changed class can contain many variables already pinned
                         // to this object. Their patterns did not change.
@@ -339,20 +474,10 @@ fn run(
                             .contains(&bindings.representative(var, step.id)),
                     }
                 });
-            let domain = if dirty {
-                filter_bindings(
-                    table,
-                    &terms,
-                    step.id,
-                    &bindings,
-                    &types,
-                    inherited,
-                    &tables.cache_budget,
-                )?
-            } else {
-                inherited.unwrap().clone()
-            };
-            let positions = terms
+            // Keep canonical variable enumeration in the original parameter
+            // order, independent of how columns are grouped. Singleton binding
+            // batches then retain their original order as well.
+            let mut positions: Vec<_> = terms
                 .iter()
                 .map(|term| {
                     let Term::Variable(var) = bindings.binding(*term, step.id) else {
@@ -366,12 +491,67 @@ fn run(
                     }))
                 })
                 .collect();
-            constraints.push(Constraint {
-                step_id: step.id,
-                table,
-                domain,
-                variables: positions,
-            });
+            // A single remaining unbound group already scans a small slice of
+            // the full relation. Avoid splitting it into several constraints.
+            // Retain an inherited decomposition to avoid rebuilding its domains.
+            let mut active_groups = 0u8;
+            for (&group, variable) in factors.groups.iter().zip(&positions) {
+                if variable.is_some() {
+                    active_groups |= 1 << group;
+                }
+            }
+            let factored = !factors.parts.is_empty()
+                && (inherited_factored || active_groups.count_ones() > 1)
+                && if dirty {
+                    !bindings
+                        .resolve_pattern(&types, &terms, step.id)
+                        .couples_groups(&factors.groups)
+                } else {
+                    inherited_factored
+                };
+            for part in 0..if factored { factors.parts.len() } else { 1 } {
+                let projected_terms;
+                let (table, terms, positions, key) = if factored {
+                    let factor = &factors.parts[part];
+                    projected_terms = factor.columns.iter().map(|&i| terms[i]).collect::<Vec<_>>();
+                    (
+                        &factor.table,
+                        projected_terms.as_slice(),
+                        factor.columns.iter().map(|&i| positions[i]).collect(),
+                        (step.id, part + 1),
+                    )
+                } else {
+                    (
+                        table,
+                        terms.as_slice(),
+                        std::mem::take(&mut positions),
+                        (step.id, 0),
+                    )
+                };
+                let inherited = if factored {
+                    base.and_then(|s| s.domains.get(&key))
+                } else {
+                    inherited_full
+                };
+                let domain = match inherited {
+                    Some(domain) if !dirty => domain.clone(),
+                    _ => filter_bindings(
+                        table,
+                        terms,
+                        step.id,
+                        &bindings,
+                        &types,
+                        inherited,
+                        &tables.cache_budget,
+                    )?,
+                };
+                constraints.push(Constraint {
+                    key,
+                    table,
+                    domain,
+                    variables: positions,
+                });
+            }
         }
 
         // Intersect cached projections once. Watchers then schedule only tables
@@ -795,6 +975,154 @@ mod tests {
     }
 
     #[test]
+    fn factorization_proves_products_and_handles_duplicate_rows() {
+        // Interleaved correlated pairs, with no independent single column.
+        let mut cells = Vec::new();
+        for a in 0..10 {
+            for b in 0..10 {
+                cells.extend([Object(a), Object(b), Object(a), Object(b)]);
+            }
+        }
+        let table = Table::new(4, cells.clone(), 100);
+        let factors = table.factors(&Cell::new(100_000));
+        assert_eq!(factors.parts.len(), 2);
+        assert_eq!(factors.groups, vec![0, 1, 0, 1]);
+        assert!(factors.parts.iter().all(|part| part.table.rows == 10));
+        let mut rebuilt = FastSet::default();
+        for a in 0..10 {
+            for b in 0..10 {
+                let mut row = [Object(0); 4];
+                for (part, id) in factors.parts.iter().zip([a, b]) {
+                    for (&column, &value) in part.columns.iter().zip(part.table.tuple(id)) {
+                        row[column] = value;
+                    }
+                }
+                rebuilt.insert(row);
+            }
+        }
+        assert!(cells
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|row| rebuilt.contains(row)));
+
+        // Remove one combination, replace it with a duplicate. Raw row counts
+        // still multiply, but the relation is no longer a Cartesian product.
+        cells.truncate(cells.len() - 4);
+        cells.extend([Object(0); 4]);
+        let correlated = Table::new(4, cells, 100);
+        assert!(correlated.factors(&Cell::new(100_000)).parts.is_empty());
+        assert!(Table::new(0, vec![], 1)
+            .factors(&Cell::new(100))
+            .parts
+            .is_empty());
+        assert!(table.factors(&Cell::new(0)).parts.len() == 2); // already cached
+        let bounded = Table::new(2, (0..200).map(Object).collect(), 100);
+        assert!(bounded.factors(&Cell::new(0)).parts.is_empty());
+    }
+
+    #[test]
+    fn grouped_propagation_matches_full_tables_through_binding_changes() {
+        let ParsedUnit::Domain(parsed) = read_pddl(
+            "(define (domain groups) (:requirements :strips :equality)
+            (:predicates (pair ?a ?b) (choice ?a) (done))
+            (:action product :parameters (?a ?b ?c ?d)
+             :precondition (and (pair ?a ?c) (pair ?b ?d)) :effect (done))
+            (:action choice :parameters (?a) :precondition (choice ?a) :effect (done)))",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let domain = lower_domain(&parsed).unwrap();
+        let names: Vec<_> = (0..10).map(|i| format!("o{i}")).collect();
+        let facts = names
+            .iter()
+            .map(|s| format!("(pair {s} {s})"))
+            .collect::<String>();
+        let ParsedUnit::Problem(parsed) = read_pddl(&format!(
+            "(define (problem test) (:domain groups) (:objects {})
+             (:init {facts} (choice o0) (choice o1)) (:goal (done)))",
+            names.join(" ")
+        ))
+        .unwrap() else {
+            panic!()
+        };
+        let problem = lower_problem(&parsed, &domain).unwrap();
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let parent = steps(&ctx, &[0, 0, 1]);
+        let cache = prepare(&ctx, &parent).unwrap();
+        assert!(cache.domains.contains_key(&(1, 1)));
+        assert!(!cache.domains.contains_key(&(1, 0)));
+        // Cross-factor equality and inequality must both use the full relation.
+        for equal in [true, false] {
+            let binding = Binding::new(Variable(0), 1, Term::Variable(Variable(1)), 1, equal);
+            let child = bind(&ctx, parent.clone(), &[binding]);
+            assert!(propagate_incremental(&ctx, &child, Some(&cache)).is_some());
+            let (_, snapshot) = run(&ctx, &child, Some(&cache), true).unwrap();
+            let snapshot = snapshot.unwrap();
+            assert!(snapshot.domains.contains_key(&(1, 0)));
+            // Fixing one side makes the cross-group constraint unary. This
+            // refinement must agree with full propagation as well.
+            let child = bind(
+                &ctx,
+                child,
+                &[eq(0, 1, Term::Object(object(&ctx, "o0")), 0)],
+            );
+            assert!(propagate_incremental(&ctx, &child, Some(&snapshot)).is_some());
+            let (_, result) = run(&ctx, &child, Some(&snapshot), true).unwrap();
+            assert!(result.unwrap().domains.contains_key(&(1, 1)));
+        }
+        let vars = [(0, 1), (1, 1), (2, 1), (3, 1), (0, 2), (1, 2), (0, 3)];
+        let mut refinements = Vec::new();
+        for &(a, sa) in &vars {
+            for equal in [false, true] {
+                for &(b, sb) in &vars {
+                    refinements.push(Binding::new(
+                        Variable(a),
+                        sa,
+                        Term::Variable(Variable(b)),
+                        sb,
+                        equal,
+                    ));
+                }
+                for name in ["o0", "o1"] {
+                    refinements.push(Binding::new(
+                        Variable(a),
+                        sa,
+                        Term::Object(object(&ctx, name)),
+                        0,
+                        equal,
+                    ));
+                }
+            }
+        }
+        // Compare every pair of refinements with the independent, unfactored
+        // oracle, including equality cycles, external restrictions and siblings.
+        for first in &refinements {
+            let Some(bindings) = parent.bindings.add(&ctx.type_ctx(), &[*first], false) else {
+                continue;
+            };
+            let child = parent.clone().with_bindings(bindings);
+            let Some(bindings) = propagate_incremental(&ctx, &child, Some(&cache)) else {
+                continue;
+            };
+            let child = child.with_bindings(bindings);
+            let snapshot = prepare(&ctx, &child).unwrap();
+            for next in &refinements {
+                let Some(bindings) = child.bindings.add(&ctx.type_ctx(), &[*next], false) else {
+                    continue;
+                };
+                propagate_incremental(
+                    &ctx,
+                    &child.clone().with_bindings(bindings),
+                    Some(&snapshot),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn binding_one_parameter_forces_its_correlated_partner() {
         let (domain, problem) = task("(pair a b) (pair b c)");
         let params = Parameters::default();
@@ -969,12 +1297,18 @@ mod tests {
             assert!(actual.is_some() && from_sibling.is_some());
             let (_, snapshot) = run(&ctx, &child, Some(&cache), true).unwrap();
             let snapshot = snapshot.unwrap();
-            assert!(Rc::ptr_eq(&snapshot.domains[&2], &cache.domains[&2]));
-            assert!(!Rc::ptr_eq(&snapshot.domains[&1], &cache.domains[&1]));
-            assert_eq!(snapshot.domains[&1].rows.len(), 1);
+            assert!(Rc::ptr_eq(
+                &snapshot.domains[&(2, 0)],
+                &cache.domains[&(2, 0)]
+            ));
+            assert!(!Rc::ptr_eq(
+                &snapshot.domains[&(1, 0)],
+                &cache.domains[&(1, 0)]
+            ));
+            assert_eq!(snapshot.domains[&(1, 0)].rows.len(), 1);
             sibling_cache = Some(snapshot);
         }
-        assert_eq!(cache.domains[&1].rows.len(), 3);
+        assert_eq!(cache.domains[&(1, 0)].rows.len(), 3);
     }
 
     #[test]
@@ -1027,8 +1361,8 @@ mod tests {
         let (_, result) = run(&ctx, &child, Some(&cache), true).unwrap();
         let result = result.unwrap();
         for step in 1..=4 {
-            assert_eq!(cache.domains[&step].rows.len(), 3);
-            assert_eq!(result.domains[&step].rows.len(), 2);
+            assert_eq!(cache.domains[&(step, 0)].rows.len(), 3);
+            assert_eq!(result.domains[&(step, 0)].rows.len(), 2);
         }
     }
 
@@ -1110,6 +1444,10 @@ mod tests {
         let problem = lower_problem(&parsed, &domain).unwrap();
         let params = Parameters::default();
         let ctx = SearchContext::new(&domain, &problem, &params);
+        assert!(ctx.joint_domains().tables["pair-step"]
+            .factors
+            .set(Factorization::default())
+            .is_ok());
         let snapshot = |value: &str| {
             let child = bind(
                 &ctx,
@@ -1121,17 +1459,17 @@ mod tests {
         };
         let a = snapshot("o0");
         let again = snapshot("o0");
-        assert!(Rc::ptr_eq(&a.domains[&1], &again.domains[&1]));
-        assert_eq!(a.domains[&1].rows.len(), 10);
+        assert!(Rc::ptr_eq(&a.domains[&(1, 0)], &again.domains[&(1, 0)]));
+        assert_eq!(a.domains[&(1, 0)].rows.len(), 10);
         let b = snapshot("o1");
-        assert!(!Rc::ptr_eq(&a.domains[&1], &b.domains[&1]));
+        assert!(!Rc::ptr_eq(&a.domains[&(1, 0)], &b.domains[&(1, 0)]));
         let equal = bind(
             &ctx,
             steps(&ctx, &[0]),
             &[eq(0, 1, Term::Variable(Variable(1)), 1)],
         );
         let equal = prepare(&ctx, &equal).unwrap();
-        assert_eq!(equal.domains[&1].rows.len(), 10);
+        assert_eq!(equal.domains[&(1, 0)].rows.len(), 10);
         let unequal = bind(
             &ctx,
             steps(&ctx, &[0]),
@@ -1146,15 +1484,18 @@ mod tests {
         let result = propagate(&ctx, &unequal);
         assert!(result.is_some());
         let unequal = prepare(&ctx, &unequal).unwrap();
-        assert_eq!(unequal.domains[&1].rows.len(), 90);
+        assert_eq!(unequal.domains[&(1, 0)].rows.len(), 90);
         let tables = ctx.joint_domains();
         tables.cache_budget.bytes.set(0);
         let entries = tables.tables["pair-step"].memo.borrow().len();
         let c = snapshot("o2");
         let c_again = snapshot("o2");
-        assert!(!Rc::ptr_eq(&c.domains[&1], &c_again.domains[&1]));
+        assert!(!Rc::ptr_eq(&c.domains[&(1, 0)], &c_again.domains[&(1, 0)]));
         assert_eq!(tables.tables["pair-step"].memo.borrow().len(), entries);
-        assert!(Rc::ptr_eq(&a.domains[&1], &snapshot("o0").domains[&1]));
+        assert!(Rc::ptr_eq(
+            &a.domains[&(1, 0)],
+            &snapshot("o0").domains[&(1, 0)]
+        ));
         // A two-value support set selects a union of indexed postings. Sort
         // its row IDs before a descendant inherits them for binary searches.
         let mut parent = steps(&ctx, &[0]);
@@ -1164,7 +1505,7 @@ mod tests {
         assert!(propagate_incremental(&ctx, &child, Some(&cache)).is_some());
         let (_, propagated) = run(&ctx, &child, Some(&cache), true).unwrap();
         let propagated = propagated.unwrap();
-        let rows = &propagated.domains[&1].rows;
+        let rows = &propagated.domains[&(1, 0)].rows;
         assert_eq!(rows.len(), 20);
         assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         let table = &tables.tables["pair-step"];

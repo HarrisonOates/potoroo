@@ -1294,6 +1294,26 @@ impl ObjectTablePattern {
 }
 
 impl AtomPattern {
+    /// Whether equality or inequality constraints connect different parts of
+    /// a Cartesian table decomposition. Such a pattern needs the full table to
+    /// preserve the strength of per-step consistency propagation.
+    pub(crate) fn couples_groups(&self, groups: &[usize]) -> bool {
+        debug_assert_eq!(groups.len(), self.terms.len());
+        let mut classes = vec![None; self.assignment.len()];
+        for (term, &group) in self.terms.iter().zip(groups) {
+            if let PatTerm::Var { class, .. } = term {
+                let previous = &mut classes[*class as usize];
+                if previous.is_some_and(|old| old != group) {
+                    return true;
+                }
+                *previous = Some(group);
+            }
+        }
+        self.ncd_pairs
+            .iter()
+            .any(|&(a, b)| classes[a as usize] != classes[b as usize])
+    }
+
     pub(crate) fn table_cache_key(&self) -> AtomPatternKey {
         let mut excluded = self.excluded.clone();
         for values in &mut excluded {

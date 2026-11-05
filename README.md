@@ -169,6 +169,10 @@ Tuple tables are shared across the search. During expansion, sibling refinements
 reuse unaffected domains and propagate changes through a constraint worklist.
 Small value domains use bitsets, and a bounded shared cache reuses table filters
 across expansions (at most 512 entries, with a 4 MiB payload allowance).
+Where useful, exact Cartesian factors propagate independent parameter groups
+separately; bindings connecting groups use the complete table. Factor discovery
+has a bounded work budget, and retained projections add at most the original
+tables' tuple and posting storage. Full tables are still built and retained.
 Queued plans retain only forced bindings; non-singleton domains are reconstructed
 when a plan is expanded, and the temporary cache is released after its children.
 Tables exceeding the storage budget are omitted in full, weakening pruning

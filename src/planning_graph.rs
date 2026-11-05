@@ -633,7 +633,8 @@ impl PlanningGraph {
         let mut domains = crate::joint_domains::JointDomains::default();
         // The default budget retains at most 8 MiB of tuple cells and 16 MiB
         // of positional postings, plus per-schema metadata. This bounds table
-        // storage, not the work of reachability enumeration.
+        // storage, not the work of reachability enumeration. Optional Cartesian
+        // projections retain at most another copy of that tuple/posting budget.
         for schema in schemas {
             let arity = schema.parameters.len();
             // AtomPattern uses u8 equality-class IDs.
