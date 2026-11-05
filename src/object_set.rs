@@ -40,6 +40,20 @@ impl ObjectSet {
         self.large.retain(|object| other.large.contains(object));
     }
 
+    pub(crate) fn is_disjoint(&self, other: &Self) -> bool {
+        self.small & other.small == 0
+            && if self.large.len() <= other.large.len() {
+                self.large
+                    .iter()
+                    .all(|object| !other.large.contains(object))
+            } else {
+                other
+                    .large
+                    .iter()
+                    .all(|object| !self.large.contains(object))
+            }
+    }
+
     /// Conservative allowance for hash buckets and control bytes. The inline
     /// mask is counted by the containing ObjectSet allocation.
     pub(crate) fn heap_bytes(&self) -> usize {
@@ -104,6 +118,8 @@ mod tests {
                 .filter(|&o| keep.contains(o))
                 .collect();
             assert_eq!(intersection.iter().collect::<FastSet<_>>(), expected);
+            assert_eq!(set.is_disjoint(&keep), expected.is_empty());
+            assert_eq!(keep.is_disjoint(&set), expected.is_empty());
         }
     }
 }

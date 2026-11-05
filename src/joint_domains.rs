@@ -75,6 +75,8 @@ struct TableData {
     // Sorted (object, row) pairs: eight bytes per cell, with no per-object
     // hash bucket or allocation. Equal-object postings form a contiguous run.
     columns: Vec<Box<[(Object, u32)]>>,
+    // Shared by early unifier checks; never attached to a plan or binding.
+    projections: OnceCell<Vec<ObjectSet>>,
 }
 
 pub(crate) struct ParameterGroup {
@@ -183,6 +185,7 @@ impl TableData {
         Self {
             cells: cells.into(),
             columns,
+            projections: OnceCell::new(),
         }
     }
 }
@@ -282,6 +285,25 @@ impl Table {
     fn tuple(&self, row: u32) -> &[Object] {
         let start = row as usize * self.arity;
         &self.data().cells[start..start + self.arity]
+    }
+
+    fn projection(&self, column: usize) -> &ObjectSet {
+        if let Some(data) = self.data.get() {
+            return &data.projections.get_or_init(|| {
+                data.columns
+                    .iter()
+                    .map(|postings| postings.iter().map(|&(object, _)| object).collect())
+                    .collect()
+            })[column];
+        }
+        // Project one factor without materializing its Cartesian product.
+        let factors = self.factors.get().expect("deferred table needs factors");
+        for part in &factors.parts {
+            if let Some(position) = part.columns.iter().position(|&c| c == column) {
+                return part.table.projection(position);
+            }
+        }
+        unreachable!("every parameter has a factor")
     }
 
     fn candidates(&self, bound: impl Iterator<Item = (usize, Object)>) -> Option<&[(Object, u32)]> {
@@ -450,6 +472,54 @@ pub(crate) fn propagate_incremental(
     #[cfg(test)]
     assert_matches_reference(ctx, plan, &result);
     result
+}
+
+/// Reject an equality whose operator parameter projections cannot agree. This
+/// is only a necessary check: surviving children still receive complete joint
+/// propagation. Projections are shared across the search; the check allocates
+/// no pattern and never materializes a deferred Cartesian product.
+pub(crate) fn unifier_possible(
+    ctx: &SearchContext,
+    bindings: &Bindings,
+    unifier: &[Binding],
+) -> bool {
+    if unifier.is_empty() {
+        return true;
+    }
+    let tables = ctx.joint_domains();
+    let projection = |var, step| {
+        let action = ctx.step_action(step)?;
+        let table = tables.tables.get(&action.name)?;
+        // Effect-local variables do not belong to the operator relation.
+        let column = action.parameters.iter().position(|&p| p == var)?;
+        Some(table.projection(column))
+    };
+    unifier.iter().all(|binding| {
+        if !binding.equality {
+            return true;
+        }
+        match (
+            bindings.binding(Term::Variable(binding.var), binding.var_id),
+            bindings.binding(binding.term, binding.term_id),
+        ) {
+            (Term::Variable(var), Term::Object(object)) => {
+                projection(var, binding.var_id).is_none_or(|p| p.contains(object))
+            }
+            (Term::Object(object), Term::Variable(var)) => {
+                projection(var, binding.term_id).is_none_or(|p| p.contains(object))
+            }
+            (Term::Variable(a), Term::Variable(b)) => {
+                match (
+                    projection(a, binding.var_id),
+                    projection(b, binding.term_id),
+                ) {
+                    (Some(a), Some(b)) => !a.is_disjoint(b),
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    })
 }
 
 fn filter_bindings(
@@ -1091,6 +1161,91 @@ mod tests {
 
     fn eq(var: u32, step: usize, term: Term, other_step: usize) -> Binding {
         Binding::new(Variable(var), step, term, other_step, true)
+    }
+
+    #[test]
+    fn parameter_projection_checks_preserve_deferred_products() {
+        let mut tables = JointDomains::default();
+        let group = |columns, offset: u32| ParameterGroup {
+            columns,
+            cells: (0..64)
+                .flat_map(|i| [Object(i + offset), Object(i + offset)])
+                .collect(),
+            rows: 64,
+        };
+        tables.insert_product(
+            "product".into(),
+            4,
+            vec![group(vec![0, 2], 0), group(vec![1, 3], 100)],
+            4096,
+        );
+        let table = &tables.tables["product"];
+        assert!(table.data.get().is_none());
+        for column in 0..4 {
+            for object in 0..200 {
+                let range = if column % 2 == 0 { 0..64 } else { 100..164 };
+                assert_eq!(
+                    table.projection(column).contains(Object(object)),
+                    range.contains(&object)
+                );
+            }
+        }
+        assert!(
+            table.data.get().is_none(),
+            "projection check materialized the product"
+        );
+        assert!(!Table::new(1, vec![], 0).projection(0).contains(Object(0)));
+    }
+
+    #[test]
+    fn early_unifier_rejections_agree_with_independent_propagation() {
+        let mut rejected = 0;
+        for mask in 0..16 {
+            let mut facts = String::from("(choice a) (choice b) (choice c)");
+            for (i, (x, y)) in [("a", "a"), ("a", "b"), ("b", "a"), ("b", "b")]
+                .iter()
+                .enumerate()
+            {
+                if mask & (1 << i) != 0 {
+                    facts.push_str(&format!("(pair {x} {y})"));
+                }
+            }
+            let (domain, problem) = task(&facts);
+            let params = Parameters::default();
+            let ctx = SearchContext::new(&domain, &problem, &params);
+            let parent = steps(&ctx, &[0, 1]);
+            let variables = [(0, 1), (1, 1), (0, 2)];
+            let mut changes = Vec::new();
+            for &(var, step) in &variables {
+                for name in ["a", "b", "c"] {
+                    changes.push(eq(var, step, Term::Object(object(&ctx, name)), 0));
+                }
+                for &(other, other_step) in &variables {
+                    changes.push(eq(var, step, Term::Variable(Variable(other)), other_step));
+                }
+            }
+            // Two successive bindings exercise aliases and both orientations
+            // of an equality whose other side was already pinned to an object.
+            for first in &changes {
+                let Some(bound) = parent.bindings.add(&ctx.type_ctx(), &[*first], false) else {
+                    continue;
+                };
+                for second in &changes {
+                    let Some(child_bindings) = bound.add(&ctx.type_ctx(), &[*second], false) else {
+                        continue;
+                    };
+                    if !unifier_possible(&ctx, &bound, &[*second]) {
+                        let child = parent.clone().with_bindings(child_bindings);
+                        assert!(
+                            reference::propagate_reference(&ctx, &child).is_none(),
+                            "lost reachable tuple: mask={mask}, first={first:?}, second={second:?}"
+                        );
+                        rejected += 1;
+                    }
+                }
+            }
+        }
+        assert!(rejected > 100);
     }
 
     #[test]

@@ -787,6 +787,17 @@ impl Plan {
             literal,
             open_cond.step_id,
         ) {
+            // Keep flaw-count probes unchanged. Actual children still undergo
+            // full propagation after refinement, including correlations and
+            // constraints shared with every older step.
+            if !test_only
+                && ctx.params.prune.joint
+                && effect.parameters.is_empty()
+                && !crate::joint_domains::unifier_possible(ctx, &self.bindings, &mgu)
+            {
+                ctx.pruned.set(ctx.pruned.get() + 1);
+                return false;
+            }
             self.make_link(ctx, plans, step, effect, open_cond, &mgu, test_only)
         } else {
             false
