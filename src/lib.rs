@@ -31,6 +31,8 @@ pub mod flaws;
 pub mod formula;
 pub mod functions;
 pub mod h2;
+#[cfg(feature = "htn")]
+pub mod htn;
 pub mod heuristics;
 pub(crate) mod instantiate;
 pub(crate) mod joint_domains;

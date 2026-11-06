@@ -206,6 +206,68 @@ constraints, and explicit derived predicates are rejected. Translator-generated
 axioms are handled by finite-domain search. State-dependent cost increases nested
 inside `when` or `forall` are accepted but currently contribute zero.
 
+## HTN prototype
+
+The optional `htn` feature adds a separate decomposition-based, plan-space
+planner. The existing `potoroo` executable, flat plan types, and flat search
+remain independent of this backend.
+
+```bash
+cargo build --release --features htn --bin potoroo-htn
+
+# Use explicit executable paths, or put pandaPIparser and malleefowl on PATH.
+export POTOROO_HTN_PARSER=/path/to/pandaPIparser
+export POTOROO_MALLEEFOWL=/path/to/malleefowl
+
+./target/release/potoroo-htn --time-limit 30 \
+  examples/htn/interleave-domain.hddl examples/htn/interleave-problem.hddl
+
+# Existing parser output or Malleefowl output can also be used directly.
+./target/release/potoroo-htn --lifted input.htn
+./target/release/potoroo-htn --grounded output.sas
+```
+
+[Malleefowl](https://github.com/HarrisonOates/malleefowl) grounds the lifted PANDA
+format produced by [pandaPIparser](https://github.com/panda-planner-dev/pandaPIparser).
+`--parser` and `--grounder` override the environment variables. The pipeline uses
+`--target=bowerbird --no-abstract-expansion` so that method expansion remains a
+search decision. Grounded PANDA `.sas` is a different format from Fast Downward
+SAS+. No additional Cargo dependencies are needed.
+
+This first increment supports ground STRIPS actions with nonnegative integer
+costs, partially ordered methods, repeated task occurrences, recursive methods,
+and empty methods. Negative preconditions and method preconditions use the
+frontend's compiled facts and check actions. Native conditional effects and
+nonempty additional mutex/invariant sections are rejected explicitly.
+
+Search is breadth-first over refinement depth: it first decomposes compound
+tasks, then resolves primitive open conditions and causal threats. Every
+primitive occurrence must belong to the hierarchy; arbitrary action insertion
+is disallowed. The search is satisficing, not cost-optimal. Recursive unsolvable
+problems can run indefinitely without a limit. `--limit N`, `--max-depth N`, and
+`--time-limit SECONDS` report incomplete termination distinctly from exhausted
+search; limits exit with status 2, input/internal errors with status 1.
+
+Successful output is a grounded PANDA decomposition certificate on stdout;
+statistics and primitive cost go to stderr. Generated guard and noop occurrences
+are retained for certificate conversion. Every solution is independently checked
+for legal decomposition, occurrence multiplicity, inherited ordering,
+executability, and final goals before emission. To check against the original
+HDDL as well:
+
+```bash
+./target/release/potoroo-htn domain.hddl problem.hddl > plan.raw
+"$POTOROO_HTN_PARSER" --panda-converter plan.raw plan.converted
+"$POTOROO_HTN_PARSER" --verify=0 --no-colour domain.hddl problem.hddl plan.converted
+```
+
+Run `cargo test --features htn --test htn --test htn_pipeline` for semantic and
+CLI checks. These include an independent exhaustive oracle over 1,024 small
+task networks. Setting both external tool environment variables also enables a
+Malleefowl/parser integration test with original-HDDL certificate verification.
+Interleaved flaw selection, TDG heuristics, and abstract-task causal-link
+inheritance are subsequent increments.
+
 ## References
 
 Potoroo draws on the following work. References for individual pruning rules
