@@ -10,11 +10,13 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use crate::chain::{self, Chain};
-use crate::fasthash::FastMap;
+use crate::fasthash::{FastMap, FastSet};
 use crate::formula::{Formula, Literal};
+use crate::object_set::ObjectSet;
 use crate::terms::{Object, Term, TermTable, Variable};
 use crate::types::{Type, Types};
 
@@ -329,6 +331,31 @@ impl Varset {
     }
 }
 
+/// An index key and its class ID in one hash-table entry. Equality and hashing
+/// use only the step-variable: inserting an older occurrence must preserve the
+/// class already recorded for the newest one. Keeping the ID beside the u32
+/// variable uses the padding a `(Variable, usize)` key would otherwise need.
+#[derive(Debug)]
+struct IndexedVariable {
+    var: Variable,
+    class: u32,
+    step_id: usize,
+}
+
+impl PartialEq for IndexedVariable {
+    fn eq(&self, other: &Self) -> bool {
+        self.var == other.var && self.step_id == other.step_id
+    }
+}
+
+impl Eq for IndexedVariable {}
+
+impl Hash for IndexedVariable {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.var, self.step_id).hash(state);
+    }
+}
+
 /// Lazily-built lookup index over an immutable varset chain: the authoritative
 /// (newest) varset node per step-variable and per pinned constant, plus the
 /// constants excluded per step-variable through pinned classes'
@@ -337,8 +364,11 @@ impl Varset {
 /// entries never win.
 #[derive(Debug, Default)]
 struct VarsetIndex {
-    vars: FastMap<StepVariable, (usize, Rc<Chain<Varset>>)>,
-    objs: FastMap<Object, (usize, Rc<Chain<Varset>>)>,
+    vars: FastSet<IndexedVariable>,
+    objs: FastMap<Object, u32>,
+    /// Store a position and node reference once per authoritative class rather
+    /// than repeating them for every variable and constant in that class.
+    classes: Box<[(usize, Rc<Chain<Varset>>)]>,
     ncd_constants: FastMap<StepVariable, Vec<Object>>,
 }
 
@@ -361,7 +391,7 @@ const MAX_PREFIX_MEMBERS: usize = 96;
 /// Whether a chain is worth indexing (cached alongside the index itself).
 #[derive(Debug, Clone)]
 enum IndexState {
-    /// Short chain: linear scans win.
+    /// Scan directly: short chains, or an index too large for u32 class IDs.
     Small,
     /// Index over a suffix of the chain. The first `prefix` (newest) varsets
     /// are scanned directly before the index answers for the rest. Reusing
@@ -389,8 +419,15 @@ fn lookup_var_in(
         IndexState::Built { prefix, ix, .. } => {
             scan_var(varsets, var, step_id, *prefix).or_else(|| {
                 ix.vars
-                    .get(&(var, step_id))
-                    .map(|(p, n)| (p + prefix, n.clone()))
+                    .get(&IndexedVariable {
+                        var,
+                        class: 0,
+                        step_id,
+                    })
+                    .map(|entry| {
+                        let (p, n) = &ix.classes[entry.class as usize];
+                        (p + prefix, n.clone())
+                    })
             })
         }
     }
@@ -404,8 +441,12 @@ fn lookup_obj_in(
 ) -> Option<(usize, Rc<Chain<Varset>>)> {
     match state {
         IndexState::Small => scan_obj(varsets, obj, usize::MAX),
-        IndexState::Built { prefix, ix, .. } => scan_obj(varsets, obj, *prefix)
-            .or_else(|| ix.objs.get(&obj).map(|(p, n)| (p + prefix, n.clone()))),
+        IndexState::Built { prefix, ix, .. } => scan_obj(varsets, obj, *prefix).or_else(|| {
+            ix.objs.get(&obj).map(|&class| {
+                let (p, n) = &ix.classes[class as usize];
+                (p + prefix, n.clone())
+            })
+        }),
     }
 }
 
@@ -515,16 +556,30 @@ impl Bindings {
     fn build_index(&self) -> IndexState {
         {
             let mut ix = VarsetIndex::default();
+            let mut classes = Vec::new();
             let mut pos = 0usize;
             let mut cur = self.varsets.clone();
             while let Some(node) = cur {
+                let Ok(class) = u32::try_from(classes.len()) else {
+                    // Preserve correctness even for histories too large to
+                    // index compactly; never truncate a class or a step ID.
+                    return IndexState::Small;
+                };
                 let vs = &node.head;
-                for sv in chain::iter(&vs.cd_set) {
+                let mut used = false;
+                for &(var, step_id) in chain::iter(&vs.cd_set) {
                     // First (newest) entry wins: it is the authoritative class.
-                    ix.vars.entry(*sv).or_insert_with(|| (pos, node.clone()));
+                    used |= ix.vars.insert(IndexedVariable {
+                        var,
+                        class,
+                        step_id,
+                    });
                 }
                 if let Some(c) = vs.constant {
-                    ix.objs.entry(c).or_insert_with(|| (pos, node.clone()));
+                    if let std::collections::hash_map::Entry::Vacant(entry) = ix.objs.entry(c) {
+                        entry.insert(class);
+                        used = true;
+                    }
                     // Record the pinned constant against every step-variable
                     // its class non-codesignates (stale entries carry subsets
                     // of the authoritative lists, so duplicates are the only
@@ -536,9 +591,13 @@ impl Bindings {
                         }
                     }
                 }
+                if used {
+                    classes.push((pos, node.clone()));
+                }
                 pos += 1;
                 cur = node.tail.clone();
             }
+            ix.classes = classes.into_boxed_slice();
             IndexState::Built {
                 prefix: 0,
                 prefix_members: 0,
@@ -606,6 +665,40 @@ impl Bindings {
             }
         }
         term
+    }
+
+    /// A representative shared by all members of an equality class in this
+    /// snapshot. Used by transient joint-domain propagation across steps.
+    pub(crate) fn representative(&self, var: Variable, step_id: usize) -> StepVariable {
+        self.find_var_node(var, step_id)
+            .and_then(|(_, node)| node.head.cd_set.as_ref().map(|members| members.head))
+            .unwrap_or((var, step_id))
+    }
+
+    /// Classes touched since an ancestor snapshot, including both sides of
+    /// inequalities. None means the histories are unrelated, so a caller must
+    /// recompute rather than reuse restrictions from another branch.
+    pub(crate) fn changed_classes_since(
+        &self,
+        ancestor: &Bindings,
+    ) -> Option<FastSet<StepVariable>> {
+        let added = self.num_varsets.checked_sub(ancestor.num_varsets)?;
+        let mut tail = &self.varsets;
+        for _ in 0..added {
+            tail = &tail.as_ref()?.tail;
+        }
+        match (tail, &ancestor.varsets) {
+            (None, None) => {}
+            (Some(a), Some(b)) if Rc::ptr_eq(a, b) => {}
+            _ => return None,
+        }
+        let mut changed = FastSet::default();
+        for varset in chain::iter(&self.varsets).take(added) {
+            for &(var, step) in chain::iter(&varset.cd_set).chain(chain::iter(&varset.ncd_set)) {
+                changed.insert(self.representative(var, step));
+            }
+        }
+        Some(changed)
     }
 
     /// Equality already entailed by the bindings, rather than equality that
@@ -894,6 +987,12 @@ impl Bindings {
         }
         self.try_add(ctx, new_bindings)
             .map(|(varsets, high_step, num_varsets)| {
+                // Reasserting constraints already entailed by this collection
+                // changes neither its history nor its lookup index. Keep the
+                // collection shared instead of allocating a wrapper per child.
+                if num_varsets == self.num_varsets && high_step == self.high_step {
+                    return self.clone();
+                }
                 // Inherit the parent's index: the child chain is the parent chain
                 // plus a few consed varsets, so the parent's table stays valid
                 // behind a scan of the new varsets. Once the prefix's length or
@@ -1014,9 +1113,11 @@ impl Bindings {
             if bind.equality {
                 let comb = match (&vs1, &vs2) {
                     (None, None) => Varset::make(ctx, bind, false),
-                    (Some((i1, n1)), Some((i2, _))) if i1 == i2 => {
-                        // Already bound to each other: reuse existing varset.
-                        Some(n1.head.clone_shallow())
+                    (Some((i1, _)), Some((i2, _))) if i1 == i2 => {
+                        // Already in the same equality class. Consing an
+                        // identical varset would only lengthen the history and
+                        // consume the inherited index's prefix budget.
+                        continue;
                     }
                     (Some((_, n1)), Some((_, n2))) => n1.head.combine(ctx, &n2.head),
                     (None, Some((_, n2))) => n2.head.add_var(ctx, bind.var, bind.var_id),
@@ -1113,7 +1214,7 @@ impl Bindings {
 /* Resolved atom patterns: fast lifted-vs-ground matching. */
 
 /// One position of an [`AtomPattern`]: a term resolved through the bindings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PatTerm {
     /// Resolved to a constant object.
     Obj(Object),
@@ -1140,7 +1241,158 @@ pub struct AtomPattern {
     assignment: Vec<Option<Object>>,
 }
 
+/// Step-independent identity of all constraints used by an atom matcher.
+/// Equality classes are numbered by first occurrence in the argument list.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) struct AtomPatternKey {
+    terms: Vec<PatTerm>,
+    excluded: Vec<Vec<Object>>,
+    ncd_pairs: Vec<(u8, u8)>,
+}
+
+impl AtomPatternKey {
+    pub(crate) fn storage_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.terms.capacity() * std::mem::size_of::<PatTerm>()
+            + self.excluded.capacity() * std::mem::size_of::<Vec<Object>>()
+            + self
+                .excluded
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<Object>())
+                .sum::<usize>()
+            + self.ncd_pairs.capacity() * std::mem::size_of::<(u8, u8)>()
+    }
+}
+
+/// Checks left after resolving types and exclusions against a table's known
+/// column values. Unlike a general atom matcher, unrestricted positions cost
+/// nothing per row, and repeated variables need no scratch assignments.
+pub(crate) struct ObjectTablePattern {
+    bound: Vec<(usize, Object)>,
+    allowed: Vec<(usize, ObjectSet)>,
+    equal: Vec<(usize, usize)>,
+    unequal: Vec<(usize, usize)>,
+}
+
+impl ObjectTablePattern {
+    pub(crate) fn unrestricted(&self) -> bool {
+        self.bound.is_empty()
+            && self.allowed.is_empty()
+            && self.equal.is_empty()
+            && self.unequal.is_empty()
+    }
+
+    pub(crate) fn matches(&self, row: &[Object]) -> bool {
+        self.bound.iter().all(|&(i, object)| row[i] == object)
+            && self
+                .allowed
+                .iter()
+                .all(|(i, objects)| objects.contains(row[*i]))
+            && self.equal.iter().all(|&(a, b)| row[a] == row[b])
+            && self.unequal.iter().all(|&(a, b)| row[a] != row[b])
+    }
+}
+
 impl AtomPattern {
+    /// Whether equality or inequality constraints connect different parts of
+    /// a Cartesian table decomposition. Such a pattern needs the full table to
+    /// preserve the strength of per-step consistency propagation.
+    pub(crate) fn couples_groups(&self, groups: &[usize]) -> bool {
+        debug_assert_eq!(groups.len(), self.terms.len());
+        let mut classes = vec![None; self.assignment.len()];
+        for (term, &group) in self.terms.iter().zip(groups) {
+            if let PatTerm::Var { class, .. } = term {
+                let previous = &mut classes[*class as usize];
+                if previous.is_some_and(|old| old != group) {
+                    return true;
+                }
+                *previous = Some(group);
+            }
+        }
+        self.ncd_pairs
+            .iter()
+            .any(|&(a, b)| classes[a as usize] != classes[b as usize])
+    }
+
+    pub(crate) fn table_cache_key(&self) -> AtomPatternKey {
+        let mut excluded = self.excluded.clone();
+        for values in &mut excluded {
+            values.sort_unstable();
+            values.dedup();
+        }
+        AtomPatternKey {
+            terms: self.terms.clone(),
+            excluded,
+            ncd_pairs: self.ncd_pairs.clone(),
+        }
+    }
+
+    pub(crate) fn for_object_table(
+        &self,
+        ctx: &TypeContext,
+        columns: &[ObjectSet],
+        declared_types: impl Iterator<Item = Type>,
+    ) -> Option<ObjectTablePattern> {
+        let mut result = ObjectTablePattern {
+            bound: Vec::new(),
+            allowed: Vec::new(),
+            equal: Vec::new(),
+            unequal: Vec::new(),
+        };
+        let mut first = vec![None; self.assignment.len()];
+        for (i, ((term, values), declared)) in self
+            .terms
+            .iter()
+            .zip(columns)
+            .zip(declared_types)
+            .enumerate()
+        {
+            match term {
+                PatTerm::Obj(object) => {
+                    if !values.contains(*object) {
+                        return None;
+                    }
+                    if values.len() > 1 {
+                        result.bound.push((i, *object));
+                    }
+                }
+                PatTerm::Var { class, ty } => {
+                    let class = *class as usize;
+                    // Complete parameter tables already obey the schema's
+                    // declared types. Only a narrower equality class needs
+                    // per-object type checks.
+                    let type_ok = ctx.types.subtype(declared, *ty);
+                    if !type_ok || self.excluded[class].iter().any(|o| values.contains(*o)) {
+                        let allowed: ObjectSet = values
+                            .iter()
+                            .filter(|&object| {
+                                (type_ok || ctx.types.subtype(ctx.object_type(object), *ty))
+                                    && !self.excluded[class].contains(&object)
+                            })
+                            .collect();
+                        if allowed.is_empty() {
+                            return None;
+                        }
+                        if allowed.len() < values.len() {
+                            result.allowed.push((i, allowed));
+                        }
+                    }
+                    if let Some(previous) = first[class] {
+                        result.equal.push((previous, i));
+                    } else {
+                        first[class] = Some(i);
+                    }
+                }
+            }
+        }
+        result.unequal.extend(
+            self.ncd_pairs
+                .iter()
+                .map(|&(a, b)| (first[a as usize].unwrap(), first[b as usize].unwrap())),
+        );
+        Some(result)
+    }
+
     /// True iff every position is already fixed to an object. Allocation-free,
     /// so callers can test before paying for [`AtomPattern::object_terms`].
     #[inline]
@@ -1213,12 +1465,29 @@ impl AtomPattern {
     /// bindings it was resolved against.
     pub fn matches(&mut self, ctx: &TypeContext, ground_terms: &[Term]) -> bool {
         debug_assert_eq!(ground_terms.len(), self.terms.len());
+        self.matches_objects_iter(
+            ctx,
+            ground_terms.iter().map(|term| match term {
+                Term::Object(object) => Some(*object),
+                Term::Variable(_) => None,
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_objects(&mut self, ctx: &TypeContext, objects: &[Object]) -> bool {
+        debug_assert_eq!(objects.len(), self.terms.len());
+        self.matches_objects_iter(ctx, objects.iter().copied().map(Some))
+    }
+
+    fn matches_objects_iter(
+        &mut self,
+        ctx: &TypeContext,
+        objects: impl Iterator<Item = Option<Object>>,
+    ) -> bool {
         self.assignment.iter_mut().for_each(|a| *a = None);
-        for (pt, gt) in self.terms.iter().zip(ground_terms) {
-            let o = match gt {
-                Term::Object(o) => *o,
-                Term::Variable(_) => return false,
-            };
+        for (pt, object) in self.terms.iter().zip(objects) {
+            let Some(o) = object else { return false };
             match pt {
                 PatTerm::Obj(p) => {
                     if *p != o {
@@ -1454,6 +1723,138 @@ mod tests {
             IndexState::Built { prefix: 0, .. }
         ));
         result
+    }
+
+    #[test]
+    fn compact_index_shares_one_record_for_a_large_equality_class() {
+        with_context(|ctx| {
+            let constraints: Vec<_> = (1..=64)
+                .map(|step| Binding::new(Variable(0), step, Term::Object(Object(0)), 0, true))
+                .collect();
+            let bindings = Bindings::empty().add(ctx, &constraints, false).unwrap();
+            let IndexState::Built { ix, .. } = bindings.index_state() else {
+                panic!("long binding history should be indexed");
+            };
+            // All 64 variables and their constant share the newest node; the
+            // older, shadowed classes must not consume additional records.
+            assert_eq!(ix.classes.len(), 1);
+            assert_eq!(ix.vars.len(), 64);
+            assert_eq!(ix.objs.len(), 1);
+            assert_lookups(&bindings);
+            for step in 1..=64 {
+                assert_eq!(
+                    bindings.binding(Term::Variable(Variable(0)), step),
+                    Term::Object(Object(0))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn compact_index_preserves_full_width_step_and_variable_ids() {
+        with_context(|ctx| {
+            let mut constraints: Vec<_> = (1..=INDEX_THRESHOLD)
+                .map(|step| Binding::new(Variable(0), step, Term::Object(Object(0)), 0, true))
+                .collect();
+            let mut cases = vec![
+                (Variable(0), 1, Object(0)),
+                (Variable(0), crate::plan::GOAL_ID, Object(1)),
+                (Variable(u32::MAX), usize::MAX - 1, Object(2)),
+                (Variable(u32::MAX), 1, Object(1)),
+            ];
+            if usize::BITS > 32 {
+                cases.push((Variable(0), u32::MAX as usize, Object(2)));
+            }
+            for &(var, step, obj) in &cases {
+                constraints.push(Binding::new(var, step, Term::Object(obj), 0, true));
+            }
+            let bindings = Bindings::empty().add(ctx, &constraints, false).unwrap();
+            assert!(matches!(bindings.index_state(), IndexState::Built { .. }));
+            for (var, step, obj) in cases {
+                assert_eq!(
+                    bindings.binding(Term::Variable(var), step),
+                    Term::Object(obj)
+                );
+                let (p, node) = bindings.find_var_node(var, step).unwrap();
+                let (q, scanned) = scan_var(&bindings.varsets, var, step, usize::MAX).unwrap();
+                assert_eq!(p, q);
+                assert!(Rc::ptr_eq(&node, &scanned));
+                assert!(bindings
+                    .add(
+                        ctx,
+                        &[Binding::new(var, step, Term::Object(obj), 0, false)],
+                        true
+                    )
+                    .is_none());
+            }
+            assert!(bindings
+                .find_var_node(Variable(1), crate::plan::GOAL_ID)
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn entailed_equalities_share_bindings_without_allocating() {
+        with_context(|ctx| {
+            let parent = indexed_bindings(ctx)
+                .add(
+                    ctx,
+                    &[Binding::new(
+                        Variable(0),
+                        1,
+                        Term::Object(Object(0)),
+                        0,
+                        true,
+                    )],
+                    false,
+                )
+                .unwrap();
+            let repeated = [
+                Binding::new(Variable(1), 1, Term::Variable(Variable(0)), 1, true),
+                Binding::new(Variable(1), 1, Term::Object(Object(0)), 0, true),
+            ];
+            let (child, allocations) = crate::alloc_test::allocations_during(|| {
+                let mut child = parent.clone();
+                for _ in 0..MAX_INDEX_PREFIX + 1 {
+                    child = child.add(ctx, &repeated, false).unwrap();
+                }
+                child
+            });
+            assert!(Rc::ptr_eq(&parent, &child));
+            assert_eq!(allocations, 0);
+            assert_lookups(&child);
+
+            // Equality is scoped to a step: this is a real merge even though
+            // the schema variable has the same name in both occurrences.
+            let mut extended = repeated.to_vec();
+            extended.push(Binding::new(
+                Variable(0),
+                2,
+                Term::Variable(Variable(0)),
+                1,
+                true,
+            ));
+            let merged = child.add(ctx, &extended, false).unwrap();
+            assert_eq!(merged.num_varsets, parent.num_varsets + 1);
+            assert_eq!(
+                merged.binding(Term::Variable(Variable(1)), 2),
+                Term::Object(Object(0))
+            );
+            assert!(parent.binding(Term::Variable(Variable(0)), 2).variable());
+            assert_lookups(&merged);
+
+            // A later contradiction in the same batch must still be checked.
+            extended.push(Binding::new(
+                Variable(1),
+                2,
+                Term::Object(Object(0)),
+                0,
+                false,
+            ));
+            for test_only in [false, true] {
+                assert!(parent.add(ctx, &extended, test_only).is_none());
+            }
+        });
     }
 
     // Compare positions and node identity, including misses, against a full

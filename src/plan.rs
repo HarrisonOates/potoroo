@@ -113,6 +113,34 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Strengthen a generated plan before ranking it. Existing threats remain
+    /// conservative: restricting bindings cannot introduce a new unifier.
+    pub(crate) fn with_bindings(self: Rc<Self>, bindings: Rc<Bindings>) -> Rc<Self> {
+        if Rc::ptr_eq(&self.bindings, &bindings) {
+            return self;
+        }
+        let mut plan = self;
+        if let Some(unique) = Rc::get_mut(&mut plan) {
+            unique.bindings = bindings;
+            return plan;
+        }
+        let updated = Self::new(
+            plan.steps.clone(),
+            plan.num_steps,
+            plan.cost,
+            plan.links.clone(),
+            plan.num_links,
+            plan.orderings.clone(),
+            bindings,
+            plan.unsafes.clone(),
+            plan.num_unsafes,
+            plan.open_conds.clone(),
+            plan.num_open_conds,
+        );
+        updated.id.set(plan.id.get());
+        updated
+    }
+
     pub fn num_steps(&self) -> usize {
         self.num_steps
     }
@@ -759,6 +787,17 @@ impl Plan {
             literal,
             open_cond.step_id,
         ) {
+            // Keep flaw-count probes unchanged. Actual children still undergo
+            // full propagation after refinement, including correlations and
+            // constraints shared with every older step.
+            if !test_only
+                && ctx.params.prune.joint
+                && effect.parameters.is_empty()
+                && !crate::joint_domains::unifier_possible(ctx, &self.bindings, &mgu)
+            {
+                ctx.pruned.set(ctx.pruned.get() + 1);
+                return false;
+            }
             self.make_link(ctx, plans, step, effect, open_cond, &mgu, test_only)
         } else {
             false
@@ -1135,12 +1174,26 @@ impl<'a> OpenConditionCounts<'a> {
                 break;
             };
             let step = &node.head;
-            if !self.plan.orderings.possibly_before(
-                step.id,
-                StepTime::AtEnd,
-                self.open.step_id,
-                self.open.when.start_time(),
-            ) {
+            // A predicate bucket can contain thousands of initial facts.
+            // Reject unrelated actions from their shorter effect lists before
+            // scanning that bucket once for every committed step. Keep the
+            // original bucket and cursor for matching actions so enumeration
+            // order and resumed counts remain unchanged.
+            let unrelated = self.reuse_cursor == 0
+                && step.id != INIT_ID
+                && achievers.len() > step.action.effects.len()
+                && !step.action.effects.iter().any(|effect| {
+                    effect.literal.negative() == literal.negative()
+                        && effect.literal.atom().predicate == literal.atom().predicate
+                });
+            if unrelated
+                || !self.plan.orderings.possibly_before(
+                    step.id,
+                    StepTime::AtEnd,
+                    self.open.step_id,
+                    self.open.when.start_time(),
+                )
+            {
                 self.reuse_step = node.tail.as_deref();
                 self.reuse_cursor = 0;
                 continue;

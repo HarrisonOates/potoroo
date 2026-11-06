@@ -1253,7 +1253,7 @@ fn print_help() {
          \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
          \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
          \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, h2, edelete,\n\
-         \x20                            disjunctive, params, recursion, minimality, symmetry, all, none\n\
+         \x20                            disjunctive, params, joint, recursion, minimality, symmetry, all, none\n\
          \x20                            (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
          \x20     --stage=SPEC           restart-portfolio stage HEURISTIC[@SEARCH][=SECS];\n\

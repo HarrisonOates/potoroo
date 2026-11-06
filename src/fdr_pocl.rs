@@ -4744,6 +4744,46 @@ mod tests {
     }
 
     #[test]
+    fn additive_ranks_charge_for_the_requested_fact_value() {
+        // A negative fact is a distinct SAS+ value, not the value true in
+        // the initial state. Check both truth directions and a non-unit cost.
+        for initial in [0, 1] {
+            let task = Task {
+                variables: vec![Variable {
+                    name: "p".to_string(),
+                    values: vec!["Atom p(a)".to_string(), "NegatedAtom p(a)".to_string()],
+                }],
+                initial: vec![initial],
+                goals: vec![Fact::new(0, 1 - initial)],
+                operators: vec![Operator {
+                    name: "toggle".to_string(),
+                    prevail: vec![],
+                    effects: vec![Effect {
+                        conditions: vec![],
+                        variable: 0,
+                        pre: Some(initial),
+                        post: 1 - initial,
+                    }],
+                    cost: 7,
+                }],
+                axioms: vec![],
+                mutex_groups: vec![],
+            };
+            let planner = Planner::new(&task);
+            let plan = PartialPlan::initial(&task);
+            for heuristic in ["ADD", "ADD_COST", "ADDR", "ADDR_COST", "CLADD"] {
+                let params = Parameters {
+                    heuristic: Heuristic::parse(heuristic).unwrap(),
+                    ..Parameters::default()
+                };
+                let (rank, greedy_rank) = planner.compute_rank_both(&plan, &params);
+                assert_eq!(rank.to_vec(), vec![7.0], "{heuristic}, initial={initial}");
+                assert_eq!(greedy_rank[0], 7.0, "{heuristic}, initial={initial}");
+            }
+        }
+    }
+
+    #[test]
     fn relaxed_plan_counts_a_shared_operator_once() {
         let task = shared_effect_task();
         let planner = Planner::new(&task);

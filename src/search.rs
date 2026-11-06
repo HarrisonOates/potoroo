@@ -94,6 +94,7 @@ pub struct SearchContext<'a> {
     /// Operator parameter domains, built on first use when `-p params` is on.
     /// See [`crate::param_domains`].
     param_domains: RefCell<Option<Rc<crate::param_domains::ParameterDomains>>>,
+    joint_domains: RefCell<Option<Rc<crate::joint_domains::JointDomains>>>,
     /// The domain's operator graph and its SCCs, built on first use when
     /// `-p recursion` is on. See [`crate::opgraph`].
     operator_graph: RefCell<Option<Rc<crate::opgraph::OperatorGraph>>>,
@@ -188,6 +189,7 @@ impl<'a> SearchContext<'a> {
             pruned: Cell::new(0),
             failed_compile_backends: RefCell::new(std::collections::HashSet::new()),
             param_domains: RefCell::new(None),
+            joint_domains: RefCell::new(None),
             operator_graph: RefCell::new(None),
             lifted_mutexes: RefCell::new(None),
             object_symmetries: RefCell::new(None),
@@ -455,13 +457,14 @@ impl<'a> SearchContext<'a> {
 
     pub fn planning_graph(&self) -> Rc<crate::planning_graph::PlanningGraph> {
         if self.planning_graph.borrow().is_none() {
-            let pg = crate::planning_graph::PlanningGraph::build_from_schemas(
+            let pg = crate::planning_graph::PlanningGraph::build_from_schemas_with_relaxed_plan(
                 &self.domain.predicates,
                 &self.init_action,
                 &self.domain.actions,
                 |ty| self.compatible_objects(ty),
                 self.params.action_cost,
                 self.problem.metric == Some(Metric::MinimizeTotalCost),
+                self.params.heuristic.needs_relaxed_plan(),
             );
             *self.planning_graph.borrow_mut() = Some(Rc::new(pg));
         }
@@ -476,6 +479,18 @@ impl<'a> SearchContext<'a> {
             *self.param_domains.borrow_mut() = Some(Rc::new(domains));
         }
         self.param_domains.borrow().clone().unwrap()
+    }
+
+    pub(crate) fn joint_domains(&self) -> Rc<crate::joint_domains::JointDomains> {
+        if self.joint_domains.borrow().is_none() {
+            let domains = self.planning_graph().joint_parameter_domains(
+                &self.domain.actions,
+                &self.domain.predicates,
+                |ty| self.compatible_objects(ty),
+            );
+            *self.joint_domains.borrow_mut() = Some(Rc::new(domains));
+        }
+        self.joint_domains.borrow().clone().unwrap()
     }
 
     /// The task's lifted landmarks, extracted once per search. `fam` also cuts
@@ -1323,12 +1338,50 @@ fn plan_impl(
             plan.refinements_with(ctx, current_flaw_order, &mut refinements);
 
             let cfo = current_flaw_order;
-            for new_plan in refinements {
+            // Reconstruct non-singleton domains once per expansion, lazily.
+            // Children share this temporary cache; no queued plan retains it.
+            // With just one affected child, filter that child directly instead
+            // of paying to reconstruct the parent's domains as well.
+            let share_joint_parent = prune_options.joint
+                && refinements
+                    .iter()
+                    .filter(|child| {
+                        child.num_steps != plan.num_steps
+                            || !Rc::ptr_eq(&child.bindings, &plan.bindings)
+                    })
+                    .take(2)
+                    .count()
+                    > 1;
+            let mut joint_parent = None;
+            for mut new_plan in refinements {
                 // N.B. id must be set before rank is computed (rank uses serial_no).
                 new_plan.id.set(num_generated_plans);
                 // Siblings share step ids, so claim the map before this child's
                 // variables are typed by anything below.
                 ctx.register_newest_step(&new_plan, plan.num_steps);
+
+                // Ordering-only refinements preserve already-propagated
+                // bindings and action domains. Everything else can constrain
+                // an older step through a shared variable.
+                if prune_options.joint
+                    && (new_plan.num_steps != plan.num_steps
+                        || !Rc::ptr_eq(&new_plan.bindings, &plan.bindings))
+                {
+                    let parent_domains = joint_parent.get_or_insert_with(|| {
+                        share_joint_parent
+                            .then(|| crate::joint_domains::prepare(ctx, &plan))
+                            .flatten()
+                    });
+                    let Some(bindings) = crate::joint_domains::propagate_incremental(
+                        ctx,
+                        &new_plan,
+                        parent_domains.as_ref(),
+                    ) else {
+                        ctx.pruned.set(ctx.pruned.get() + 1);
+                        continue;
+                    };
+                    new_plan = new_plan.with_bindings(bindings);
+                }
 
                 // Opt-in literature pruning rules (`-p`). Each discards a plan
                 // it has proved unrefinable or provably non-minimal; all are
