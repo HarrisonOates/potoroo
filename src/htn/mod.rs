@@ -12,6 +12,7 @@ pub mod plan;
 pub mod refine;
 pub mod search;
 pub mod tdg;
+mod tdg_cache;
 pub mod validate;
 
 #[cfg(test)]
@@ -22,3 +23,4 @@ pub use refine::FlawSelection;
 pub use search::{
     search, Config, Outcome, SearchResult, SearchStrategy, Solution, Stats, StopReason,
 };
+pub use tdg::TdgMode;

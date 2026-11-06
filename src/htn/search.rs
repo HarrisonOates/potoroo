@@ -8,7 +8,8 @@ use std::time::Instant;
 use super::model::Problem;
 use super::plan::Plan;
 use super::refine::{self, FlawSelection, Refinement};
-use super::tdg::{Tdg, COST_CAP};
+use super::tdg::{Recompute, Tdg, TdgMode, COST_CAP};
+use super::tdg_cache::BoundCache;
 use super::validate::{self, Certificate};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -34,6 +35,7 @@ pub struct Config {
     pub deadline: Option<Instant>,
     pub strategy: SearchStrategy,
     pub flaws: FlawSelection,
+    pub tdg: TdgMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +55,10 @@ pub struct Stats {
     pub causal_links: usize,
     pub threat_orderings: usize,
     pub tdg_pruned: usize,
+    pub tdg_recomputed: usize,
+    /// Lazy evaluations whose stronger bound required another queue insertion.
+    pub tdg_requeued: usize,
+    pub tdg_cache_hits: usize,
     pub cost_bound_pruned: usize,
     pub max_queued: usize,
 }
@@ -78,10 +84,50 @@ pub struct SearchResult {
     pub stats: Stats,
 }
 
+struct Evaluator {
+    index: Recompute,
+    cache: Option<BoundCache>,
+}
+
+impl Evaluator {
+    fn bound(
+        &mut self,
+        problem: &Problem,
+        plan: &Plan,
+        tdg: &Tdg,
+        deadline: Option<Instant>,
+        stats: &mut Stats,
+    ) -> Option<Option<u128>> {
+        let key = self.cache.as_ref().map(|_| BoundCache::key(plan));
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
+        }
+        if let (Some(cache), Some(key)) = (&self.cache, &key) {
+            if let Some(bound) = cache.get(key) {
+                stats.tdg_cache_hits += 1;
+                return Some(bound);
+            }
+        }
+        stats.tdg_recomputed += 1;
+        let bound = self.index.remaining_cost(problem, plan, tdg, deadline)?;
+        // Cancellation is not a bound and is never cached.
+        if let (Some(cache), Some(key)) = (&mut self.cache, key) {
+            cache.insert(key, bound);
+        }
+        Some(bound)
+    }
+}
+
+struct Node {
+    plan: Rc<Plan>,
+    h: u128,
+    pending_tdg: bool,
+}
+
 struct Queued {
     // Increasing serial number gives FIFO tie-breaking on equal priorities.
     key: (u128, usize),
-    plan: Rc<Plan>,
+    node: Node,
 }
 impl PartialEq for Queued {
     fn eq(&self, other: &Self) -> bool {
@@ -101,30 +147,30 @@ impl Ord for Queued {
 }
 
 enum Frontier {
-    Fifo(VecDeque<Rc<Plan>>),
+    Fifo(VecDeque<Node>),
     Guided(BinaryHeap<Queued>),
 }
 impl Frontier {
-    fn push(&mut self, plan: Rc<Plan>, strategy: SearchStrategy, h: u128, serial: usize) {
+    fn push(&mut self, node: Node, strategy: SearchStrategy, serial: usize) {
         match self {
-            Self::Fifo(q) => q.push_back(plan),
+            Self::Fifo(q) => q.push_back(node),
             Self::Guided(q) => {
                 let score = if strategy == SearchStrategy::AStar {
-                    plan.cost() as u128 + h
+                    node.plan.cost() as u128 + node.h
                 } else {
-                    h
+                    node.h
                 };
                 q.push(Queued {
                     key: (score, serial),
-                    plan,
+                    node,
                 });
             }
         }
     }
-    fn pop(&mut self) -> Option<Rc<Plan>> {
+    fn pop(&mut self) -> Option<(Node, usize)> {
         match self {
-            Self::Fifo(q) => q.pop_front(),
-            Self::Guided(q) => q.pop().map(|entry| entry.plan),
+            Self::Fifo(q) => q.pop_front().map(|node| (node, 0)),
+            Self::Guided(q) => q.pop().map(|entry| (entry.node, entry.key.1)),
         }
     }
     fn len(&self) -> usize {
@@ -159,6 +205,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     // effect summaries, making it a useful independent research baseline.
     let tdg = if config.flaws != FlawSelection::DecompositionFirst
         || config.strategy != SearchStrategy::BreadthFirst
+        || config.tdg != TdgMode::Static
     {
         let Some(graph) = Tdg::with_deadline(problem, config.deadline) else {
             return Ok(SearchResult {
@@ -170,6 +217,20 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     } else {
         None
     };
+    let mut recompute = if config.tdg != TdgMode::Static {
+        let Some(index) = Recompute::new(problem, config.deadline) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        Some(Evaluator {
+            index,
+            cache: (config.tdg == TdgMode::LazyCached).then(BoundCache::default),
+        })
+    } else {
+        None
+    };
     let mut queue = if config.strategy == SearchStrategy::BreadthFirst {
         Frontier::Fifo(VecDeque::new())
     } else {
@@ -177,9 +238,24 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     };
     let initial = Rc::new(Plan::initial(problem));
     stats.generated = 1;
-    let h = tdg
-        .as_ref()
-        .map_or(Some(0), |g| g.remaining_cost(problem, &initial));
+    let h = if let Some(index) = &mut recompute {
+        let Some(bound) = index.bound(
+            problem,
+            &initial,
+            tdg.as_ref().unwrap(),
+            config.deadline,
+            &mut stats,
+        ) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        bound
+    } else {
+        tdg.as_ref()
+            .map_or(Some(0), |g| g.remaining_cost(problem, &initial))
+    };
     let Some(h) = h else {
         stats.tdg_pruned += 1;
         return Ok(SearchResult {
@@ -190,17 +266,63 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     if initial.cost() as u128 + h >= COST_CAP {
         return Err("HTN plan cost overflow: TDG lower bound exceeds u64".into());
     }
-    queue.push(initial, config.strategy, h, 0);
+    queue.push(
+        Node {
+            plan: initial,
+            h,
+            pending_tdg: false,
+        },
+        config.strategy,
+        0,
+    );
     stats.max_queued = 1;
     let mut depth_cut = false;
     let mut cost_cut = false;
-    while let Some(plan) = queue.pop() {
+    while let Some((mut node, serial)) = queue.pop() {
         if expired() {
             return Ok(SearchResult {
                 outcome: Outcome::Stopped(StopReason::Deadline),
                 stats,
             });
         }
+        if node.pending_tdg {
+            let Some(bound) = recompute.as_mut().unwrap().bound(
+                problem,
+                &node.plan,
+                tdg.as_ref().unwrap(),
+                config.deadline,
+                &mut stats,
+            ) else {
+                return Ok(SearchResult {
+                    outcome: Outcome::Stopped(StopReason::Deadline),
+                    stats,
+                });
+            };
+            let Some(bound) = bound else {
+                stats.tdg_pruned += 1;
+                continue;
+            };
+            if node.plan.cost() as u128 + bound >= COST_CAP {
+                stats.cost_bound_pruned += 1;
+                cost_cut = true;
+                continue;
+            }
+            let previous = node.h;
+            node.h = node.h.max(bound);
+            node.pending_tdg = false;
+            // OPEN always carries admissible lower bounds. A strengthened
+            // priority must compete again before expansion or accepting a goal.
+            // Keep the original serial, so equal-priority FIFO ties are stable.
+            // BFS does not order by h and must not lose its refinement-depth order.
+            if node.h > previous && config.strategy != SearchStrategy::BreadthFirst {
+                stats.tdg_requeued += 1;
+                queue.push(node, config.strategy, serial);
+                continue;
+            }
+        }
+        let Node {
+            plan, h: parent_h, ..
+        } = node;
         stats.expanded += 1;
         if plan.compound(problem).is_none()
             && plan.open.is_none()
@@ -274,10 +396,61 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                     stats,
                 });
             }
-            let h = tdg.as_ref().map_or(0, |g| {
-                g.remaining_cost(problem, &child)
-                    .expect("productive method was checked before refinement")
-            });
+            let mut pending_tdg = false;
+            let h = if let Refinement::Decompose { parent, .. } = refinement {
+                if let Some(index) = &mut recompute {
+                    if problem.methods_by_task[parent.task].len() == 1 {
+                        // The only method preserves the set of descendant actions.
+                        // Its new primitive costs move from h into g (IJCAI 2017, §5.1).
+                        parent_h
+                            .checked_sub((child.cost() - plan.cost()) as u128)
+                            .expect("single-method refinement preserves the relaxed total cost")
+                    } else if matches!(config.tdg, TdgMode::Lazy | TdgMode::LazyCached) {
+                        pending_tdg = true;
+                        let structural = tdg
+                            .as_ref()
+                            .unwrap()
+                            .remaining_cost(problem, &child)
+                            .expect("productive method was checked before refinement");
+                        // Any completion of the child also completes the parent.
+                        // Preserve that total-cost lower bound while primitive
+                        // costs move into g; never use an unchecked estimate as exact.
+                        structural
+                            .max(parent_h.saturating_sub((child.cost() - plan.cost()) as u128))
+                    } else {
+                        let Some(bound) = index.bound(
+                            problem,
+                            &child,
+                            tdg.as_ref().unwrap(),
+                            config.deadline,
+                            &mut stats,
+                        ) else {
+                            return Ok(SearchResult {
+                                outcome: Outcome::Stopped(StopReason::Deadline),
+                                stats,
+                            });
+                        };
+                        let Some(bound) = bound else {
+                            stats.tdg_pruned += 1;
+                            continue;
+                        };
+                        bound
+                    }
+                } else {
+                    tdg.as_ref().map_or(0, |g| {
+                        g.remaining_cost(problem, &child)
+                            .expect("productive method was checked before refinement")
+                    })
+                }
+            } else {
+                // Links and ordering constraints do not change active tasks.
+                parent_h
+            };
+            if child.cost() as u128 + h >= COST_CAP {
+                stats.cost_bound_pruned += 1;
+                cost_cut = true;
+                continue;
+            }
             stats.generated += 1;
             match refinement {
                 Refinement::Decompose { for_support, .. } => {
@@ -287,7 +460,15 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 Refinement::Support(..) => stats.causal_links += 1,
                 Refinement::Order(..) => stats.threat_orderings += 1,
             }
-            queue.push(Rc::new(child), config.strategy, h, stats.generated);
+            queue.push(
+                Node {
+                    plan: Rc::new(child),
+                    h,
+                    pending_tdg,
+                },
+                config.strategy,
+                stats.generated,
+            );
             stats.max_queued = stats.max_queued.max(queue.len());
         }
     }

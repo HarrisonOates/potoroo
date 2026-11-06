@@ -4,7 +4,7 @@ use potoroo::htn::{
     search,
     tdg::{Tdg, COST_CAP},
     validate, Action, Config, FlawSelection, Method, Outcome, Problem, SearchStrategy, Solution,
-    StopReason, Task,
+    StopReason, Task, TdgMode,
 };
 
 fn action(cost: u64, pre: &[usize], add: &[usize], delete: &[usize]) -> Action {
@@ -67,7 +67,7 @@ fn solved(outcome: Outcome) -> Solution {
     }
 }
 
-fn modes() -> impl Iterator<Item = (SearchStrategy, FlawSelection)> {
+fn modes() -> impl Iterator<Item = Config> {
     [
         SearchStrategy::BreadthFirst,
         SearchStrategy::AStar,
@@ -81,7 +81,19 @@ fn modes() -> impl Iterator<Item = (SearchStrategy, FlawSelection)> {
             FlawSelection::Systematic,
         ]
         .into_iter()
-        .map(move |flaws| (strategy, flaws))
+        .flat_map(move |flaws| {
+            [
+                TdgMode::Static,
+                TdgMode::Recompute,
+                TdgMode::Lazy,
+                TdgMode::LazyCached,
+            ]
+            .into_iter()
+            .map(move |tdg| Config {
+                tdg,
+                ..config(strategy, flaws)
+            })
+        })
     })
 }
 
@@ -364,11 +376,9 @@ fn compound_after_consumer_cannot_provide_support_and_empty_tasks_stay_required(
         &[],
         &[],
     );
-    for (strategy, flaws) in modes() {
+    for cfg in modes() {
         assert!(matches!(
-            search(&impossible, &config(strategy, flaws))
-                .unwrap()
-                .outcome,
+            search(&impossible, &cfg).unwrap().outcome,
             Outcome::NoSolution
         ));
     }
@@ -482,22 +492,93 @@ fn all_search_modes_match_an_independent_hierarchical_oracle() {
                         if initial { &[0] } else { &[] },
                         &[0],
                     );
-                    for (strategy, flaws) in modes() {
-                        let result = search(&p, &config(strategy, flaws)).unwrap();
+                    for cfg in modes() {
+                        let result = search(&p, &cfg).unwrap();
                         match (result.outcome, expected) {
                             (Outcome::NoSolution, None) => {},
                             (Outcome::Solved(s), Some(optimum)) => {
                                 assert_eq!(validate::validate(&p, &s.certificate).unwrap(), s.cost);
-                                if strategy == SearchStrategy::AStar {
+                                if cfg.strategy == SearchStrategy::AStar {
                                     assert!(s.cost_optimal);
                                     assert_eq!(s.cost, optimum);
                                 }
                             },
-                            (actual, expected) => panic!("code={code} left={ordered_left} root={ordered_root} init={initial} strategy={strategy:?} flaws={flaws:?}: {actual:?}, expected={expected:?}"),
+                            (actual, expected) => panic!("code={code} left={ordered_left} root={ordered_root} init={initial} config={cfg:?}: {actual:?}, expected={expected:?}"),
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn lazy_tdg_reranks_without_spending_node_budget_and_caches_equivalent_networks() {
+    // The root can supply p through an expensive alternative. Selecting either
+    // of two identical X branches removes that enabler: X then costs 8, exceeds
+    // u64, or is impossible. A direct cost-3 solution is already in OPEN.
+    // Both X entries must be repaired/pruned before expansion, without charging
+    // a new node for requeueing. Their distinct histories share a relaxed bound.
+    for expensive in [None, Some(4), Some(u64::MAX)] {
+        let mut methods = vec![
+            method(4, &[0], &[]),
+            method(5, &[4], &[]),
+            method(5, &[4], &[]),
+            method(5, &[1], &[]),
+            method(5, &[3, 0], &[]),
+        ];
+        if expensive.is_some() {
+            methods.push(method(4, &[2, 2], &[]));
+        }
+        let p = problem(
+            vec![
+                action(1, &[0], &[], &[]),
+                action(3, &[], &[], &[]),
+                action(expensive.unwrap_or(4), &[], &[], &[]),
+                action(50, &[], &[0], &[]),
+            ],
+            2,
+            methods,
+            &[],
+            &[],
+        );
+        for tdg in [TdgMode::Lazy, TdgMode::LazyCached] {
+            let result = search(
+                &p,
+                &Config {
+                    strategy: SearchStrategy::AStar,
+                    tdg,
+                    node_limit: Some(5),
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.stats.generated, 5);
+            assert_eq!(result.stats.expanded, 2);
+            assert_eq!(
+                result.stats.tdg_requeued,
+                if expensive == Some(4) { 2 } else { 0 }
+            );
+            assert_eq!(
+                result.stats.cost_bound_pruned,
+                if expensive == Some(u64::MAX) { 2 } else { 0 }
+            );
+            assert_eq!(
+                result.stats.tdg_pruned,
+                if expensive.is_none() { 2 } else { 0 }
+            );
+            assert_eq!(
+                result.stats.tdg_cache_hits,
+                usize::from(tdg == TdgMode::LazyCached)
+            );
+            assert_eq!(
+                result.stats.tdg_recomputed,
+                if tdg == TdgMode::LazyCached { 3 } else { 4 }
+            );
+            let solution = solved(result.outcome);
+            assert_eq!(solution.cost, 3);
+            assert!(solution.cost_optimal);
+            assert_eq!(validate::validate(&p, &solution.certificate).unwrap(), 3);
         }
     }
 }

@@ -53,6 +53,13 @@ fn grounded_cli_requires_no_external_tools() {
             assert_eq!(bounded.status.code(), Some(2));
         }
     }
+    for tdg in ["recompute", "lazy", "lazy-cached"] {
+        let recomputed = run(&["--grounded", "--search", "astar", "--tdg", tdg]);
+        assert!(recomputed.status.success());
+        assert_eq!(recomputed.stdout, solved.stdout);
+        // Root has only one method: only the initial TDG needs recomputation.
+        assert!(String::from_utf8_lossy(&recomputed.stderr).contains("tdg_recomputed=1"));
+    }
     assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
     let limited = run(&["--grounded", "--limit", "0"]);
     assert_eq!(limited.status.code(), Some(2));
@@ -70,11 +77,18 @@ fn panda_pipeline_certificate_verifies_against_original_hddl() {
         potoroo::htn::FlawSelection::Interleaved,
         potoroo::htn::FlawSelection::Systematic,
     ] {
-        verify_panda_certificate(flaws);
+        for tdg in [
+            potoroo::htn::TdgMode::Static,
+            potoroo::htn::TdgMode::Recompute,
+            potoroo::htn::TdgMode::Lazy,
+            potoroo::htn::TdgMode::LazyCached,
+        ] {
+            verify_panda_certificate(flaws, tdg);
+        }
     }
 }
 
-fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection) {
+fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection, tdg: potoroo::htn::TdgMode) {
     let (Some(parser), Some(grounder)) = (
         std::env::var_os("POTOROO_HTN_PARSER"),
         std::env::var_os("POTOROO_HTN_GROUNDER"),
@@ -107,6 +121,7 @@ fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection) {
             deadline,
             strategy: potoroo::htn::SearchStrategy::AStar,
             flaws,
+            tdg,
             ..Config::default()
         },
     )

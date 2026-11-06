@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use potoroo::htn::{pipeline, search, Config, FlawSelection, Outcome, SearchStrategy, StopReason};
+use potoroo::htn::{
+    pipeline, search, Config, FlawSelection, Outcome, SearchStrategy, StopReason, TdgMode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -34,6 +36,9 @@ struct Cli {
     /// Flaw policy; systematic commits support subtrees and uses last-achiever links.
     #[arg(long, value_enum, default_value_t = FlawSelection::default())]
     flaws: FlawSelection,
+    /// TDG evaluation; recompute eagerly or lazily after decomposition choices.
+    #[arg(long, value_enum, default_value_t = TdgMode::default())]
+    tdg: TdgMode,
     /// Generated-node limit, including the initial node.
     #[arg(short = 'l', long)]
     limit: Option<usize>,
@@ -108,12 +113,14 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             deadline,
             strategy: cli.search,
             flaws: cli.flaws,
+            tdg: cli.tdg,
         },
     )?;
-    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} elapsed={:.3}s",
+    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} tdg_recomputed={} tdg_requeued={} tdg_cache_hits={} elapsed={:.3}s",
         result.stats.generated, result.stats.expanded, result.stats.decompositions,
         result.stats.causal_links, result.stats.threat_orderings, result.stats.max_queued,
         result.stats.support_decompositions, result.stats.tdg_pruned, result.stats.cost_bound_pruned,
+        result.stats.tdg_recomputed, result.stats.tdg_requeued, result.stats.tdg_cache_hits,
         start.elapsed().as_secs_f64());
     match result.outcome {
         Outcome::Solved(solution) => {
