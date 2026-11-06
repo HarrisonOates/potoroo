@@ -3,8 +3,8 @@
 use potoroo::htn::{
     search,
     tdg::{Tdg, COST_CAP},
-    validate, Action, Config, FlawSelection, Method, Outcome, Problem, SearchStrategy, Solution,
-    StopReason, Task, TdgMode,
+    validate, AStarTieBreak, Action, Config, FlawSelection, Method, Outcome, Problem,
+    SearchStrategy, Solution, StopReason, Task, TdgMode,
 };
 
 fn action(cost: u64, pre: &[usize], add: &[usize], delete: &[usize]) -> Action {
@@ -89,12 +89,175 @@ fn modes() -> impl Iterator<Item = Config> {
                 TdgMode::LazyCached,
             ]
             .into_iter()
-            .map(move |tdg| Config {
-                tdg,
-                ..config(strategy, flaws)
+            .flat_map(move |tdg| {
+                [
+                    AStarTieBreak::Fifo,
+                    AStarTieBreak::LargerG,
+                    AStarTieBreak::Modification,
+                ]
+                .into_iter()
+                .filter(move |tie| strategy == SearchStrategy::AStar || *tie == AStarTieBreak::Fifo)
+                .map(move |astar_tie| Config {
+                    tdg,
+                    astar_tie,
+                    ..config(strategy, flaws)
+                })
             })
         })
     })
+}
+
+#[test]
+fn astar_secondary_guidance_shortens_equal_cost_plateaus() {
+    let p = problem(
+        vec![action(1, &[], &[], &[])],
+        2,
+        vec![
+            method(1, &[0], &[]),
+            method(2, &[1], &[]),
+            method(2, &[0], &[]),
+        ],
+        &[],
+        &[],
+    );
+    for tdg in [
+        TdgMode::Static,
+        TdgMode::Recompute,
+        TdgMode::Lazy,
+        TdgMode::LazyCached,
+    ] {
+        for astar_tie in [
+            AStarTieBreak::Fifo,
+            AStarTieBreak::LargerG,
+            AStarTieBreak::Modification,
+        ] {
+            let result = search(
+                &p,
+                &Config {
+                    strategy: SearchStrategy::AStar,
+                    astar_tie,
+                    tdg,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            let expanded = if astar_tie == AStarTieBreak::Fifo {
+                3
+            } else {
+                2
+            };
+            assert_eq!(result.stats.expanded, expanded);
+            assert_eq!(result.stats.max_f_plateau, expanded);
+            assert_eq!(result.stats.equal_f_expanded, expanded - 1);
+            let s = solved(result.outcome);
+            assert_eq!(s.cost, 1);
+            assert!(s.cost_optimal);
+        }
+    }
+}
+
+#[test]
+fn modification_guidance_keeps_action_cost_primary_and_other_queues_unchanged() {
+    let p = problem(
+        vec![action(1, &[], &[], &[]), action(9, &[], &[], &[])],
+        3,
+        vec![
+            method(2, &[0], &[]),
+            method(3, &[2], &[]),
+            method(4, &[3], &[]),
+            method(4, &[1], &[]),
+        ],
+        &[],
+        &[],
+    );
+    for strategy in [
+        SearchStrategy::BreadthFirst,
+        SearchStrategy::Greedy,
+        SearchStrategy::AStar,
+    ] {
+        let mut baseline = None;
+        for astar_tie in [
+            AStarTieBreak::Fifo,
+            AStarTieBreak::LargerG,
+            AStarTieBreak::Modification,
+        ] {
+            let result = search(
+                &p,
+                &Config {
+                    strategy,
+                    astar_tie,
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            let s = solved(result.outcome);
+            if strategy == SearchStrategy::AStar {
+                assert_eq!(s.cost, 1); // The cost-9 goal has zero remaining modification effort.
+                assert!(s.cost_optimal);
+            } else {
+                let signature = (
+                    result.stats.generated,
+                    result.stats.expanded,
+                    s.certificate.to_panda(&p).unwrap(),
+                );
+                assert_eq!(result.stats.max_f_plateau, 0);
+                assert_eq!(result.stats.equal_f_expanded, 0);
+                if let Some(expected) = &baseline {
+                    assert_eq!(&signature, expected);
+                } else {
+                    baseline = Some(signature);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn modification_ties_can_starve_an_exit_within_one_recursive_cost_plateau() {
+    // Every action-cost f is zero. The empty method makes root's static
+    // modification estimate cheap, but cannot achieve the goal. Repeatedly
+    // choosing root -> root therefore outranks the longer executable exit.
+    // FIFO eventually takes that exit; secondary guidance need not be fair.
+    let p = problem(
+        vec![action(0, &[], &[0], &[])],
+        4,
+        vec![
+            method(1, &[0], &[]),
+            method(2, &[1], &[]),
+            method(3, &[2], &[]),
+            method(4, &[4], &[]),
+            method(4, &[], &[]),
+            method(4, &[3], &[]),
+        ],
+        &[],
+        &[0],
+    );
+    for astar_tie in [
+        AStarTieBreak::Fifo,
+        AStarTieBreak::LargerG,
+        AStarTieBreak::Modification,
+    ] {
+        let result = search(
+            &p,
+            &Config {
+                strategy: SearchStrategy::AStar,
+                astar_tie,
+                node_limit: Some(100),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        if astar_tie == AStarTieBreak::Modification {
+            assert!(matches!(
+                result.outcome,
+                Outcome::Stopped(StopReason::NodeLimit)
+            ));
+        } else {
+            let s = solved(result.outcome);
+            assert_eq!(s.cost, 0);
+            assert!(s.cost_optimal);
+        }
+    }
 }
 
 #[test]
@@ -542,12 +705,24 @@ fn lazy_tdg_reranks_without_spending_node_budget_and_caches_equivalent_networks(
             &[],
             &[],
         );
-        for tdg in [TdgMode::Lazy, TdgMode::LazyCached] {
+        for (tdg, astar_tie) in [TdgMode::Lazy, TdgMode::LazyCached]
+            .into_iter()
+            .flat_map(|tdg| {
+                [
+                    AStarTieBreak::Fifo,
+                    AStarTieBreak::LargerG,
+                    AStarTieBreak::Modification,
+                ]
+                .into_iter()
+                .map(move |tie| (tdg, tie))
+            })
+        {
             let result = search(
                 &p,
                 &Config {
                     strategy: SearchStrategy::AStar,
                     tdg,
+                    astar_tie,
                     node_limit: Some(5),
                     ..Config::default()
                 },

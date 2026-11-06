@@ -54,12 +54,26 @@ fn grounded_cli_requires_no_external_tools() {
         }
     }
     for tdg in ["recompute", "lazy", "lazy-cached"] {
-        let recomputed = run(&["--grounded", "--search", "astar", "--tdg", tdg]);
-        assert!(recomputed.status.success());
-        assert_eq!(recomputed.stdout, solved.stdout);
-        // Root has only one method: only the initial TDG needs recomputation.
-        assert!(String::from_utf8_lossy(&recomputed.stderr).contains("tdg_recomputed=1"));
+        for tie in ["fifo", "larger-g", "modification"] {
+            let recomputed = run(&[
+                "--grounded",
+                "--search",
+                "astar",
+                "--tdg",
+                tdg,
+                "--astar-tie",
+                tie,
+            ]);
+            assert!(recomputed.status.success());
+            assert_eq!(recomputed.stdout, solved.stdout);
+            // Root has only one method: only the initial TDG needs recomputation.
+            assert!(String::from_utf8_lossy(&recomputed.stderr).contains("tdg_recomputed=1"));
+            assert!(String::from_utf8_lossy(&recomputed.stderr).contains("max_f_plateau=2"));
+        }
     }
+    assert!(!run(&["--grounded", "--astar-tie", "unknown"])
+        .status
+        .success());
     assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
     let limited = run(&["--grounded", "--limit", "0"]);
     assert_eq!(limited.status.code(), Some(2));
@@ -83,12 +97,22 @@ fn panda_pipeline_certificate_verifies_against_original_hddl() {
             potoroo::htn::TdgMode::Lazy,
             potoroo::htn::TdgMode::LazyCached,
         ] {
-            verify_panda_certificate(flaws, tdg);
+            for astar_tie in [
+                potoroo::htn::AStarTieBreak::Fifo,
+                potoroo::htn::AStarTieBreak::LargerG,
+                potoroo::htn::AStarTieBreak::Modification,
+            ] {
+                verify_panda_certificate(flaws, tdg, astar_tie);
+            }
         }
     }
 }
 
-fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection, tdg: potoroo::htn::TdgMode) {
+fn verify_panda_certificate(
+    flaws: potoroo::htn::FlawSelection,
+    tdg: potoroo::htn::TdgMode,
+    astar_tie: potoroo::htn::AStarTieBreak,
+) {
     let (Some(parser), Some(grounder)) = (
         std::env::var_os("POTOROO_HTN_PARSER"),
         std::env::var_os("POTOROO_HTN_GROUNDER"),
@@ -122,6 +146,7 @@ fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection, tdg: potoroo::ht
             strategy: potoroo::htn::SearchStrategy::AStar,
             flaws,
             tdg,
+            astar_tie,
             ..Config::default()
         },
     )

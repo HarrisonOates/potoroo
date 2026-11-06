@@ -7,6 +7,7 @@
 //! frontend. Native conditional effects are rejected by the reader.
 pub mod input;
 pub mod model;
+pub mod modification;
 pub mod pipeline;
 pub mod plan;
 pub mod refine;
@@ -19,8 +20,10 @@ pub mod validate;
 mod systematic_tests;
 
 pub use model::{Action, Method, Problem, Task};
+pub use modification::ModificationTdg;
 pub use refine::FlawSelection;
 pub use search::{
-    search, Config, Outcome, SearchResult, SearchStrategy, Solution, Stats, StopReason,
+    search, AStarTieBreak, Config, Outcome, SearchResult, SearchStrategy, Solution, Stats,
+    StopReason,
 };
 pub use tdg::TdgMode;

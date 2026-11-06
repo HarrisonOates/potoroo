@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::model::Problem;
+use super::modification::ModificationTdg;
 use super::plan::Plan;
 use super::refine::{self, FlawSelection, Refinement};
 use super::tdg::{Recompute, Tdg, TdgMode, COST_CAP};
@@ -26,6 +27,19 @@ pub enum SearchStrategy {
     Greedy,
 }
 
+/// Secondary ordering within an equal action-cost f-value. None of these
+/// policies changes the cost bound or resolves infinite recursive plateaus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AStarTieBreak {
+    /// Preserve insertion order.
+    #[default]
+    Fifo,
+    /// Prefer greater committed primitive cost (equivalently, smaller h).
+    LargerG,
+    /// Prefer fewer estimated remaining decompositions and causal links.
+    Modification,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     /// Maximum generated nodes, including the initial node.
@@ -36,6 +50,8 @@ pub struct Config {
     pub strategy: SearchStrategy,
     pub flaws: FlawSelection,
     pub tdg: TdgMode,
+    /// Only affects A*. Other strategies ignore this setting.
+    pub astar_tie: AStarTieBreak,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +77,10 @@ pub struct Stats {
     pub tdg_cache_hits: usize,
     pub cost_bound_pruned: usize,
     pub max_queued: usize,
+    /// A* expansions with the same f as the preceding expansion; excludes requeues.
+    pub equal_f_expanded: usize,
+    /// Largest consecutive run of A* expansions with the same f, including goals.
+    pub max_f_plateau: usize,
 }
 
 #[derive(Debug)]
@@ -125,8 +145,8 @@ struct Node {
 }
 
 struct Queued {
-    // Increasing serial number gives FIFO tie-breaking on equal priorities.
-    key: (u128, usize),
+    // Action-cost priority, secondary guidance, then stable FIFO ties.
+    key: (u128, u128, usize),
     node: Node,
 }
 impl PartialEq for Queued {
@@ -151,7 +171,7 @@ enum Frontier {
     Guided(BinaryHeap<Queued>),
 }
 impl Frontier {
-    fn push(&mut self, node: Node, strategy: SearchStrategy, serial: usize) {
+    fn push(&mut self, node: Node, strategy: SearchStrategy, secondary: u128, serial: usize) {
         match self {
             Self::Fifo(q) => q.push_back(node),
             Self::Guided(q) => {
@@ -161,16 +181,16 @@ impl Frontier {
                     node.h
                 };
                 q.push(Queued {
-                    key: (score, serial),
+                    key: (score, secondary, serial),
                     node,
                 });
             }
         }
     }
-    fn pop(&mut self) -> Option<(Node, usize)> {
+    fn pop(&mut self) -> Option<(Node, u128, usize)> {
         match self {
-            Self::Fifo(q) => q.pop_front().map(|node| (node, 0)),
-            Self::Guided(q) => q.pop().map(|entry| (entry.node, entry.key.1)),
+            Self::Fifo(q) => q.pop_front().map(|node| (node, 0, 0)),
+            Self::Guided(q) => q.pop().map(|entry| (entry.node, entry.key.1, entry.key.2)),
         }
     }
     fn len(&self) -> usize {
@@ -208,6 +228,22 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
         || config.tdg != TdgMode::Static
     {
         let Some(graph) = Tdg::with_deadline(problem, config.deadline) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        Some(graph)
+    } else {
+        None
+    };
+    let astar_tie = if config.strategy == SearchStrategy::AStar {
+        config.astar_tie
+    } else {
+        AStarTieBreak::Fifo
+    };
+    let modification = if astar_tie == AStarTieBreak::Modification {
+        let Some(graph) = ModificationTdg::with_deadline(problem, config.deadline) else {
             return Ok(SearchResult {
                 outcome: Outcome::Stopped(StopReason::Deadline),
                 stats,
@@ -266,6 +302,15 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     if initial.cost() as u128 + h >= COST_CAP {
         return Err("HTN plan cost overflow: TDG lower bound exceeds u64".into());
     }
+    let secondary = match astar_tie {
+        AStarTieBreak::Fifo => 0,
+        AStarTieBreak::LargerG => (u64::MAX - initial.cost()) as u128,
+        AStarTieBreak::Modification => modification
+            .as_ref()
+            .unwrap()
+            .remaining_effort(problem, &initial)
+            .unwrap_or(u128::MAX),
+    };
     queue.push(
         Node {
             plan: initial,
@@ -273,12 +318,15 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             pending_tdg: false,
         },
         config.strategy,
+        secondary,
         0,
     );
     stats.max_queued = 1;
     let mut depth_cut = false;
     let mut cost_cut = false;
-    while let Some((mut node, serial)) = queue.pop() {
+    let mut last_f = None;
+    let mut f_run = 0;
+    while let Some((mut node, secondary, serial)) = queue.pop() {
         if expired() {
             return Ok(SearchResult {
                 outcome: Outcome::Stopped(StopReason::Deadline),
@@ -316,13 +364,24 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             // BFS does not order by h and must not lose its refinement-depth order.
             if node.h > previous && config.strategy != SearchStrategy::BreadthFirst {
                 stats.tdg_requeued += 1;
-                queue.push(node, config.strategy, serial);
+                queue.push(node, config.strategy, secondary, serial);
                 continue;
             }
         }
         let Node {
             plan, h: parent_h, ..
         } = node;
+        if config.strategy == SearchStrategy::AStar {
+            let f = plan.cost() as u128 + parent_h;
+            if last_f == Some(f) {
+                stats.equal_f_expanded += 1;
+                f_run += 1;
+            } else {
+                last_f = Some(f);
+                f_run = 1;
+            }
+            stats.max_f_plateau = stats.max_f_plateau.max(f_run);
+        }
         stats.expanded += 1;
         if plan.compound(problem).is_none()
             && plan.open.is_none()
@@ -452,6 +511,14 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 continue;
             }
             stats.generated += 1;
+            let child_secondary = match astar_tie {
+                AStarTieBreak::Fifo => 0,
+                AStarTieBreak::LargerG => (u64::MAX - child.cost()) as u128,
+                AStarTieBreak::Modification => modification
+                    .as_ref()
+                    .unwrap()
+                    .after_refinement(problem, &child, refinement, secondary),
+            };
             match refinement {
                 Refinement::Decompose { for_support, .. } => {
                     stats.decompositions += 1;
@@ -467,6 +534,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                     pending_tdg,
                 },
                 config.strategy,
+                child_secondary,
                 stats.generated,
             );
             stats.max_queued = stats.max_queued.max(queue.len());
