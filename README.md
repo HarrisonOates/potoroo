@@ -234,19 +234,53 @@ format produced by [pandaPIparser](https://github.com/panda-planner-dev/pandaPIp
 search decision. Grounded PANDA `.sas` is a different format from Fast Downward
 SAS+. No additional Cargo dependencies are needed.
 
-This first increment supports ground STRIPS actions with nonnegative integer
+The HTN backend supports ground STRIPS actions with nonnegative integer
 costs, partially ordered methods, repeated task occurrences, recursive methods,
 and empty methods. Negative preconditions and method preconditions use the
 frontend's compiled facts and check actions. Native conditional effects and
 nonempty additional mutex/invariant sections are rejected explicitly.
 
-Search is breadth-first over refinement depth: it first decomposes compound
-tasks, then resolves primitive open conditions and causal threats. Every
-primitive occurrence must belong to the hierarchy; arbitrary action insertion
-is disallowed. The search is satisficing, not cost-optimal. Recursive unsolvable
-problems can run indefinitely without a limit. `--limit N`, `--max-depth N`, and
-`--time-limit SECONDS` report incomplete termination distinctly from exhausted
-search; limits exit with status 2, input/internal errors with status 1.
+Every primitive occurrence must belong to the hierarchy; arbitrary action
+insertion is disallowed. Queue policy and flaw selection are independent:
+
+| Option | Behaviour |
+| --- | --- |
+| `--search bfs` (default) | Breadth-first over refinement depth; satisficing. |
+| `--search astar` | TDG A*: committed primitive cost plus a lower bound on remaining cost. |
+| `--search gbfs` | Greedy search on the TDG remaining-cost bound; satisficing. |
+| `--flaws decomposition-first` (default) | Expand all compounds before resolving causal flaws. |
+| `--flaws interleaved` | Resolve threats first, then the open condition with fewest possible refinements; expand remaining compounds when no causal flaws remain. |
+
+```bash
+./target/release/potoroo-htn --flaws interleaved --search astar --time-limit 30 \
+  examples/htn/interleave-domain.hddl examples/htn/interleave-problem.hddl
+```
+
+Interleaved search considers both existing primitive supporters and methods
+that could introduce a future supporter. It uses conservative descendant-effect
+reachability to identify those methods, retains the open condition until a
+primitive can support it, and checks for new threats after decomposition.
+Compound tasks do not directly supply causal links.
+
+The task-decomposition graph (TDG) gives primitive tasks their action costs,
+methods the sum of their children's costs **with occurrence multiplicity**,
+and compound tasks the minimum over their methods. Empty methods cost zero.
+A nonnegative AND/OR traversal handles recursive exits and proves tasks with no
+finite decomposition dead. The node bound sums only active compound occurrences;
+active primitive occurrences are already charged to the committed cost. This
+relaxation ignores preconditions, deletes, and ordering. Bounds saturate above
+`u64::MAX` separately from unproductive tasks; overflow cannot become a false
+unsolvability result. TDG preprocessing runs only for interleaved or guided
+search, leaving the default baseline independent of the relaxation.
+
+`cost_optimal=true` means A* returned a minimum-cost solution without dropping
+branches at a depth bound. Equal priorities use FIFO ties, but A*/GBFS can still
+starve solutions behind infinite recursive plateaus of lower priority.
+Breadth-first remains fair for finite solutions; recursive unsolvable problems
+can run indefinitely. `--limit N`, `--max-depth N`, and `--time-limit SECONDS`
+report incomplete termination distinctly from exhausted search; limits exit
+with status 2, input/internal errors with status 1. The time limit includes TDG
+preprocessing. A depth cutoff disables the optimality claim for any later solution.
 
 Successful output is a grounded PANDA decomposition certificate on stdout;
 statistics and primitive cost go to stderr. Generated guard and noop occurrences
@@ -261,12 +295,60 @@ HDDL as well:
 "$POTOROO_HTN_PARSER" --verify=0 --no-colour domain.hddl problem.hddl plan.converted
 ```
 
-Run `cargo test --features htn --test htn --test htn_pipeline` for semantic and
-CLI checks. These include an independent exhaustive oracle over 1,024 small
-task networks. Setting both external tool environment variables also enables a
-Malleefowl/parser integration test with original-HDDL certificate verification.
-Interleaved flaw selection, TDG heuristics, and abstract-task causal-link
-inheritance are subsequent increments.
+Run `cargo test --features htn --test htn --test htn_guidance --test htn_pipeline`
+for semantic and CLI checks. Independent exhaustive oracles cover 1,024 fixed
+task networks and 512 hierarchical problems with alternative methods; the latter
+checks all six queue/flaw combinations and A* cost optimality. Setting both
+external tool environment variables also enables a Malleefowl/parser integration
+test of interleaved A* with original-HDDL certificate verification.
+
+The modules separate immutable schemas (`model`), persistent partial plans
+(`plan`), flaw selection/refinements (`refine`), static hierarchy analysis (`tdg`),
+queue policies (`search`), and independent certificate checking (`validate`).
+All are behind the `htn` feature; flat nodes and search dispatch remain separate.
+This is still a strict HTN backend, not a full hybrid PANDA-3 replacement.
+
+### HTN research coverage and next increments
+
+Literature review updated **2026-11-06**. The algorithm and applicability review
+below guides implementation; it is not a claim of exhaustive coverage or planner
+parity. [PANDA's overview](https://panda-planner-dev.github.io/) distinguishes its
+POCL backend from progression, SAT, and BDD planners. Our immediate comparison
+target is PANDA's decomposition-based POCL search. Techniques evaluated with
+progression or totally ordered networks need a separate justification here.
+
+| Work reviewed | Consequence for this backend |
+| --- | --- |
+| [Hybrid Planning Heuristics Based on Task Decomposition Graphs (SoCS 2014)](https://ojs.aaai.org/index.php/SOCS/article/view/18323) | Basis for interleaving decomposition and causal refinement. Abstract interfaces and causal-link inheritance remain absent; possible descendant effects are only used to enumerate refinements. |
+| [An Admissible HTN Planning Heuristic (IJCAI 2017)](https://www.uni-ulm.de/fileadmin/website_uni_ulm/iui.inst.090/Publikationen/2017/Bercher17AdmissibleHTNHeuristic.pdf) | The static structural cost recurrence is implemented. Modification-effort guidance, delete-relaxed reachability pruning, and node-specific TDG recomputation remain to be added. Current search does not reproduce the full published heuristic suite. |
+| [Classical heuristic guidance (IJCAI 2019)](https://www.uni-ulm.de/fileadmin/website_uni_ulm/iui.inst.090/Publikationen/2019/Hoeller2019ProgressionHeuristics.pdf) and [delete- and ordering-relaxation (IJCAI 2020)](https://ijcai.org/proceedings/2020/564) | Investigate relaxed-composition and LP/ILP alternatives after the TDG baselines. A POCL adaptation must account for committed occurrences, causal commitments, and repeated mandatory tasks. |
+| [Landmark Generation in HTN Planning (AAAI 2021)](https://ojs.aaai.org/index.php/AAAI/article/view/17405) and [Landmark Generation in HTN Planning Revisited (ICAPS 2025)](https://ojs.aaai.org/index.php/ICAPS/article/view/36123) | Bidirectional landmark extraction is a promising next heuristic. Design occurrence-aware progress tracking for partial plans; a raw landmark count is not automatically an admissible cost bound. |
+| [Inevitable task refinements (SoCS 2023)](https://ojs.aaai.org/index.php/SOCS/article/download/27284/27057/31328) and [optimal total-order ILP guidance (ECAI 2024)](https://journals.sagepub.com/doi/pdf/10.3233/FAIA241005) | Reviewed summary-based pruning and heuristic construction. Their total-order assumptions need explicit guards; arbitrary POCL frontiers do not supply a single progression state. |
+| [How Good is Perfect? On the Incompleteness of A* for Total-Order HTN Planning (ICAPS 2025)](https://yousefi.ai/static/papers/Yousefi2025Incompleteness.pdf) | Zero-cost recursion can defeat A*, including graph search. Keep fairness tests and distinguish conditional cost optimality from completeness. The paper's total-order transformation is not a ready-made partial-order preprocessing rule. |
+| [Learning Heuristic Functions for HTN Planning (AAAI 2026)](https://nsp.cs.uni-saarland.de/papers/HoellerAAAI26.pdf) | Reviewed representation and evaluation: learned lifted guidance is interesting, but its total-order evaluation does not establish gains for this ground POCL backend. Keep learning optional after reproducible symbolic baselines. |
+
+Additional screening, with no implementation claim: [PANDA loop detection
+(2021)](https://ojs.aaai.org/index.php/ICAPS/article/view/15959),
+[redundant PO decompositions (HPlan 2024)](https://icaps24.icaps-conference.org/program/workshops/hplan/HPlan2024_paper_9.pdf),
+[LLM-generated heuristics (May 2026 preprint)](https://arxiv.org/abs/2605.07707),
+[hierarchy-preserving deordering (September 2026 preprint)](https://arxiv.org/abs/2609.03912),
+and [risk-aware HTN planning (2026)](https://link.springer.com/article/10.1007/s10489-026-07450-4).
+These warrant further algorithm review before adoption. Stochastic objectives
+and learned domain-specific guidance are separate extensions.
+
+Planned order: modification-effort guidance; restricted reachability and cached
+node-specific TDG updates; bidirectional landmarks and sound duplicate detection;
+then RC/LP alternatives and explicit hybrid interfaces. Duplicate keys must
+respect occurrence multiplicity, ordering, open conditions, and causal links,
+while retaining a certificate witness. Abstract effects cannot simply be inferred
+from the union of descendant effects and used as causal supporters.
+
+Before promoting a configuration, compare pinned PANDA baselines on IPC partial-
+and total-order problems, verify certificates against original HDDL, and report
+coverage, primitive cost, grounding/preprocessing/search time, and peak memory.
+Ablate each heuristic and pruning rule. Small exhaustive tests establish semantic
+coverage, not competitive performance. Continue matched feature-on/off flat
+benchmarks; HTN analysis and per-node data stay within the optional backend.
 
 ## References
 

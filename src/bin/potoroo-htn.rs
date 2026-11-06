@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use potoroo::htn::{pipeline, search, Config, Outcome, StopReason};
+use potoroo::htn::{pipeline, search, Config, FlawSelection, Outcome, SearchStrategy, StopReason};
 
 #[derive(Parser)]
 #[command(
@@ -28,6 +28,12 @@ struct Cli {
     /// Malleefowl executable (default POTOROO_MALLEEFOWL or malleefowl).
     #[arg(long)]
     grounder: Option<PathBuf>,
+    /// Queue policy; astar/gbfs use the TDG primitive-cost bound.
+    #[arg(long, value_enum, default_value = "bfs")]
+    search: SearchStrategy,
+    /// Interleave causal support and decomposition, or use the original baseline.
+    #[arg(long, value_enum, default_value = "decomposition-first")]
+    flaws: FlawSelection,
     /// Generated-node limit, including the initial node.
     #[arg(short = 'l', long)]
     limit: Option<usize>,
@@ -100,20 +106,24 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             node_limit: cli.limit,
             max_depth: cli.max_depth,
             deadline,
+            strategy: cli.search,
+            flaws: cli.flaws,
         },
     )?;
-    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} elapsed={:.3}s",
+    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} elapsed={:.3}s",
         result.stats.generated, result.stats.expanded, result.stats.decompositions,
         result.stats.causal_links, result.stats.threat_orderings, result.stats.max_queued,
+        result.stats.support_decompositions, result.stats.tdg_pruned, result.stats.cost_bound_pruned,
         start.elapsed().as_secs_f64());
     match result.outcome {
         Outcome::Solved(solution) => {
             print!("{}", solution.certificate.to_panda(&problem)?);
             eprintln!(
-                "HTN: primitive_occurrences={} cost={} refinement_depth={}",
+                "HTN: primitive_occurrences={} cost={} refinement_depth={} cost_optimal={}",
                 solution.certificate.steps.len(),
                 solution.cost,
-                solution.plan.refinement_depth()
+                solution.plan.refinement_depth(),
+                solution.cost_optimal
             );
             Ok(ExitCode::SUCCESS)
         }

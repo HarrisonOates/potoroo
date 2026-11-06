@@ -31,6 +31,29 @@ fn grounded_cli_requires_no_external_tools() {
         String::from_utf8_lossy(&solved.stderr)
     );
     assert!(String::from_utf8_lossy(&solved.stdout).contains("==>\nroot 1\n1 root[] -> empty\n<=="));
+    for strategy in ["bfs", "astar", "gbfs"] {
+        for flaws in ["decomposition-first", "interleaved"] {
+            let output = run(&["--grounded", "--search", strategy, "--flaws", flaws]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = format!("cost_optimal={}", strategy == "astar");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&expected));
+            let bounded = run(&[
+                "--grounded",
+                "--search",
+                strategy,
+                "--flaws",
+                flaws,
+                "--max-depth",
+                "0",
+            ]);
+            assert_eq!(bounded.status.code(), Some(2));
+        }
+    }
+    assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
     let limited = run(&["--grounded", "--limit", "0"]);
     assert_eq!(limited.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&limited.stdout).contains("node limit"));
@@ -73,6 +96,8 @@ fn malleefowl_pipeline_certificate_verifies_against_original_hddl() {
         &Config {
             node_limit: Some(10_000),
             deadline,
+            strategy: potoroo::htn::SearchStrategy::AStar,
+            flaws: potoroo::htn::FlawSelection::Interleaved,
             ..Config::default()
         },
     )
