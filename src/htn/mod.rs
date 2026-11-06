@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod refine;
 pub mod search;
+mod support;
 pub mod tdg;
 mod tdg_cache;
 mod unit_cycles;

@@ -97,10 +97,13 @@ fn modes() -> impl Iterator<Item = Config> {
                 ]
                 .into_iter()
                 .filter(move |tie| strategy == SearchStrategy::AStar || *tie == AStarTieBreak::Fifo)
-                .map(move |astar_tie| Config {
-                    tdg,
-                    astar_tie,
-                    ..config(strategy, flaws)
+                .flat_map(move |astar_tie| {
+                    [false, true].into_iter().map(move |support_bound| Config {
+                        tdg,
+                        astar_tie,
+                        support_bound,
+                        ..config(strategy, flaws)
+                    })
                 })
             })
         })
@@ -456,6 +459,91 @@ fn unit_cycle_pruning_preserves_empty_exits_and_does_not_prune_growing_cycles() 
         Outcome::Stopped(StopReason::NodeLimit)
     ));
     assert_eq!(result.stats.unit_cycles_pruned, 0);
+    // Necessary support raises that lower-cost plateau without deleting any
+    // decomposition histories. All modes can now take the cost-1 exit.
+    for mut cfg in modes().filter(|cfg| cfg.support_bound) {
+        cfg.node_limit = Some(100);
+        let s = solved(search(&growing, &cfg).unwrap().outcome);
+        assert_eq!(s.cost, 1);
+        assert_eq!(s.cost_optimal, cfg.strategy == SearchStrategy::AStar);
+    }
+}
+
+#[test]
+fn support_bounds_do_not_charge_shared_achievers_twice() {
+    // Both goals can share the cost-4 action. Adding their individual cost
+    // increments would incorrectly prefer the shallow cost-7 alternative.
+    let p = problem(
+        vec![action(7, &[], &[0, 1], &[]), action(4, &[], &[0, 1], &[])],
+        2,
+        vec![
+            method(2, &[], &[]),
+            method(2, &[1], &[]),
+            method(3, &[2], &[]),
+            method(3, &[0], &[]),
+        ],
+        &[],
+        &[0, 1],
+    );
+    for cfg in modes().filter(|cfg| cfg.support_bound && cfg.strategy == SearchStrategy::AStar) {
+        let result = search(&p, &cfg).unwrap();
+        assert!(result.stats.support_tables > 0);
+        let s = solved(result.outcome);
+        assert_eq!(s.cost, 4);
+        assert!(s.cost_optimal);
+    }
+}
+
+#[test]
+fn support_bounds_can_still_have_recursive_plateaus_for_joint_requirements() {
+    // One required achiever costs 1, but an executable solution needs both
+    // actions. A -> A,A can still grow forever below the true cost of 2.
+    let p = problem(
+        vec![action(1, &[], &[0], &[]), action(1, &[0], &[1], &[])],
+        1,
+        vec![
+            method(2, &[2, 2], &[]),
+            method(2, &[], &[]),
+            method(2, &[0], &[]),
+            method(2, &[1], &[]),
+        ],
+        &[],
+        &[1],
+    );
+    for astar_tie in [
+        AStarTieBreak::Fifo,
+        AStarTieBreak::LargerG,
+        AStarTieBreak::Modification,
+    ] {
+        let result = search(
+            &p,
+            &Config {
+                strategy: SearchStrategy::AStar,
+                support_bound: true,
+                astar_tie,
+                node_limit: Some(100),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            Outcome::Stopped(StopReason::NodeLimit)
+        ));
+    }
+    let s = solved(
+        search(
+            &p,
+            &Config {
+                support_bound: true,
+                node_limit: Some(1000),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+        .outcome,
+    );
+    assert_eq!(s.cost, 2);
 }
 
 #[test]

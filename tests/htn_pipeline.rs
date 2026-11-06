@@ -83,6 +83,10 @@ fn grounded_cli_requires_no_external_tools() {
     assert!(!run(&["--grounded", "--unit-cycles", "unknown"])
         .status
         .success());
+    let support = run(&["--grounded", "--support-bound"]);
+    assert!(support.status.success());
+    assert_eq!(support.stdout, solved.stdout);
+    assert!(String::from_utf8_lossy(&support.stderr).contains("support_evaluated=2"));
     assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
     let limited = run(&["--grounded", "--limit", "0"]);
     assert_eq!(limited.status.code(), Some(2));
@@ -111,7 +115,9 @@ fn panda_pipeline_certificate_verifies_against_original_hddl() {
                 potoroo::htn::AStarTieBreak::LargerG,
                 potoroo::htn::AStarTieBreak::Modification,
             ] {
-                verify_panda_certificate(flaws, tdg, astar_tie);
+                for support_bound in [false, true] {
+                    verify_panda_certificate(flaws, tdg, astar_tie, support_bound);
+                }
             }
         }
     }
@@ -121,6 +127,7 @@ fn verify_panda_certificate(
     flaws: potoroo::htn::FlawSelection,
     tdg: potoroo::htn::TdgMode,
     astar_tie: potoroo::htn::AStarTieBreak,
+    support_bound: bool,
 ) {
     let (Some(parser), Some(grounder)) = (
         std::env::var_os("POTOROO_HTN_PARSER"),
@@ -156,6 +163,7 @@ fn verify_panda_certificate(
             flaws,
             tdg,
             astar_tie,
+            support_bound,
             ..Config::default()
         },
     )

@@ -9,6 +9,7 @@ use super::model::Problem;
 use super::modification::ModificationTdg;
 use super::plan::Plan;
 use super::refine::{self, FlawSelection, Refinement};
+use super::support::SupportBound;
 use super::tdg::{Recompute, Tdg, TdgMode, COST_CAP};
 use super::tdg_cache::BoundCache;
 use super::unit_cycles::{UnitCyclePolicy, UnitCyclePruner};
@@ -55,6 +56,8 @@ pub struct Config {
     pub astar_tie: AStarTieBreak,
     /// Optional reduction of decomposition histories; preserves primitive plans.
     pub unit_cycles: UnitCyclePolicy,
+    /// Strengthen the TDG cost bound with necessary future causal supporters.
+    pub support_bound: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +84,12 @@ pub struct Stats {
     pub cost_bound_pruned: usize,
     /// Unary cycle-closing refinements discarded before allocating a child.
     pub unit_cycles_pruned: usize,
+    pub support_evaluated: usize,
+    /// Distinct fact tables computed, including recomputations after eviction.
+    pub support_tables: usize,
+    pub support_cache_hits: usize,
+    /// Partial plans with no eligible current or future causal supporter.
+    pub support_pruned: usize,
     pub max_queued: usize,
     /// A* expansions with the same f as the preceding expansion; excludes requeues.
     pub equal_f_expanded: usize,
@@ -231,6 +240,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     let tdg = if config.flaws != FlawSelection::DecompositionFirst
         || config.strategy != SearchStrategy::BreadthFirst
         || config.tdg != TdgMode::Static
+        || config.support_bound
     {
         let Some(graph) = Tdg::with_deadline(problem, config.deadline) else {
             return Ok(SearchResult {
@@ -272,6 +282,17 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     } else {
         None
     };
+    let mut support = if config.support_bound {
+        let Some(index) = SupportBound::new(problem, tdg.as_ref().unwrap(), config.deadline) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        Some(index)
+    } else {
+        None
+    };
     let unit_cycles = if config.unit_cycles == UnitCyclePolicy::Prune {
         let Some(index) = UnitCyclePruner::new(problem, config.deadline) else {
             return Ok(SearchResult {
@@ -308,13 +329,36 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
         tdg.as_ref()
             .map_or(Some(0), |g| g.remaining_cost(problem, &initial))
     };
-    let Some(h) = h else {
+    let Some(mut h) = h else {
         stats.tdg_pruned += 1;
         return Ok(SearchResult {
             outcome: Outcome::NoSolution,
             stats,
         });
     };
+    if let Some(index) = &mut support {
+        let Some(bound) = index.remaining_cost(
+            problem,
+            &initial,
+            tdg.as_ref().unwrap(),
+            config.deadline,
+            &mut stats,
+        ) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        let Some(bound) = bound else {
+            stats.support_pruned += 1;
+            return Ok(SearchResult {
+                outcome: Outcome::NoSolution,
+                stats,
+            });
+        };
+        // Both bounds charge the same future primitives. Sum would double-count.
+        h = h.max(bound);
+    }
     if initial.cost() as u128 + h >= COST_CAP {
         return Err("HTN plan cost overflow: TDG lower bound exceeds u64".into());
     }
@@ -489,7 +533,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 });
             }
             let mut pending_tdg = false;
-            let h = if let Refinement::Decompose { parent, .. } = refinement {
+            let mut h = if let Refinement::Decompose { parent, .. } = refinement {
                 if let Some(index) = &mut recompute {
                     if problem.methods_by_task[parent.task].len() == 1 {
                         // The only method preserves the set of descendant actions.
@@ -535,9 +579,29 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                     })
                 }
             } else {
-                // Links and ordering constraints do not change active tasks.
+                // Retain the parent's lower bound; support/order refinements
+                // cannot reduce the cost of completing this partial plan.
                 parent_h
             };
+            if let Some(index) = &mut support {
+                let Some(bound) = index.remaining_cost(
+                    problem,
+                    &child,
+                    tdg.as_ref().unwrap(),
+                    config.deadline,
+                    &mut stats,
+                ) else {
+                    return Ok(SearchResult {
+                        outcome: Outcome::Stopped(StopReason::Deadline),
+                        stats,
+                    });
+                };
+                let Some(bound) = bound else {
+                    stats.support_pruned += 1;
+                    continue;
+                };
+                h = h.max(bound);
+            }
             if child.cost() as u128 + h >= COST_CAP {
                 stats.cost_bound_pruned += 1;
                 cost_cut = true;
