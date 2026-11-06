@@ -11,6 +11,7 @@ use super::plan::Plan;
 use super::refine::{self, FlawSelection, Refinement};
 use super::tdg::{Recompute, Tdg, TdgMode, COST_CAP};
 use super::tdg_cache::BoundCache;
+use super::unit_cycles::{UnitCyclePolicy, UnitCyclePruner};
 use super::validate::{self, Certificate};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -52,6 +53,8 @@ pub struct Config {
     pub tdg: TdgMode,
     /// Only affects A*. Other strategies ignore this setting.
     pub astar_tie: AStarTieBreak,
+    /// Optional reduction of decomposition histories; preserves primitive plans.
+    pub unit_cycles: UnitCyclePolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +79,8 @@ pub struct Stats {
     pub tdg_requeued: usize,
     pub tdg_cache_hits: usize,
     pub cost_bound_pruned: usize,
+    /// Unary cycle-closing refinements discarded before allocating a child.
+    pub unit_cycles_pruned: usize,
     pub max_queued: usize,
     /// A* expansions with the same f as the preceding expansion; excludes requeues.
     pub equal_f_expanded: usize,
@@ -267,6 +272,17 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     } else {
         None
     };
+    let unit_cycles = if config.unit_cycles == UnitCyclePolicy::Prune {
+        let Some(index) = UnitCyclePruner::new(problem, config.deadline) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        Some(index).filter(UnitCyclePruner::has_cycles)
+    } else {
+        None
+    };
     let mut queue = if config.strategy == SearchStrategy::BreadthFirst {
         Frontier::Fifo(VecDeque::new())
     } else {
@@ -424,6 +440,23 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                     outcome: Outcome::Stopped(StopReason::Deadline),
                     stats,
                 });
+            }
+            if let (Some(index), Refinement::Decompose { parent, method, .. }) =
+                (&unit_cycles, refinement)
+            {
+                match index.prunes(problem, &plan, parent, method, config.deadline) {
+                    None => {
+                        return Ok(SearchResult {
+                            outcome: Outcome::Stopped(StopReason::Deadline),
+                            stats,
+                        });
+                    }
+                    Some(true) => {
+                        stats.unit_cycles_pruned += 1;
+                        continue;
+                    }
+                    Some(false) => {}
+                }
             }
             if let (Some(graph), Refinement::Decompose { parent, method, .. }) = (&tdg, refinement)
             {

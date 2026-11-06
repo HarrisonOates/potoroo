@@ -4,7 +4,7 @@ use potoroo::htn::{
     search,
     tdg::{Tdg, COST_CAP},
     validate, AStarTieBreak, Action, Config, FlawSelection, Method, Outcome, Problem,
-    SearchStrategy, Solution, StopReason, Task, TdgMode,
+    SearchStrategy, Solution, StopReason, Task, TdgMode, UnitCyclePolicy,
 };
 
 fn action(cost: u64, pre: &[usize], add: &[usize], delete: &[usize]) -> Action {
@@ -258,6 +258,204 @@ fn modification_ties_can_starve_an_exit_within_one_recursive_cost_plateau() {
             assert!(s.cost_optimal);
         }
     }
+    for mut cfg in modes() {
+        cfg.unit_cycles = UnitCyclePolicy::Prune;
+        cfg.node_limit = Some(100);
+        let result = search(&p, &cfg).unwrap();
+        assert!(result.stats.unit_cycles_pruned > 0);
+        let s = solved(result.outcome);
+        assert_eq!(s.cost, 0);
+        assert_eq!(s.cost_optimal, cfg.strategy == SearchStrategy::AStar);
+    }
+}
+
+#[test]
+fn unit_cycle_pruning_matches_exhaustive_graph_reachability() {
+    // All 512 directed graphs on three compound tasks, including self loops.
+    // Each reachable exit yields exactly one action, so graph reachability is
+    // an independent oracle for primitive languages and their minimum costs.
+    for edges in 0..512 {
+        let mut methods = Vec::new();
+        let mut reach = [[false; 3]; 3];
+        for (a, row) in reach.iter_mut().enumerate() {
+            for (b, reachable) in row.iter_mut().enumerate() {
+                if edges & (1 << (3 * a + b)) != 0 {
+                    methods.push(method(a + 2, &[b + 2], &[]));
+                    *reachable = true;
+                }
+            }
+            row[a] = true;
+        }
+        for via in 0..3 {
+            for a in 0..3 {
+                for b in 0..3 {
+                    reach[a][b] |= reach[a][via] && reach[via][b];
+                }
+            }
+        }
+        methods.extend([
+            method(2, &[0], &[]),
+            method(3, &[1], &[]),
+            method(4, &[], &[]), // Cheap structurally, but cannot achieve p.
+        ]);
+        let p = problem(
+            vec![action(3, &[], &[0], &[]), action(7, &[], &[0], &[])],
+            3,
+            methods,
+            &[],
+            &[0],
+        );
+        let optimum = if reach[2][0] {
+            Some(3)
+        } else if reach[2][1] {
+            Some(7)
+        } else {
+            None
+        };
+        for mut cfg in modes() {
+            cfg.unit_cycles = UnitCyclePolicy::Prune;
+            cfg.node_limit = Some(100);
+            let result = search(&p, &cfg).unwrap();
+            match (optimum, result.outcome) {
+                (None, Outcome::NoSolution) => {}
+                (Some(cost), Outcome::Solved(s)) => {
+                    assert_eq!(s.certificate.steps.len(), 1);
+                    let task = s.certificate.steps[0].task;
+                    assert!(reach[2][task]);
+                    assert_eq!(validate::validate(&p, &s.certificate).unwrap(), s.cost);
+                    if cfg.strategy == SearchStrategy::AStar {
+                        assert_eq!(s.cost, cost, "graph={edges} config={cfg:?}");
+                        assert!(s.cost_optimal);
+                    }
+                }
+                (expected, actual) => {
+                    panic!("graph={edges} config={cfg:?}: expected {expected:?}, got {actual:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unit_cycles_keep_repeated_siblings_and_inherited_partial_orders() {
+    let p = problem(
+        vec![
+            action(1, &[], &[0], &[]),
+            action(2, &[0], &[1], &[]),
+            action(3, &[1], &[], &[]),
+        ],
+        3,
+        vec![
+            method(3, &[4], &[]),
+            method(4, &[3], &[]),
+            method(4, &[1], &[]),
+            method(5, &[0, 3, 3, 2], &[(0, 1), (0, 2), (1, 3), (2, 3)]),
+        ],
+        &[],
+        &[],
+    );
+    for mut cfg in modes() {
+        cfg.unit_cycles = UnitCyclePolicy::Prune;
+        let s = solved(search(&p, &cfg).unwrap().outcome);
+        assert_eq!(s.cost, 8);
+        assert_eq!(
+            s.certificate
+                .steps
+                .iter()
+                .map(|t| t.task)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 2]
+        );
+        assert_eq!(s.certificate.decompositions.len(), 5);
+    }
+}
+
+#[test]
+fn unit_ancestry_restarts_after_recursion_with_primitive_or_compound_siblings() {
+    for compound_sibling in [false, true] {
+        // A -> B -> prepare,A -> B -> consume is essential. The extra B -> A
+        // method is a redundant unit cycle. Rejecting every repeated task on
+        // the ancestry would incorrectly remove the only executable solution.
+        let mut methods = vec![
+            method(3, &[2], &[]),
+            method(2, &[3], &[]),
+            method(2, &[if compound_sibling { 4 } else { 0 }, 3], &[(0, 1)]),
+            method(2, &[1], &[]),
+        ];
+        if compound_sibling {
+            methods.extend([method(4, &[0], &[]), method(5, &[3], &[])]);
+        }
+        let p = problem(
+            vec![action(1, &[0], &[1], &[0]), action(1, &[1], &[], &[])],
+            if compound_sibling { 4 } else { 2 },
+            methods,
+            &[0],
+            &[1],
+        );
+        for mut cfg in modes() {
+            cfg.unit_cycles = UnitCyclePolicy::Prune;
+            let s = solved(search(&p, &cfg).unwrap().outcome);
+            assert_eq!(s.cost, 2);
+            assert_eq!(
+                s.certificate
+                    .steps
+                    .iter()
+                    .map(|t| t.task)
+                    .collect::<Vec<_>>(),
+                [0, 1]
+            );
+        }
+    }
+}
+
+#[test]
+fn unit_cycle_pruning_preserves_empty_exits_and_does_not_prune_growing_cycles() {
+    let empty = problem(
+        vec![],
+        2,
+        vec![
+            method(1, &[0], &[]),
+            method(0, &[1], &[]),
+            method(0, &[], &[]),
+        ],
+        &[],
+        &[],
+    );
+    for mut cfg in modes() {
+        cfg.unit_cycles = UnitCyclePolicy::Prune;
+        let s = solved(search(&empty, &cfg).unwrap().outcome);
+        assert_eq!(s.cost, 0);
+        assert!(s.certificate.steps.is_empty());
+        assert_eq!(s.certificate.decompositions.len(), 2);
+    }
+    // A -> A,A may generate arbitrarily many actions: it is not a unit cycle.
+    // Nullable siblings still leave an infinite f=0 plateau before a cost-1 goal.
+    let growing = problem(
+        vec![action(1, &[], &[0], &[])],
+        1,
+        vec![
+            method(1, &[1, 1], &[]),
+            method(1, &[], &[]),
+            method(1, &[0], &[]),
+        ],
+        &[],
+        &[0],
+    );
+    let result = search(
+        &growing,
+        &Config {
+            strategy: SearchStrategy::AStar,
+            unit_cycles: UnitCyclePolicy::Prune,
+            node_limit: Some(50),
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        result.outcome,
+        Outcome::Stopped(StopReason::NodeLimit)
+    ));
+    assert_eq!(result.stats.unit_cycles_pruned, 0);
 }
 
 #[test]
@@ -455,6 +653,13 @@ fn breadth_first_is_fair_when_astar_has_an_infinite_lower_cost_plateau() {
         .outcome,
         Outcome::Stopped(StopReason::NodeLimit)
     ));
+    for mut cfg in modes() {
+        cfg.unit_cycles = UnitCyclePolicy::Prune;
+        cfg.node_limit = Some(50);
+        let s = solved(search(&p, &cfg).unwrap().outcome);
+        assert_eq!(s.cost, 1);
+        assert_eq!(s.cost_optimal, cfg.strategy == SearchStrategy::AStar);
+    }
 }
 
 #[test]

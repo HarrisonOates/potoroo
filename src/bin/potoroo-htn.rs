@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use potoroo::htn::{
     pipeline, search, AStarTieBreak, Config, FlawSelection, Outcome, SearchStrategy, StopReason,
-    TdgMode,
+    TdgMode, UnitCyclePolicy,
 };
 
 #[derive(Parser)]
@@ -43,6 +43,9 @@ struct Cli {
     /// A* tie policy; ignored by bfs/gbfs. Action cost remains the primary key.
     #[arg(long, value_enum, default_value_t = AStarTieBreak::default())]
     astar_tie: AStarTieBreak,
+    /// Prune unary decomposition round trips while preserving primitive plans.
+    #[arg(long, value_enum, default_value_t = UnitCyclePolicy::default())]
+    unit_cycles: UnitCyclePolicy,
     /// Generated-node limit, including the initial node.
     #[arg(short = 'l', long)]
     limit: Option<usize>,
@@ -119,14 +122,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             flaws: cli.flaws,
             tdg: cli.tdg,
             astar_tie: cli.astar_tie,
+            unit_cycles: cli.unit_cycles,
         },
     )?;
-    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} tdg_recomputed={} tdg_requeued={} tdg_cache_hits={} equal_f_expanded={} max_f_plateau={} elapsed={:.3}s",
+    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} tdg_recomputed={} tdg_requeued={} tdg_cache_hits={} equal_f_expanded={} max_f_plateau={} unit_cycles_pruned={} elapsed={:.3}s",
         result.stats.generated, result.stats.expanded, result.stats.decompositions,
         result.stats.causal_links, result.stats.threat_orderings, result.stats.max_queued,
         result.stats.support_decompositions, result.stats.tdg_pruned, result.stats.cost_bound_pruned,
         result.stats.tdg_recomputed, result.stats.tdg_requeued, result.stats.tdg_cache_hits,
         result.stats.equal_f_expanded, result.stats.max_f_plateau,
+        result.stats.unit_cycles_pruned,
         start.elapsed().as_secs_f64());
     match result.outcome {
         Outcome::Solved(solution) => {

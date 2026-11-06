@@ -14,6 +14,7 @@ pub mod refine;
 pub mod search;
 pub mod tdg;
 mod tdg_cache;
+mod unit_cycles;
 pub mod validate;
 
 #[cfg(test)]
@@ -27,3 +28,4 @@ pub use search::{
     StopReason,
 };
 pub use tdg::TdgMode;
+pub use unit_cycles::UnitCyclePolicy;

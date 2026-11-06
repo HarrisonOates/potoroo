@@ -2,7 +2,7 @@
 
 use potoroo::htn::{pipeline, search, Config, Outcome};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -72,6 +72,15 @@ fn grounded_cli_requires_no_external_tools() {
         }
     }
     assert!(!run(&["--grounded", "--astar-tie", "unknown"])
+        .status
+        .success());
+    for cycles in ["keep", "prune"] {
+        let output = run(&["--grounded", "--unit-cycles", cycles]);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, solved.stdout);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unit_cycles_pruned=0"));
+    }
+    assert!(!run(&["--grounded", "--unit-cycles", "unknown"])
         .status
         .success());
     assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
@@ -163,9 +172,26 @@ fn verify_panda_certificate(
     assert_eq!(names, ["prepare[]", "consume[]", "finish[]"]);
     let root = std::env::temp_dir().join(format!("potoroo-htn-verify-{}", std::process::id()));
     fs::create_dir(&root).unwrap();
+    verify_with_panda(
+        &tools,
+        &domain,
+        &problem,
+        &solution.certificate.to_panda(&model).unwrap(),
+        &root,
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn verify_with_panda(
+    tools: &pipeline::Tools,
+    domain: &Path,
+    problem: &Path,
+    certificate: &str,
+    root: &Path,
+) {
     let raw = root.join("raw.plan");
     let converted = root.join("converted.plan");
-    fs::write(&raw, solution.certificate.to_panda(&model).unwrap()).unwrap();
+    fs::write(&raw, certificate).unwrap();
     let conversion = Command::new(&tools.parser)
         .arg("--panda-converter")
         .arg(&raw)
@@ -190,6 +216,99 @@ fn verify_panda_certificate(
         "{stdout}\n{}",
         String::from_utf8_lossy(&checked.stderr)
     );
+}
+
+#[test]
+fn panda_verifies_original_methods_after_unit_cycle_pruning() {
+    use potoroo::htn::{AStarTieBreak, SearchStrategy, TdgMode, UnitCyclePolicy};
+    let (Some(parser), Some(grounder)) = (
+        std::env::var_os("POTOROO_HTN_PARSER"),
+        std::env::var_os("POTOROO_HTN_GROUNDER"),
+    ) else {
+        eprintln!("skipping external HTN integration: set PANDA tool paths");
+        return;
+    };
+    let tools = pipeline::Tools {
+        parser: parser.into(),
+        grounder: grounder.into(),
+    };
+    let root = std::env::temp_dir().join(format!("potoroo-htn-cycles-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let domain = root.join("domain.hddl");
+    let problem = root.join("problem.hddl");
+    fs::write(
+        &domain,
+        r#"(define (domain unit-cycles)
+      (:requirements :typing :hierarchy)
+      (:predicates (done))
+      (:task r :parameters ())
+      (:task a :parameters ())
+      (:task b :parameters ())
+      (:task c :parameters ())
+      (:method enter :parameters () :task (r) :subtasks (a))
+      (:method empty-exit :parameters () :task (r) :subtasks ())
+      (:method return :parameters () :task (a) :subtasks (r))
+      (:method finite-exit :parameters () :task (a) :subtasks (b))
+      (:method middle :parameters () :task (b) :subtasks (c))
+      (:method leaf :parameters () :task (c) :subtasks (finish))
+      (:action finish :parameters () :precondition () :effect (done)))"#,
+    )
+    .unwrap();
+    fs::write(
+        &problem,
+        r#"(define (problem cycle-example)
+      (:domain unit-cycles)
+      (:htn :parameters () :subtasks (r))
+      (:init)
+      (:goal (done)))"#,
+    )
+    .unwrap();
+    let model = pipeline::load(
+        pipeline::Input::Hddl {
+            domain: &domain,
+            problem: &problem,
+        },
+        &tools,
+        Some(Instant::now() + Duration::from_secs(30)),
+    )
+    .unwrap();
+    for tdg in [
+        TdgMode::Static,
+        TdgMode::Recompute,
+        TdgMode::Lazy,
+        TdgMode::LazyCached,
+    ] {
+        for astar_tie in [
+            AStarTieBreak::Fifo,
+            AStarTieBreak::LargerG,
+            AStarTieBreak::Modification,
+        ] {
+            let result = search(
+                &model,
+                &Config {
+                    strategy: SearchStrategy::AStar,
+                    unit_cycles: UnitCyclePolicy::Prune,
+                    tdg,
+                    astar_tie,
+                    node_limit: Some(100),
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            assert!(result.stats.unit_cycles_pruned > 0);
+            let Outcome::Solved(solution) = result.outcome else {
+                panic!("expected solution")
+            };
+            assert!(solution.cost_optimal);
+            verify_with_panda(
+                &tools,
+                &domain,
+                &problem,
+                &solution.certificate.to_panda(&model).unwrap(),
+                &root,
+            );
+        }
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
