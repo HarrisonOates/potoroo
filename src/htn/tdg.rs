@@ -422,6 +422,85 @@ impl Recompute {
         {
             return Some(None);
         }
+        self.finish_costs(problem, plan, &mut expired)
+    }
+
+    /// Reuse h_max's complete productive closure and relaxed executability.
+    /// A reachable primitive has zero missing preconditions iff executable.
+    /// Goals and committed preconditions have already been checked by h_max.
+    pub(crate) fn remaining_from_relaxed(
+        &mut self,
+        problem: &Problem,
+        plan: &Plan,
+        tdg: &Tdg,
+        closure: (&[TaskId], &[usize]),
+        deadline: Option<Instant>,
+    ) -> Option<Option<u128>> {
+        self.evaluate_relaxed(problem, plan, tdg, closure, || {
+            deadline.is_some_and(|d| Instant::now() >= d)
+        })
+    }
+
+    fn evaluate_relaxed(
+        &mut self,
+        problem: &Problem,
+        plan: &Plan,
+        tdg: &Tdg,
+        closure: (&[TaskId], &[usize]),
+        mut expired: impl FnMut() -> bool,
+    ) -> Option<Option<u128>> {
+        if expired() {
+            return None;
+        }
+        self.reset();
+        let (tasks, missing) = closure;
+        // Register every touched task before building edges, including children
+        // not visited yet if a deadline interrupts the following loop.
+        for &task in tasks {
+            if expired() {
+                return None;
+            }
+            self.discover(task);
+        }
+        self.traversal.clear();
+        for &task in tasks {
+            if expired() {
+                return None;
+            }
+            if task < problem.actions.len() && missing[task] == 0 {
+                self.ready
+                    .push(Reverse((problem.actions[task].cost as u128, task)));
+            }
+            for &id in &problem.methods_by_task[task] {
+                if expired() {
+                    return None;
+                }
+                if tdg.method_cost(id).is_none() {
+                    continue;
+                }
+                let method = &problem.methods[id];
+                self.pending[id] = method.subtasks.len();
+                self.sums[id] = 0;
+                if method.subtasks.is_empty() {
+                    self.ready.push(Reverse((0, task)));
+                }
+                for &child in &method.subtasks {
+                    if expired() {
+                        return None;
+                    }
+                    self.parents[child].push(id);
+                }
+            }
+        }
+        self.finish_costs(problem, plan, &mut expired)
+    }
+
+    fn finish_costs(
+        &mut self,
+        problem: &Problem,
+        plan: &Plan,
+        expired: &mut impl FnMut() -> bool,
+    ) -> Option<Option<u128>> {
         // Generalized Dijkstra on the induced productive hierarchy. An active
         // task includes all its productive methods and all their children, so
         // omitting the rest of the model cannot change any active task's cost.
@@ -756,6 +835,51 @@ mod tests {
                     None
                 ),
                 Some((!initial.is_empty()).then_some(0))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_closure_reuse_survives_cancellation_at_every_checkpoint() {
+        let p = choice_problem();
+        let tdg = Tdg::new(&p);
+        let initial = Plan::initial(&p);
+        // Every task is a productive descendant; action 0 enables action 2.
+        let tasks = (0..p.tasks.len()).collect::<Vec<_>>();
+        let missing = vec![0; p.actions.len()];
+        let closure = (tasks.as_slice(), missing.as_slice());
+        let mut index = Recompute::new(&p, None).unwrap();
+        let mut checks = 0;
+        assert_eq!(
+            index.evaluate_relaxed(&p, &initial, &tdg, closure, || {
+                checks += 1;
+                false
+            }),
+            Some(Some(2))
+        );
+        let root = initial
+            .decompose(&p, initial.compound(&p).unwrap(), 4)
+            .unwrap()
+            .unwrap();
+        let no_enabler = root
+            .decompose(&p, *root.tasks().find(|t| t.task == 4).unwrap(), 1)
+            .unwrap()
+            .unwrap();
+        for stop in 1..=checks {
+            let mut ticks = 0;
+            assert!(index
+                .evaluate_relaxed(&p, &initial, &tdg, closure, || {
+                    ticks += 1;
+                    ticks == stop
+                })
+                .is_none());
+            assert_eq!(
+                index.remaining_cost(&p, &no_enabler, &tdg, None),
+                Some(Some(14))
+            );
+            assert_eq!(
+                index.evaluate_relaxed(&p, &initial, &tdg, closure, || false),
+                Some(Some(2))
             );
         }
     }

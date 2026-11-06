@@ -98,11 +98,14 @@ fn modes() -> impl Iterator<Item = Config> {
                 .into_iter()
                 .filter(move |tie| strategy == SearchStrategy::AStar || *tie == AStarTieBreak::Fifo)
                 .flat_map(move |astar_tie| {
-                    [false, true].into_iter().map(move |support_bound| Config {
-                        tdg,
-                        astar_tie,
-                        support_bound,
-                        ..config(strategy, flaws)
+                    [false, true].into_iter().flat_map(move |support_bound| {
+                        [false, true].into_iter().map(move |relaxed_bound| Config {
+                            tdg,
+                            astar_tie,
+                            support_bound,
+                            relaxed_bound,
+                            ..config(strategy, flaws)
+                        })
                     })
                 })
             })
@@ -536,6 +539,127 @@ fn support_bounds_can_still_have_recursive_plateaus_for_joint_requirements() {
             &p,
             &Config {
                 support_bound: true,
+                node_limit: Some(1000),
+                ..Config::default()
+            },
+        )
+        .unwrap()
+        .outcome,
+    );
+    assert_eq!(s.cost, 2);
+    // h_max sees the prep -> finish chain, so growing the network no longer
+    // leaves an infinite plateau strictly below the cost-2 solution.
+    for mut cfg in modes().filter(|cfg| {
+        cfg.relaxed_bound
+            && cfg.strategy == SearchStrategy::AStar
+            && cfg.flaws == FlawSelection::Systematic
+    }) {
+        cfg.node_limit = Some(1000);
+        let result = search(&p, &cfg).unwrap();
+        assert!(
+            matches!(result.outcome, Outcome::Solved(_)),
+            "{cfg:?}: {:?}",
+            result.outcome
+        );
+        let s = solved(result.outcome);
+        assert_eq!(s.cost, 2);
+        assert_eq!(s.cost_optimal, cfg.strategy == SearchStrategy::AStar);
+    }
+}
+
+#[test]
+fn relaxed_execution_bounds_preserve_shared_support_and_committed_costs() {
+    // The cost-4 action supports two occurrences of the cost-1 consumer.
+    // Their total cost is 6, not 10. The root also offers a shallow cost-7 exit.
+    let p = problem(
+        vec![
+            action(4, &[], &[0], &[]),
+            action(1, &[0], &[1], &[]),
+            action(7, &[], &[1], &[]),
+        ],
+        2,
+        vec![
+            method(3, &[0], &[]),
+            method(4, &[3, 1, 1], &[]),
+            method(4, &[2], &[]),
+        ],
+        &[],
+        &[1],
+    );
+    for cfg in modes().filter(|cfg| cfg.relaxed_bound && cfg.strategy == SearchStrategy::AStar) {
+        let result = search(&p, &cfg).unwrap();
+        assert!(result.stats.relaxed_evaluated > 0);
+        let s = solved(result.outcome);
+        assert_eq!(s.cost, 6, "{cfg:?}");
+        assert!(s.cost_optimal);
+        assert_eq!(validate::validate(&p, &s.certificate).unwrap(), 6);
+    }
+}
+
+#[test]
+fn relaxed_execution_rejects_unseeded_support_cycles() {
+    let p = problem(
+        vec![action(0, &[0], &[1], &[]), action(0, &[1], &[0], &[])],
+        1,
+        vec![method(2, &[0, 1], &[])],
+        &[],
+        &[0],
+    );
+    for cfg in modes().filter(|cfg| cfg.relaxed_bound) {
+        let result = search(&p, &cfg).unwrap();
+        assert!(matches!(result.outcome, Outcome::NoSolution));
+        // Eager/recomputed TDG can already discover this dead end.
+        if cfg.tdg == TdgMode::Static {
+            assert_eq!(result.stats.relaxed_pruned, 1);
+            assert_eq!(result.stats.expanded, 0);
+        }
+    }
+}
+
+#[test]
+fn relaxed_execution_still_underestimates_independent_joint_goals() {
+    // Each goal costs 1 separately, so h_max and necessary support both give
+    // 1. Their conjunction costs 2: an infinite cheaper plateau remains.
+    let p = problem(
+        vec![action(1, &[], &[0], &[]), action(1, &[], &[1], &[])],
+        1,
+        vec![
+            method(2, &[2, 2], &[]),
+            method(2, &[], &[]),
+            method(2, &[0], &[]),
+            method(2, &[1], &[]),
+        ],
+        &[],
+        &[0, 1],
+    );
+    for astar_tie in [
+        AStarTieBreak::Fifo,
+        AStarTieBreak::LargerG,
+        AStarTieBreak::Modification,
+    ] {
+        let result = search(
+            &p,
+            &Config {
+                strategy: SearchStrategy::AStar,
+                support_bound: true,
+                relaxed_bound: true,
+                astar_tie,
+                node_limit: Some(100),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            result.outcome,
+            Outcome::Stopped(StopReason::NodeLimit)
+        ));
+    }
+    let s = solved(
+        search(
+            &p,
+            &Config {
+                support_bound: true,
+                relaxed_bound: true,
                 node_limit: Some(1000),
                 ..Config::default()
             },
@@ -1047,6 +1171,76 @@ fn lazy_tdg_reranks_without_spending_node_budget_and_caches_equivalent_networks(
             assert_eq!(solution.cost, 3);
             assert!(solution.cost_optimal);
             assert_eq!(validate::validate(&p, &solution.certificate).unwrap(), 3);
+        }
+    }
+}
+
+#[test]
+fn lazy_hmax_repairs_priorities_and_prunes_before_expansion() {
+    // At the root, the cost-0 p-achiever makes q look cheap. The two X choices
+    // lose it, leaving cost 5, overflow, or no supporter. Defer these checks
+    // until selection, but repair them before accepting the cost-3 competitor.
+    for expensive in [None, Some(4), Some(u64::MAX)] {
+        let mut methods = vec![
+            method(5, &[], &[]),
+            method(6, &[5, 0], &[]),
+            method(7, &[6], &[]),
+            method(7, &[6], &[]),
+            method(7, &[1], &[]),
+            method(7, &[3, 4], &[]),
+        ];
+        if expensive.is_some() {
+            methods.push(method(5, &[2], &[]));
+        }
+        let p = problem(
+            vec![
+                action(1, &[0], &[1], &[]),
+                action(3, &[], &[1], &[]),
+                action(expensive.unwrap_or(4), &[], &[0], &[]),
+                action(0, &[], &[0], &[]),
+                action(0, &[1], &[], &[]),
+            ],
+            3,
+            methods,
+            &[],
+            &[1],
+        );
+        for astar_tie in [
+            AStarTieBreak::Fifo,
+            AStarTieBreak::LargerG,
+            AStarTieBreak::Modification,
+        ] {
+            let result = search(
+                &p,
+                &Config {
+                    strategy: SearchStrategy::AStar,
+                    astar_tie,
+                    relaxed_bound: true,
+                    node_limit: Some(5),
+                    ..Config::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.stats.generated, 5);
+            assert_eq!(result.stats.expanded, 3);
+            assert_eq!(
+                result.stats.relaxed_requeued,
+                if expensive == Some(4) { 2 } else { 0 }
+            );
+            assert_eq!(
+                result.stats.cost_bound_pruned,
+                if expensive == Some(u64::MAX) { 2 } else { 0 }
+            );
+            assert_eq!(
+                result.stats.relaxed_pruned,
+                if expensive.is_none() { 2 } else { 0 }
+            );
+            assert_eq!(result.stats.relaxed_cache_hits, 1);
+            assert_eq!(result.stats.relaxed_shared, 0);
+            let s = solved(result.outcome);
+            assert_eq!(s.cost, 3);
+            assert!(s.cost_optimal);
+            assert_eq!(validate::validate(&p, &s.certificate).unwrap(), 3);
         }
     }
 }

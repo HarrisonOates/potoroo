@@ -87,6 +87,10 @@ fn grounded_cli_requires_no_external_tools() {
     assert!(support.status.success());
     assert_eq!(support.stdout, solved.stdout);
     assert!(String::from_utf8_lossy(&support.stderr).contains("support_evaluated=2"));
+    let relaxed = run(&["--grounded", "--support-bound", "--relaxed-bound"]);
+    assert!(relaxed.status.success());
+    assert_eq!(relaxed.stdout, solved.stdout);
+    assert!(String::from_utf8_lossy(&relaxed.stderr).contains("relaxed_evaluated=2"));
     assert!(!run(&["--grounded", "--search", "unknown"]).status.success());
     let limited = run(&["--grounded", "--limit", "0"]);
     assert_eq!(limited.status.code(), Some(2));
@@ -116,7 +120,15 @@ fn panda_pipeline_certificate_verifies_against_original_hddl() {
                 potoroo::htn::AStarTieBreak::Modification,
             ] {
                 for support_bound in [false, true] {
-                    verify_panda_certificate(flaws, tdg, astar_tie, support_bound);
+                    for relaxed_bound in [false, true] {
+                        verify_panda_certificate(
+                            flaws,
+                            tdg,
+                            astar_tie,
+                            support_bound,
+                            relaxed_bound,
+                        );
+                    }
                 }
             }
         }
@@ -128,6 +140,7 @@ fn verify_panda_certificate(
     tdg: potoroo::htn::TdgMode,
     astar_tie: potoroo::htn::AStarTieBreak,
     support_bound: bool,
+    relaxed_bound: bool,
 ) {
     let (Some(parser), Some(grounder)) = (
         std::env::var_os("POTOROO_HTN_PARSER"),
@@ -164,6 +177,7 @@ fn verify_panda_certificate(
             tdg,
             astar_tie,
             support_bound,
+            relaxed_bound,
             ..Config::default()
         },
     )
@@ -350,7 +364,7 @@ fn external_failures_and_deadlines_are_distinct_from_search_exhaustion() {
         Some(start + Duration::from_millis(50)),
     )
     .unwrap_err();
-    assert!(matches!(timed, pipeline::Error::Deadline));
+    assert!(matches!(timed, pipeline::Error::Deadline), "{timed:?}");
     assert!(start.elapsed() < Duration::from_secs(3));
     fs::remove_file(&grounder).unwrap();
     let missing = pipeline::load(pipeline::Input::Lifted(&lifted), &tools, None).unwrap_err();

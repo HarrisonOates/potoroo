@@ -49,6 +49,9 @@ struct Cli {
     /// Strengthen TDG costs using achievers of open conditions and support focus.
     #[arg(long)]
     support_bound: bool,
+    /// Add lazy h_max precondition costs, sharing TDG reachability when possible.
+    #[arg(long)]
+    relaxed_bound: bool,
     /// Generated-node limit, including the initial node.
     #[arg(short = 'l', long)]
     limit: Option<usize>,
@@ -127,9 +130,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             astar_tie: cli.astar_tie,
             unit_cycles: cli.unit_cycles,
             support_bound: cli.support_bound,
+            relaxed_bound: cli.relaxed_bound,
         },
     )?;
-    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} tdg_recomputed={} tdg_requeued={} tdg_cache_hits={} equal_f_expanded={} max_f_plateau={} unit_cycles_pruned={} support_evaluated={} support_tables={} support_cache_hits={} support_pruned={} elapsed={:.3}s",
+    eprintln!("HTN: generated={} expanded={} decompositions={} links={} threat_orderings={} max_queued={} support_decompositions={} tdg_pruned={} cost_bound_pruned={} tdg_recomputed={} tdg_requeued={} tdg_cache_hits={} equal_f_expanded={} max_f_plateau={} unit_cycles_pruned={} support_evaluated={} support_tables={} support_cache_hits={} support_pruned={} relaxed_evaluated={} relaxed_cache_hits={} relaxed_shared={} relaxed_requeued={} relaxed_pruned={} elapsed={:.3}s",
         result.stats.generated, result.stats.expanded, result.stats.decompositions,
         result.stats.causal_links, result.stats.threat_orderings, result.stats.max_queued,
         result.stats.support_decompositions, result.stats.tdg_pruned, result.stats.cost_bound_pruned,
@@ -138,6 +142,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         result.stats.unit_cycles_pruned,
         result.stats.support_evaluated, result.stats.support_tables,
         result.stats.support_cache_hits, result.stats.support_pruned,
+        result.stats.relaxed_evaluated, result.stats.relaxed_cache_hits,
+        result.stats.relaxed_shared, result.stats.relaxed_requeued, result.stats.relaxed_pruned,
         start.elapsed().as_secs_f64());
     match result.outcome {
         Outcome::Solved(solution) => {

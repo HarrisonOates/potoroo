@@ -9,6 +9,7 @@ use super::model::Problem;
 use super::modification::ModificationTdg;
 use super::plan::Plan;
 use super::refine::{self, FlawSelection, Refinement};
+use super::relaxed::RelaxedBound;
 use super::support::SupportBound;
 use super::tdg::{Recompute, Tdg, TdgMode, COST_CAP};
 use super::tdg_cache::BoundCache;
@@ -58,6 +59,8 @@ pub struct Config {
     pub unit_cycles: UnitCyclePolicy,
     /// Strengthen the TDG cost bound with necessary future causal supporters.
     pub support_bound: bool,
+    /// Add cached, lazy h_max; share propagation when TDG also needs evaluation.
+    pub relaxed_bound: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +93,15 @@ pub struct Stats {
     pub support_cache_hits: usize,
     /// Partial plans with no eligible current or future causal supporter.
     pub support_pruned: usize,
+    /// h_max computations, excluding active-task-set cache hits.
+    pub relaxed_evaluated: usize,
+    pub relaxed_cache_hits: usize,
+    /// TDG evaluations reusing h_max's hierarchy closure and executability.
+    pub relaxed_shared: usize,
+    /// Lazy evaluations including h_max that raised a queued priority.
+    pub relaxed_requeued: usize,
+    /// Partial plans with relaxed-unreachable goals/committed preconditions.
+    pub relaxed_pruned: usize,
     pub max_queued: usize,
     /// A* expansions with the same f as the preceding expansion; excludes requeues.
     pub equal_f_expanded: usize,
@@ -129,6 +141,7 @@ impl Evaluator {
         problem: &Problem,
         plan: &Plan,
         tdg: &Tdg,
+        relaxed: Option<&mut RelaxedBound>,
         deadline: Option<Instant>,
         stats: &mut Stats,
     ) -> Option<Option<u128>> {
@@ -143,8 +156,14 @@ impl Evaluator {
             }
         }
         stats.tdg_recomputed += 1;
-        let bound = self.index.remaining_cost(problem, plan, tdg, deadline)?;
+        let bound = if let Some(relaxed) = relaxed {
+            relaxed.with_tdg(problem, plan, tdg, &mut self.index, deadline, stats)?
+        } else {
+            self.index.remaining_cost(problem, plan, tdg, deadline)?
+        };
         // Cancellation is not a bound and is never cached.
+        // With h_max enabled this cache stores the combined bound, using the
+        // full multiset because TDG still counts repeated compound occurrences.
         if let (Some(cache), Some(key)) = (&mut self.cache, key) {
             cache.insert(key, bound);
         }
@@ -156,6 +175,7 @@ struct Node {
     plan: Rc<Plan>,
     h: u128,
     pending_tdg: bool,
+    pending_relaxed: bool,
 }
 
 struct Queued {
@@ -241,6 +261,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
         || config.strategy != SearchStrategy::BreadthFirst
         || config.tdg != TdgMode::Static
         || config.support_bound
+        || config.relaxed_bound
     {
         let Some(graph) = Tdg::with_deadline(problem, config.deadline) else {
             return Ok(SearchResult {
@@ -293,6 +314,17 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     } else {
         None
     };
+    let mut relaxed = if config.relaxed_bound {
+        let Some(index) = RelaxedBound::new(problem, config.deadline) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        Some(index)
+    } else {
+        None
+    };
     let unit_cycles = if config.unit_cycles == UnitCyclePolicy::Prune {
         let Some(index) = UnitCyclePruner::new(problem, config.deadline) else {
             return Ok(SearchResult {
@@ -316,6 +348,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             problem,
             &initial,
             tdg.as_ref().unwrap(),
+            relaxed.as_mut(),
             config.deadline,
             &mut stats,
         ) else {
@@ -359,6 +392,28 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
         // Both bounds charge the same future primitives. Sum would double-count.
         h = h.max(bound);
     }
+    if let Some(index) = relaxed.as_mut().filter(|_| recompute.is_none()) {
+        let Some(bound) = index.remaining_cost(
+            problem,
+            &initial,
+            tdg.as_ref().unwrap(),
+            config.deadline,
+            &mut stats,
+        ) else {
+            return Ok(SearchResult {
+                outcome: Outcome::Stopped(StopReason::Deadline),
+                stats,
+            });
+        };
+        let Some(bound) = bound else {
+            stats.relaxed_pruned += 1;
+            return Ok(SearchResult {
+                outcome: Outcome::NoSolution,
+                stats,
+            });
+        };
+        h = h.max(bound);
+    }
     if initial.cost() as u128 + h >= COST_CAP {
         return Err("HTN plan cost overflow: TDG lower bound exceeds u64".into());
     }
@@ -376,6 +431,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             plan: initial,
             h,
             pending_tdg: false,
+            pending_relaxed: false,
         },
         config.strategy,
         secondary,
@@ -393,21 +449,39 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 stats,
             });
         }
-        if node.pending_tdg {
-            let Some(bound) = recompute.as_mut().unwrap().bound(
-                problem,
-                &node.plan,
-                tdg.as_ref().unwrap(),
-                config.deadline,
-                &mut stats,
-            ) else {
+        if node.pending_tdg || node.pending_relaxed {
+            let pending_tdg = node.pending_tdg;
+            let pending_relaxed = node.pending_relaxed;
+            let evaluation = if pending_tdg {
+                recompute.as_mut().unwrap().bound(
+                    problem,
+                    &node.plan,
+                    tdg.as_ref().unwrap(),
+                    relaxed.as_mut(),
+                    config.deadline,
+                    &mut stats,
+                )
+            } else {
+                relaxed.as_mut().unwrap().remaining_cost(
+                    problem,
+                    &node.plan,
+                    tdg.as_ref().unwrap(),
+                    config.deadline,
+                    &mut stats,
+                )
+            };
+            let Some(bound) = evaluation else {
                 return Ok(SearchResult {
                     outcome: Outcome::Stopped(StopReason::Deadline),
                     stats,
                 });
             };
             let Some(bound) = bound else {
-                stats.tdg_pruned += 1;
+                if pending_tdg {
+                    stats.tdg_pruned += 1;
+                } else {
+                    stats.relaxed_pruned += 1;
+                }
                 continue;
             };
             if node.plan.cost() as u128 + bound >= COST_CAP {
@@ -418,12 +492,14 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             let previous = node.h;
             node.h = node.h.max(bound);
             node.pending_tdg = false;
+            node.pending_relaxed = false;
             // OPEN always carries admissible lower bounds. A strengthened
             // priority must compete again before expansion or accepting a goal.
             // Keep the original serial, so equal-priority FIFO ties are stable.
             // BFS does not order by h and must not lose its refinement-depth order.
             if node.h > previous && config.strategy != SearchStrategy::BreadthFirst {
-                stats.tdg_requeued += 1;
+                stats.tdg_requeued += usize::from(pending_tdg);
+                stats.relaxed_requeued += usize::from(pending_relaxed);
                 queue.push(node, config.strategy, secondary, serial);
                 continue;
             }
@@ -533,6 +609,9 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 });
             }
             let mut pending_tdg = false;
+            // Links and orderings retain their evaluated parent's bound.
+            let mut pending_relaxed =
+                config.relaxed_bound && matches!(refinement, Refinement::Decompose { .. });
             let mut h = if let Refinement::Decompose { parent, .. } = refinement {
                 if let Some(index) = &mut recompute {
                     if problem.methods_by_task[parent.task].len() == 1 {
@@ -558,6 +637,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                             problem,
                             &child,
                             tdg.as_ref().unwrap(),
+                            relaxed.as_mut(),
                             config.deadline,
                             &mut stats,
                         ) else {
@@ -570,6 +650,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                             stats.tdg_pruned += 1;
                             continue;
                         };
+                        pending_relaxed = false; // Eager TDG also evaluated h_max.
                         bound
                     }
                 } else {
@@ -583,6 +664,11 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                 // cannot reduce the cost of completing this partial plan.
                 parent_h
             };
+            if config.relaxed_bound {
+                // Every completion also completes the parent. Preserve its
+                // total-cost lower bound until the deferred evaluation runs.
+                h = h.max(parent_h.saturating_sub((child.cost() - plan.cost()) as u128));
+            }
             if let Some(index) = &mut support {
                 let Some(bound) = index.remaining_cost(
                     problem,
@@ -629,6 +715,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
                     plan: Rc::new(child),
                     h,
                     pending_tdg,
+                    pending_relaxed,
                 },
                 config.strategy,
                 child_secondary,
