@@ -42,6 +42,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - run: cargo +stable clippy --locked --all-targets --features htn -- -D warnings
 
   test:
     name: Tests (${{ matrix.configuration }})
@@ -53,6 +54,9 @@ jobs:
         include:
           - configuration: default
             features: ''
+            fast_downward: false
+          - configuration: htn
+            features: htn
             fast_downward: false
           - configuration: fast-downward
             features: ''
@@ -102,7 +106,7 @@ jobs:
       - name: Test standalone build
         if: ${{ !matrix.fast_downward }}
         # This LP regression is slow without FD's grounding; both integration jobs run it.
-        run: cargo +stable test --locked -- --skip lifted_cutset_preserves_optimal_ground_plans
+        run: cargo +stable test --locked --features "$CARGO_FEATURES" -- --skip lifted_cutset_preserves_optimal_ground_plans
       - name: Test Fast Downward integration
         if: matrix.fast_downward
         run: cargo +stable test --locked --features "$CARGO_FEATURES"

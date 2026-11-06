@@ -2,6 +2,7 @@
 name = "potoroo"
 version = "0.1.0"
 edition = "2021"
+default-run = "potoroo"
 description = "A modern partial-order causal-link (POCL) planner in Rust"
 license = "Apache-2.0"
 
@@ -9,12 +10,19 @@ license = "Apache-2.0"
 name = "potoroo"
 path = "src/bin/potoroo.rs"
 
+[[bin]]
+name = "potoroo-htn"
+path = "src/bin/potoroo-htn.rs"
+required-features = ["htn"]
+
 [lib]
 name = "potoroo"
 path = "src/lib.rs"
 
 [features]
 default = []
+# Grounded decomposition-based HTN search; the flat planner keeps its own types.
+htn = []
 # Solve the Lplan LP with HiGHS instead of the pure-Rust microlp. HiGHS is a C++
 # library built from source, so this is off by default: the core stays buildable
 # with no system dependencies.

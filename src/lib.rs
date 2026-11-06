@@ -32,6 +32,8 @@ pub mod formula;
 pub mod functions;
 pub mod h2;
 pub mod heuristics;
+#[cfg(feature = "htn")]
+pub mod htn;
 pub(crate) mod instantiate;
 pub(crate) mod joint_domains;
 pub mod landmarks;

@@ -1,0 +1,25 @@
+(define (domain interleave)
+  (:requirements :typing :hierarchy)
+  (:predicates (ready) (consumed))
+  (:task left :parameters ())
+  (:task right :parameters ())
+  (:method left-work
+    :parameters ()
+    :task (left)
+    :ordered-subtasks (and (prepare) (finish)))
+  (:method right-work
+    :parameters ()
+    :task (right)
+    :subtasks (consume))
+  (:action prepare
+    :parameters ()
+    :precondition ()
+    :effect (ready))
+  (:action consume
+    :parameters ()
+    :precondition (ready)
+    :effect (and (not (ready)) (consumed)))
+  (:action finish
+    :parameters ()
+    :precondition (consumed)
+    :effect ()))

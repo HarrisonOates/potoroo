@@ -1,0 +1,5 @@
+(define (problem interleave-example)
+  (:domain interleave)
+  (:htn :parameters () :subtasks (and (left) (right)))
+  (:init)
+  (:goal (consumed)))
