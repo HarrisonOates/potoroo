@@ -287,32 +287,37 @@ fn recursion_and_resource_limits_do_not_claim_unsolvability() {
     );
     assert!(solve(&p).certificate.steps.is_empty());
     let loop_only = problem(vec![], 1, vec![method(0, &[0], &[])], &[], &[]);
+    // Exercise cutoffs without TDG pruning, which proves this loop unsolvable.
+    let baseline = Config {
+        flaws: potoroo::htn::FlawSelection::DecompositionFirst,
+        ..Config::default()
+    };
     let cases = [
         (
             Config {
                 node_limit: Some(8),
-                ..Config::default()
+                ..baseline.clone()
             },
             StopReason::NodeLimit,
         ),
         (
             Config {
                 node_limit: Some(0),
-                ..Config::default()
+                ..baseline.clone()
             },
             StopReason::NodeLimit,
         ),
         (
             Config {
                 max_depth: Some(3),
-                ..Config::default()
+                ..baseline.clone()
             },
             StopReason::DepthLimit,
         ),
         (
             Config {
                 deadline: Some(Instant::now()),
-                ..Config::default()
+                ..baseline
             },
             StopReason::Deadline,
         ),

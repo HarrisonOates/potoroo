@@ -14,6 +14,9 @@ pub mod search;
 pub mod tdg;
 pub mod validate;
 
+#[cfg(test)]
+mod systematic_tests;
+
 pub use model::{Action, Method, Problem, Task};
 pub use refine::FlawSelection;
 pub use search::{

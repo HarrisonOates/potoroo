@@ -41,6 +41,14 @@ pub struct Threat {
     pub link: Link,
 }
 
+/// While exposing a supporter, stay inside the chosen decomposition subtree.
+/// Its immediate children are the only possible ancestors of that supporter.
+#[derive(Clone, Debug)]
+pub(crate) struct SupportFocus {
+    pub open: OpenCondition,
+    pub candidates: Vec<Occurrence>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub(crate) tasks: Option<Rc<Chain<Occurrence>>>,
@@ -48,6 +56,7 @@ pub struct Plan {
     pub(crate) links: Option<Rc<Chain<Link>>>,
     pub(crate) open: Option<Rc<Chain<OpenCondition>>>,
     pub(crate) history: Option<Rc<Chain<Decomposition>>>,
+    pub(crate) support_focus: Option<Rc<SupportFocus>>,
     next_id: usize,
     pub(crate) cost: u64,
     pub(crate) depth: usize,
@@ -79,6 +88,7 @@ impl Plan {
             links: None,
             open: None,
             history: None,
+            support_focus: None,
             next_id: 2,
             cost: 0,
             depth: 0,
@@ -226,6 +236,8 @@ impl Plan {
         child.depth = self.depth.checked_add(1)?;
         child.orderings = orderings;
         child.open = chain::remove(&self.open, &open);
+        debug_assert!(self.support_focus.as_ref().is_none_or(|f| f.open == open));
+        child.support_focus = None;
         child.links = chain::cons(
             Link {
                 producer,
@@ -247,7 +259,9 @@ impl Plan {
 
     /// Recompute threats from actions and links. This baseline deliberately
     /// avoids an incremental flaw cache that could miss a batched insertion.
-    pub(crate) fn threat(&self, problem: &Problem) -> Option<Threat> {
+    /// With `last_achiever`, an intervening add also threatens the link: the
+    /// producer must be the last achiever before the consumer (SNLP semantics).
+    pub(crate) fn threat(&self, problem: &Problem, last_achiever: bool) -> Option<Threat> {
         for &link in self.links() {
             for occurrence in self.tasks() {
                 let Some(action) = problem.actions.get(occurrence.task) else {
@@ -255,7 +269,8 @@ impl Plan {
                 };
                 if occurrence.id != link.producer
                     && occurrence.id != link.consumer
-                    && action.delete.binary_search(&link.fact).is_ok()
+                    && (action.delete.binary_search(&link.fact).is_ok()
+                        || (last_achiever && action.add.binary_search(&link.fact).is_ok()))
                     && self.orderings.possibly_before(
                         link.producer,
                         StepTime::AtEnd,

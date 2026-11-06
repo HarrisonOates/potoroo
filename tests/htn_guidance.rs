@@ -78,6 +78,7 @@ fn modes() -> impl Iterator<Item = (SearchStrategy, FlawSelection)> {
         [
             FlawSelection::DecompositionFirst,
             FlawSelection::Interleaved,
+            FlawSelection::Systematic,
         ]
         .into_iter()
         .map(move |flaws| (strategy, flaws))
@@ -115,6 +116,7 @@ fn tdg_handles_productive_mutual_recursion_empty_exits_and_repeated_children() {
     for flaws in [
         FlawSelection::DecompositionFirst,
         FlawSelection::Interleaved,
+        FlawSelection::Systematic,
     ] {
         let s = solved(
             search(&p, &config(SearchStrategy::AStar, flaws))
@@ -216,6 +218,7 @@ fn astar_optimises_cost_across_different_refinement_depths() {
     for flaws in [
         FlawSelection::DecompositionFirst,
         FlawSelection::Interleaved,
+        FlawSelection::Systematic,
     ] {
         let bfs = solved(
             search(&p, &config(SearchStrategy::BreadthFirst, flaws))

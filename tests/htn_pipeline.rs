@@ -32,7 +32,7 @@ fn grounded_cli_requires_no_external_tools() {
     );
     assert!(String::from_utf8_lossy(&solved.stdout).contains("==>\nroot 1\n1 root[] -> empty\n<=="));
     for strategy in ["bfs", "astar", "gbfs"] {
-        for flaws in ["decomposition-first", "interleaved"] {
+        for flaws in ["decomposition-first", "interleaved", "systematic"] {
             let output = run(&["--grounded", "--search", strategy, "--flaws", flaws]);
             assert!(
                 output.status.success(),
@@ -66,6 +66,15 @@ fn grounded_cli_requires_no_external_tools() {
 
 #[test]
 fn panda_pipeline_certificate_verifies_against_original_hddl() {
+    for flaws in [
+        potoroo::htn::FlawSelection::Interleaved,
+        potoroo::htn::FlawSelection::Systematic,
+    ] {
+        verify_panda_certificate(flaws);
+    }
+}
+
+fn verify_panda_certificate(flaws: potoroo::htn::FlawSelection) {
     let (Some(parser), Some(grounder)) = (
         std::env::var_os("POTOROO_HTN_PARSER"),
         std::env::var_os("POTOROO_HTN_GROUNDER"),
@@ -97,7 +106,7 @@ fn panda_pipeline_certificate_verifies_against_original_hddl() {
             node_limit: Some(10_000),
             deadline,
             strategy: potoroo::htn::SearchStrategy::AStar,
-            flaws: potoroo::htn::FlawSelection::Interleaved,
+            flaws,
             ..Config::default()
         },
     )

@@ -31,8 +31,8 @@ struct Cli {
     /// Queue policy; astar/gbfs use the TDG primitive-cost bound.
     #[arg(long, value_enum, default_value = "bfs")]
     search: SearchStrategy,
-    /// Interleave causal support and decomposition, or use the original baseline.
-    #[arg(long, value_enum, default_value = "decomposition-first")]
+    /// Flaw policy; systematic commits support subtrees and uses last-achiever links.
+    #[arg(long, value_enum, default_value_t = FlawSelection::default())]
     flaws: FlawSelection,
     /// Generated-node limit, including the initial node.
     #[arg(short = 'l', long)]

@@ -157,7 +157,7 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
     }
     // The original decomposition-first BFS needs neither TDG preprocessing nor
     // effect summaries, making it a useful independent research baseline.
-    let tdg = if config.flaws == FlawSelection::Interleaved
+    let tdg = if config.flaws != FlawSelection::DecompositionFirst
         || config.strategy != SearchStrategy::BreadthFirst
     {
         let Some(graph) = Tdg::with_deadline(problem, config.deadline) else {
@@ -202,7 +202,12 @@ pub fn search(problem: &Problem, config: &Config) -> Result<SearchResult, String
             });
         }
         stats.expanded += 1;
-        if plan.compound(problem).is_none() && plan.open.is_none() && plan.threat(problem).is_none()
+        if plan.compound(problem).is_none()
+            && plan.open.is_none()
+            && plan.support_focus.is_none()
+            && plan
+                .threat(problem, config.flaws == FlawSelection::Systematic)
+                .is_none()
         {
             let certificate = Certificate {
                 root: 1,
