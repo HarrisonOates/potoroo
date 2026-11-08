@@ -114,3 +114,39 @@ zenotravel (51× fewer nodes). It loses gripper and childsnack by 4× and 21×.
 
 Policies `never`, `end` and `lr` are each dominated by `threat`. The two orders
 are complementary: the union covers 6/10, against ground FDR's 8/10.
+
+## Update: why the panel stalled, and fixes
+
+Diagnosed with `POTOROO_TRACE=N`, which now also prints the selected flaw.
+
+1. **The heuristic ignored binding domains.** `at(rover0, ?w)` costs 0
+   under a pattern minimum over all waypoints, even when `visible_from` has
+   narrowed `?w` to distant ones. ADD now evaluates each condition over the
+   classes' propagated domains, enumerating up to 512 combinations
+   (`POTOROO_LFDR_HDOM=0` disables this).
+   * Logistics solves for the first time (ZLIFO, 2,468 nodes; ground FDR
+     4,107), and zenotravel improves under MW-Loc (3,426 → 2,009).
+   * Elevators under ZLIFO regresses (5,006 → >3M nodes): a search-direction
+     change, not cost.
+2. **Throughput.** Phase timers (shown with `-v`) showed propagation
+   dominating refinement and heuristic time.
+   * Tables now have per-position indexes and a worklist.
+   * Domains computed in refinement are handed to the heuristic once and
+     dropped before queuing.
+   * Speed-up 2–5×: elevators 30k nodes 18.5 s → 3.5 s; rovers 3.1 s → 1.4 s.
+3. **Rovers remains.** The stall is ordering many consumers of
+   `at(rover0)` against a chain of `navigate` steps. Ground FDR also needs
+   2.15M nodes there, at about 800k nodes/s; we run at about 20k/s.
+
+| p01 | hdom=0 MW-Loc | hdom=0 ZLIFO | hdom=1 MW-Loc | hdom=1 ZLIFO |
+|---|---|---|---|---|
+| gripper | 6,307 | 4,080 | 6,307 | 4,080 |
+| childsnack | 15,454 | 491 | 15,454 | 491 |
+| logistics | – | – | – | 2,468 |
+| miconic | 932 | 2,119 | 1,495 | 4,116 |
+| satellite | 159 | – | 159 | – |
+| elevators | – | 4,952 | – | – |
+| zenotravel | 3,426 | – | 2,009 | 550,540 |
+
+The union is 7/10, against ground FDR's 8/10 (rovers). Blocksworld and
+sokoban are unsolved by both.

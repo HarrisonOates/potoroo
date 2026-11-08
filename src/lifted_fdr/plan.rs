@@ -64,6 +64,42 @@ pub struct Plan {
     pub cost: usize,
     pub num_opens: usize,
     pub num_threats: usize,
+    /// Domains from the propagation that produced this plan, kept only until
+    /// its heuristic evaluation so the evaluation need not propagate again.
+    pub domains: Option<Rc<Domains>>,
+}
+
+/// Narrowed domains per equality class.
+pub type Domains = HashMap<crate::bindings::StepVariable, HashSet<Object>>;
+
+/// A relation (static predicate or a variable's initial values) with a
+/// membership set and per-position row indexes.
+#[derive(Default)]
+pub struct Table {
+    pub rows: Vec<Vec<Object>>,
+    set: HashSet<Vec<Object>>,
+    by_position: HashMap<(usize, Object), Vec<u32>>,
+}
+
+impl Table {
+    fn push(&mut self, row: Vec<Object>) {
+        if !self.set.insert(row.clone()) {
+            return;
+        }
+        let index = self.rows.len() as u32;
+        for (i, o) in row.iter().enumerate() {
+            self.by_position.entry((i, *o)).or_default().push(index);
+        }
+        self.rows.push(row);
+    }
+
+    fn contains(&self, row: &[Object]) -> bool {
+        self.set.contains(row)
+    }
+
+    fn with(&self, position: usize, object: Object) -> &[u32] {
+        self.by_position.get(&(position, object)).map_or(&[], |v| v.as_slice())
+    }
 }
 
 /// Types of global schema variables, for [`TypeContext`].
@@ -159,7 +195,9 @@ pub struct Ctx<'a> {
     /// Initial values by variable.
     pub init_by_var: HashMap<u32, Vec<(Vec<Object>, LValue)>>,
     /// Initial facts per (variable, part) as rows `inv ++ counted args`.
-    pub init_rows: HashMap<(u32, u16), (Vec<Vec<Object>>, HashSet<Vec<Object>>)>,
+    pub init_rows: HashMap<(u32, u16), Table>,
+    /// Static relations by predicate.
+    pub static_tables: HashMap<Predicate, Table>,
     /// A new step's parameters still free after linking are bound on
     /// insertion when their domain has at most this many objects (0: never).
     pub bind_limit: usize,
@@ -179,22 +217,30 @@ impl<'a> Ctx<'a> {
         for ((var, inv), value) in init {
             init_by_var.entry(*var).or_default().push((inv.clone(), value.clone()));
         }
-        let mut init_rows: HashMap<(u32, u16), (Vec<Vec<Object>>, HashSet<Vec<Object>>)> = HashMap::new();
+        let mut init_rows: HashMap<(u32, u16), Table> = HashMap::new();
         for (var, entries) in &init_by_var {
             for (inv, value) in entries {
                 if let LValue::Part { part, args } = value {
                     let mut row = inv.clone();
                     row.extend(args.iter().map(|t| t.as_object()));
-                    let table = init_rows.entry((*var, *part)).or_default();
-                    table.1.insert(row.clone());
-                    table.0.push(row);
+                    init_rows.entry((*var, *part)).or_default().push(row);
                 }
             }
+        }
+        let mut static_tables: HashMap<Predicate, Table> = HashMap::new();
+        let mut statics: Vec<&Atom> = task.static_atoms.iter().collect();
+        statics.sort_by(|a, b| (a.predicate.0, &a.terms).cmp(&(b.predicate.0, &b.terms)));
+        for atom in statics {
+            static_tables
+                .entry(atom.predicate)
+                .or_default()
+                .push(atom.terms.iter().map(|t| t.as_object()).collect());
         }
         Ctx {
             task,
             types,
             init_rows,
+            static_tables,
             statics: StaticIndex::new(&task.static_atoms),
             writers,
             init_by_var,
@@ -305,6 +351,7 @@ impl Plan {
             bindings,
             cost: 0,
             num_threats: 0,
+            domains: None,
         })
     }
 
@@ -460,10 +507,11 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
         }
     }
     for mut plan in variants {
-        let Some(bindings) = propagate_statics(ctx, &plan) else {
+        let Some((bindings, domains)) = propagate_domains(ctx, &plan) else {
             continue;
         };
         plan.bindings = bindings;
+        plan.domains = Some(Rc::new(domains));
         link_threats(ctx, &mut plan, link);
         out.push(plan);
     }
@@ -649,8 +697,9 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
             let mut child = base.clone();
             child.bindings = bindings;
-            if let Some(bindings) = propagate_statics(ctx, &child) {
+            if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
                 child.bindings = bindings;
+                child.domains = Some(Rc::new(domains));
                 out.push(child);
             }
         }
@@ -678,8 +727,9 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
             let mut child = base.clone();
             child.bindings = bindings;
-            if let Some(bindings) = propagate_statics(ctx, &child) {
+            if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
                 child.bindings = bindings;
+                child.domains = Some(Rc::new(domains));
                 out.push(child);
             }
         }
@@ -784,11 +834,6 @@ pub fn definite(ctx: &Ctx, plan: &Plan, threat: &Threat) -> bool {
     }
 }
 
-enum TableSet<'a> {
-    Static(Predicate),
-    Init(&'a HashSet<Vec<Object>>),
-}
-
 /// Generalised arc consistency over the steps' static atoms and over the
 /// initial-state links (their tuple must be an initial fact). Domains are kept
 /// per equality class (a representative step variable), start from the type
@@ -802,23 +847,32 @@ pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<Rc<Bindings>> {
 
 /// [`propagate_statics`], also returning the narrowed domains of the classes
 /// that table or distinctness constraints touch.
-pub fn propagate_domains(
-    ctx: &Ctx,
-    plan: &Plan,
-) -> Option<(Rc<Bindings>, HashMap<crate::bindings::StepVariable, HashSet<Object>>)> {
+pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domains)> {
     use crate::bindings::StepVariable;
     let b = &plan.bindings;
-    let mut domains: HashMap<StepVariable, HashSet<Object>> = HashMap::new();
-    // Table constraints: (terms, scope, rows, membership).
-    let mut tables: Vec<(Vec<Term>, usize, &[Vec<Object>], TableSet)> = Vec::new();
+    let mut domains: Domains = HashMap::new();
+    // Table constraints over resolved terms.
+    struct Constraint<'t> {
+        terms: Vec<Result<Object, StepVariable>>,
+        table: &'t Table,
+    }
+    let resolve = |terms: &[Term], step: usize| -> Vec<Result<Object, StepVariable>> {
+        terms
+            .iter()
+            .map(|t| match b.binding(*t, step) {
+                Term::Object(o) => Ok(o),
+                Term::Variable(v) => Err(b.representative(v, step)),
+            })
+            .collect()
+    };
+    let empty = Table::default();
+    let mut constraints: Vec<Constraint> = Vec::new();
     for step in 1..=plan.num_steps() {
         for atom in &ctx.schema_of(plan, step).statics {
-            tables.push((
-                atom.terms.clone(),
-                step,
-                ctx.statics.rows(atom.predicate),
-                TableSet::Static(atom.predicate),
-            ));
+            constraints.push(Constraint {
+                terms: resolve(&atom.terms, step),
+                table: ctx.static_tables.get(&atom.predicate).unwrap_or(&empty),
+            });
         }
     }
     for link in chain::iter(&plan.links) {
@@ -827,90 +881,130 @@ pub fn propagate_domains(
         }
         let f = ctx.condition(plan, link.consumer, link.cond);
         if let LValue::Part { part, args } = &f.value {
-            let (rows, set) = &ctx.init_rows[&(f.var, *part)];
             let mut terms = f.inv.clone();
             terms.extend(args.iter().copied());
-            tables.push((terms, link.consumer, rows.as_slice(), TableSet::Init(set)));
+            constraints.push(Constraint {
+                terms: resolve(&terms, link.consumer),
+                table: &ctx.init_rows[&(f.var, *part)],
+            });
         }
     }
-    let mut changed = true;
-    let mut rounds = 0;
-    while changed && rounds < 16 {
-        changed = false;
-        rounds += 1;
-        for (atom_terms, step, rows, set) in &tables {
-            let step = *step;
-            let terms: Vec<Result<Object, StepVariable>> = atom_terms
-                .iter()
-                .map(|t| match b.binding(*t, step) {
-                    Term::Object(o) => Ok(o),
-                    Term::Variable(v) => Err(b.representative(v, step)),
-                })
-                .collect();
-            if terms.iter().all(|t| t.is_ok()) {
-                let ground: Vec<Object> = terms.iter().map(|t| *t.as_ref().unwrap()).collect();
-                let member = match set {
-                    TableSet::Static(predicate) => ctx.statics.contains(&Atom {
-                        predicate: *predicate,
-                        terms: ground.iter().map(|o| Term::Object(*o)).collect(),
-                    }),
-                    TableSet::Init(set) => set.contains(&ground),
-                };
-                if !member {
-                    return None;
-                }
-                continue;
-            }
-            for (i, t) in atom_terms.iter().enumerate() {
-                if let Err(rep) = terms[i] {
-                    domains.entry(rep).or_insert_with(|| {
-                        let Term::Variable(v) = b.binding(*t, step) else { unreachable!() };
-                        b.domain(&ctx.types, v, step).into_iter().collect()
-                    });
-                }
-            }
-            let mut support: Vec<HashSet<Object>> = vec![HashSet::new(); terms.len()];
-            let mut any = false;
-            'rows: for row in rows.iter() {
-                let mut seen: Vec<(StepVariable, Object)> = Vec::new();
-                for (i, t) in terms.iter().enumerate() {
-                    match t {
-                        Ok(o) => {
-                            if row[i] != *o {
-                                continue 'rows;
-                            }
-                        }
-                        Err(rep) => {
-                            if !domains[rep].contains(&row[i]) {
-                                continue 'rows;
-                            }
-                            if let Some((_, o)) = seen.iter().find(|(r, _)| r == rep) {
-                                if *o != row[i] {
-                                    continue 'rows;
-                                }
-                            } else {
-                                seen.push((*rep, row[i]));
-                            }
-                        }
-                    }
-                }
-                any = true;
-                for (i, t) in terms.iter().enumerate() {
-                    if t.is_err() {
-                        support[i].insert(row[i]);
-                    }
-                }
-            }
-            if !any {
+    // Ground constraints are membership tests; the rest seed the domains.
+    let mut by_class: HashMap<StepVariable, Vec<usize>> = HashMap::new();
+    for (index, c) in constraints.iter().enumerate() {
+        if c.terms.iter().all(|t| t.is_ok()) {
+            let ground: Vec<Object> = c.terms.iter().map(|t| *t.as_ref().unwrap()).collect();
+            if !c.table.contains(&ground) {
                 return None;
             }
-            for (i, t) in terms.iter().enumerate() {
+            continue;
+        }
+        for t in &c.terms {
+            if let Err(rep) = t {
+                by_class.entry(*rep).or_default().push(index);
+                domains
+                    .entry(*rep)
+                    .or_insert_with(|| b.domain(&ctx.types, rep.0, rep.1).into_iter().collect());
+            }
+        }
+    }
+    let mut queued = vec![false; constraints.len()];
+    let mut worklist: Vec<usize> = Vec::new();
+    for (index, c) in constraints.iter().enumerate() {
+        if c.terms.iter().any(|t| t.is_err()) {
+            queued[index] = true;
+            worklist.push(index);
+        }
+    }
+    while let Some(index) = worklist.pop() {
+        queued[index] = false;
+        let c = &constraints[index];
+        // Candidate rows: the shortest index list over bound positions or a
+        // small domain's objects, else every row.
+        let mut candidates: Option<Vec<u32>> = None;
+        for (i, t) in c.terms.iter().enumerate() {
+            if let Ok(o) = t {
+                let list = c.table.with(i, *o);
+                if candidates.as_ref().is_none_or(|l| list.len() < l.len()) {
+                    candidates = Some(list.to_vec());
+                }
+            }
+        }
+        if candidates.is_none() {
+            let mut best: Option<(usize, usize)> = None;
+            for (i, t) in c.terms.iter().enumerate() {
                 if let Err(rep) = t {
-                    let domain = domains.get_mut(rep).unwrap();
-                    let before = domain.len();
-                    domain.retain(|o| support[i].contains(o));
-                    if domain.len() != before {
-                        changed = true;
+                    let size: usize = domains[rep].iter().map(|o| c.table.with(i, *o).len()).sum();
+                    if best.is_none_or(|(_, s)| size < s) {
+                        best = Some((i, size));
+                    }
+                }
+            }
+            if let Some((i, size)) = best {
+                if size < c.table.rows.len() {
+                    let Err(rep) = c.terms[i] else { unreachable!() };
+                    let mut list: Vec<u32> =
+                        domains[&rep].iter().flat_map(|o| c.table.with(i, *o).iter().copied()).collect();
+                    list.sort_unstable();
+                    candidates = Some(list);
+                }
+            }
+        }
+        let all: Vec<u32>;
+        let rows: &[u32] = match &candidates {
+            Some(list) => list,
+            None => {
+                all = (0..c.table.rows.len() as u32).collect();
+                &all
+            }
+        };
+        let mut support: Vec<HashSet<Object>> = vec![HashSet::new(); c.terms.len()];
+        let mut any = false;
+        'rows: for &r in rows {
+            let row = &c.table.rows[r as usize];
+            let mut seen: Vec<(StepVariable, Object)> = Vec::new();
+            for (i, t) in c.terms.iter().enumerate() {
+                match t {
+                    Ok(o) => {
+                        if row[i] != *o {
+                            continue 'rows;
+                        }
+                    }
+                    Err(rep) => {
+                        if !domains[rep].contains(&row[i]) {
+                            continue 'rows;
+                        }
+                        if let Some((_, o)) = seen.iter().find(|(r, _)| r == rep) {
+                            if *o != row[i] {
+                                continue 'rows;
+                            }
+                        } else {
+                            seen.push((*rep, row[i]));
+                        }
+                    }
+                }
+            }
+            any = true;
+            for (i, t) in c.terms.iter().enumerate() {
+                if t.is_err() {
+                    support[i].insert(row[i]);
+                }
+            }
+        }
+        if !any {
+            return None;
+        }
+        for (i, t) in c.terms.iter().enumerate() {
+            if let Err(rep) = t {
+                let domain = domains.get_mut(rep).unwrap();
+                let before = domain.len();
+                domain.retain(|o| support[i].contains(o));
+                if domain.len() != before {
+                    for &other in &by_class[rep] {
+                        if other != index && !queued[other] {
+                            queued[other] = true;
+                            worklist.push(other);
+                        }
                     }
                 }
             }
@@ -1186,8 +1280,9 @@ pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: crate::bindings::StepVariable,
         };
         let mut child = plan.clone();
         child.bindings = bindings;
-        if let Some(bindings) = propagate_statics(ctx, &child) {
+        if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
             child.bindings = bindings;
+            child.domains = Some(Rc::new(domains));
             out.push(child);
         }
     }

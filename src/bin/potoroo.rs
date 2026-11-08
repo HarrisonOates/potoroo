@@ -607,6 +607,14 @@ fn run_lifted_fdr(
             stats.dead,
             stats.max_steps
         );
+        let [h, select, bind, refine] = stats.phase;
+        eprintln!(
+            "Lifted FDR time: heuristic {:.2}s | flaw selection {:.2}s | binding choice {:.2}s | refinement {:.2}s",
+            h.as_secs_f64(),
+            select.as_secs_f64(),
+            bind.as_secs_f64(),
+            refine.as_secs_f64()
+        );
     }
     let outcome = match outcome {
         Outcome::Solved(solution) => RunOutcome::Solved {

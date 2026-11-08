@@ -48,6 +48,9 @@ impl Default for Config {
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
+    /// Time in heuristic evaluation, flaw selection, binding choice and
+    /// refinement (with propagation), for profiling.
+    pub phase: [Duration; 4],
     pub generated: usize,
     pub expanded: usize,
     pub dead: usize,
@@ -145,13 +148,16 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let push = |queue: &mut BinaryHeap<Node>, plan: Plan, stats: &mut Stats| {
+    let push = |queue: &mut BinaryHeap<Node>, mut plan: Plan, stats: &mut Stats| {
         stats.generated += 1;
         if mac_budget > 0 && !bindings_feasible(&ctx, &plan, mac_budget) {
             stats.dead += 1;
             return;
         }
+        let started = Instant::now();
         let h = estimator.estimate(&ctx, &plan);
+        stats.phase[0] += started.elapsed();
+        plan.domains = None;
         if !h.is_finite() {
             stats.dead += 1;
             return;
@@ -257,8 +263,44 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
             stats.dead += 1;
             continue;
         }
+        let started = Instant::now();
         let selected = super::flaws::select(&ctx, &plan, &flaw_order, &estimator);
-        let children = match choose_binding(&ctx, &plan, &selected, bind_policy) {
+        stats.phase[1] += started.elapsed();
+        let started = Instant::now();
+        let binding = choose_binding(&ctx, &plan, &selected, bind_policy);
+        stats.phase[2] += started.elapsed();
+        if stats.expanded <= trace {
+            let describe = |consumer: usize, f: &super::task::LFact| {
+                let resolved = super::task::LFact {
+                    var: f.var,
+                    inv: f.inv.iter().map(|t| plan.bindings.binding(*t, consumer)).collect(),
+                    value: match &f.value {
+                        super::task::LValue::None => super::task::LValue::None,
+                        super::task::LValue::Part { part, args } => super::task::LValue::Part {
+                            part: *part,
+                            args: args.iter().map(|t| plan.bindings.binding(*t, consumer)).collect(),
+                        },
+                    },
+                };
+                ctx.task.fact_name(domain, problem, &resolved)
+            };
+            match (&binding, &selected) {
+                (Some((class, objects)), _) => eprintln!("   flaw: bind ?{}@{} over {} objects", class.0 .0, class.1, objects.len()),
+                (None, super::flaws::Flaw::Open(o)) => {
+                    let name = if o.consumer == super::plan::GOAL_ID { "goal".to_string() } else { ctx.schema_of(&plan, o.consumer).name.clone() };
+                    eprintln!("   flaw: open {} for {}@{}", describe(o.consumer, ctx.condition(&plan, o.consumer, o.cond)), name, o.consumer)
+                }
+                (None, super::flaws::Flaw::Threat(t)) => eprintln!(
+                    "   flaw: threat step {} ({}) on {}",
+                    t.step,
+                    ctx.schema_of(&plan, t.step).name,
+                    describe(t.link.consumer, ctx.condition(&plan, t.link.consumer, t.link.cond))
+                ),
+                (None, super::flaws::Flaw::Dead) => eprintln!("   flaw: dead"),
+            }
+        }
+        let started = Instant::now();
+        let children = match binding {
             Some((class, objects)) => super::plan::refine_bind(&ctx, &plan, class, &objects),
             None => match selected {
                 super::flaws::Flaw::Threat(t) => refine_threat(&ctx, &plan, t),
@@ -266,6 +308,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
                 super::flaws::Flaw::Dead => Vec::new(),
             },
         };
+        stats.phase[3] += started.elapsed();
         for child in children {
             push(&mut queue, child, &mut stats);
         }

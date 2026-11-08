@@ -16,7 +16,13 @@ use crate::planning_graph::{HeuristicValue, PlanningGraph};
 use crate::problem::Problem;
 use crate::search::SearchContext;
 
-use super::plan::{reusable, Ctx, Plan};
+
+use crate::bindings::StepVariable;
+use crate::formula::Atom;
+use crate::planning_graph::hv_min;
+use crate::terms::{Object, Term};
+
+use super::plan::{propagate_domains, reusable, Ctx, Plan};
 use super::task::LValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,8 +35,16 @@ pub enum Kind {
     Addr,
 }
 
+pub use super::plan::Domains;
+
+/// Largest product of narrowed domains enumerated per condition.
+const ENUMERATION_LIMIT: usize = 512;
+
 pub struct Estimator {
     kind: Kind,
+    /// Evaluate conditions over propagated binding domains
+    /// (`POTOROO_LFDR_HDOM=0` disables).
+    use_domains: bool,
     graph: Option<Rc<PlanningGraph>>,
 }
 
@@ -44,28 +58,105 @@ impl Estimator {
                 Some(search.planning_graph())
             }
         };
-        Estimator { kind, graph }
+        Estimator {
+            kind,
+            graph,
+            use_domains: std::env::var("POTOROO_LFDR_HDOM").map_or(true, |v| v != "0"),
+        }
     }
 
     /// The planning-graph value of one open condition (infinite when no graph
     /// is built).
     pub fn open_value(&self, ctx: &Ctx, plan: &Plan, open: super::plan::Open) -> HeuristicValue {
+        self.open_value_in(ctx, plan, open, None)
+    }
+
+    /// The planning-graph value of one open condition: the cheapest ground
+    /// atom it admits. With `domains` (from [`propagate_domains`]), variables
+    /// whose class the static and initial-state tables narrowed range over
+    /// those objects only, enumerated when the product is small; other
+    /// variables keep the graph's pattern minimum over type-compatible
+    /// objects.
+    pub fn open_value_in(
+        &self,
+        ctx: &Ctx,
+        plan: &Plan,
+        open: super::plan::Open,
+        domains: Option<&Domains>,
+    ) -> HeuristicValue {
         let Some(graph) = self.graph.as_ref() else {
             return HeuristicValue::ZERO;
         };
         let fact = ctx.condition(plan, open.consumer, open.cond);
-        match &fact.value {
-            LValue::Part { .. } => {
-                let atom = ctx.task.atom_of(fact).expect("part value");
-                graph.heuristic_value_atom(&atom, open.consumer, Some((&ctx.types, &plan.bindings)))
-            }
-            LValue::None => {
-                let predicate = ctx.task.vars[fact.var as usize].parts[0].predicate;
-                let atom = crate::formula::Atom {
-                    predicate,
+        let (atom, negated) = match &fact.value {
+            LValue::Part { .. } => (ctx.task.atom_of(fact).expect("part value"), false),
+            LValue::None => (
+                Atom {
+                    predicate: ctx.task.vars[fact.var as usize].parts[0].predicate,
                     terms: fact.inv.clone(),
-                };
-                graph.heuristic_value_negation(&atom, open.consumer, Some((&ctx.types, &plan.bindings)))
+                },
+                true,
+            ),
+        };
+        let value_of = |atom: &Atom| {
+            if negated {
+                graph.heuristic_value_negation(atom, open.consumer, Some((&ctx.types, &plan.bindings)))
+            } else {
+                graph.heuristic_value_atom(atom, open.consumer, Some((&ctx.types, &plan.bindings)))
+            }
+        };
+        let Some(domains) = domains else {
+            return value_of(&atom);
+        };
+        // Positions per narrowed class.
+        let b = &plan.bindings;
+        let mut classes: Vec<(StepVariable, Vec<usize>, Vec<Object>)> = Vec::new();
+        for (i, t) in atom.terms.iter().enumerate() {
+            if let Term::Variable(v) = b.binding(*t, open.consumer) {
+                let rep = b.representative(v, open.consumer);
+                if let Some(domain) = domains.get(&rep) {
+                    match classes.iter_mut().find(|(r, _, _)| *r == rep) {
+                        Some((_, positions, _)) => positions.push(i),
+                        None => {
+                            let mut objects: Vec<Object> = domain.iter().copied().collect();
+                            objects.sort();
+                            classes.push((rep, vec![i], objects));
+                        }
+                    }
+                }
+            }
+        }
+        let product = classes.iter().try_fold(1usize, |acc, (_, _, d)| acc.checked_mul(d.len()));
+        if classes.is_empty() || product.is_none_or(|p| p > ENUMERATION_LIMIT) {
+            return value_of(&atom);
+        }
+        if product == Some(0) {
+            return HeuristicValue::INFINITE;
+        }
+        let mut best = HeuristicValue::INFINITE;
+        let mut index = vec![0usize; classes.len()];
+        let mut probe = atom.clone();
+        loop {
+            for (k, (_, positions, objects)) in classes.iter().enumerate() {
+                for &p in positions {
+                    probe.terms[p] = Term::Object(objects[index[k]]);
+                }
+            }
+            best = hv_min(best, value_of(&probe));
+            if best.zero() {
+                return best;
+            }
+            let mut k = 0;
+            loop {
+                if k == classes.len() {
+                    return best;
+                }
+                index[k] += 1;
+                if index[k] < classes[k].2.len() {
+                    break;
+                }
+                index[k] = 0;
+                k += 1;
             }
         }
     }
@@ -75,9 +166,19 @@ impl Estimator {
             Kind::Oc => plan.num_opens as f32,
             Kind::Add | Kind::Addr => {
                 let reuse = self.kind == Kind::Addr;
+                let domains = if !self.use_domains {
+                    None
+                } else if let Some(d) = &plan.domains {
+                    Some(d.clone())
+                } else {
+                    match propagate_domains(ctx, plan) {
+                        Some((_, d)) => Some(Rc::new(d)),
+                        None => return f32::INFINITY,
+                    }
+                };
                 let mut total = 0.0;
                 for open in crate::chain::iter(&plan.opens) {
-                    let value = self.open_value(ctx, plan, *open);
+                    let value = self.open_value_in(ctx, plan, *open, domains.as_deref());
                     let cost = value.add_cost();
                     if cost == 0.0 {
                         continue;
