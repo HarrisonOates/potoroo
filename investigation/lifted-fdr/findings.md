@@ -253,3 +253,34 @@ Per-domain levers found so far:
   * Lifted wins nomystery 7–0, zenotravel 7–1, driverlog 4–1, tpp and
     openstacks. `port3c` wins elevators 10–2, depots, rovers, satellite and
     pathways.
+
+## Recipes, speed and memory (to `8c9d79f`)
+
+* **Recipes** (`bf4e828`). Queued children are kept as (parent expansion,
+  choice) and rebuilt on pop.
+  * Identical search, 40–68% less memory.
+  * 375-task calibrated fragment (225 s / 1 GiB): **108 solved**, against 96
+    without recipes. 169 memouts and 98 timeouts, against 266 and 13.
+* **Incremental, allocation-free propagation** (`b2d6000`).
+  * Recipes now cost about what the build without them did.
+  * Same fragment: **109** (gained logistics p08). Faster runs reach the
+    memory limit sooner: 203 memouts, 63 timeouts.
+  * With `port3c` (117 alone): 142.
+* **Copy-free class merges** (`8c9d79f`): −3 to −9% memory, identical
+  searches.
+* **Measured and dropped:**
+  * *Threat-list compaction.* Removals copy only 2–6 nodes on average.
+  * *Queue entries.* Already 32 bytes.
+  * *Allocator overhead.* RSS minus the binary's footprint matches the live
+    heap.
+* **Chained recipes with a plan cache: rejected.**
+  * Each expansion recorded its origin, and built parents were kept only
+    while cached (fixed size, or evicted under address-space pressure).
+  * A fixed cache cuts memory 3–4× but rebuilds 20–74% of expansions; at
+    1024 plans nomystery needed 59M rebuilds.
+  * Chain records add 9–22% even with nothing evicted.
+  * Under 300 MB: logistics p06 still solves (55 s against 51 s), but
+    **nomystery p05 times out where `8c9d79f` solves in 71 s**, and
+    elevators p03 only turns a memout into a timeout.
+  * Non-local pops make rebuild chains too expensive, and the overhead
+    triggers eviction in runs that would have fit.
