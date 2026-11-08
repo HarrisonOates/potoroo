@@ -121,6 +121,15 @@ impl ObjSet {
         changed
     }
 
+    /// Whether every member is also in `other`.
+    pub fn is_subset(&self, other: &ObjSet) -> bool {
+        let theirs = other.slice();
+        self.slice()
+            .iter()
+            .enumerate()
+            .all(|(i, w)| w & !theirs.get(i).copied().unwrap_or(0) == 0)
+    }
+
     pub fn intersects(&self, other: &ObjSet) -> bool {
         self.slice().iter().zip(other.slice()).any(|(a, b)| a & b != 0)
     }

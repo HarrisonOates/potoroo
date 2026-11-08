@@ -63,10 +63,8 @@ struct Class {
     domain: ObjSet,
     distinct: IdList,
     /// The class this one was merged into (union-find without path
-    /// compression; merges link the smaller class under the larger).
+    /// compression; merges link the newer class under the older).
     forward: Option<ClassId>,
-    /// Slots in the class, for union by size.
-    size: u32,
 }
 
 /// A resolved term: an object, or an unbound class.
@@ -117,7 +115,6 @@ impl LBindings {
                 domain,
                 distinct: IdList::default(),
                 forward: None,
-                size: 1,
             }));
         }
     }
@@ -299,18 +296,20 @@ impl LBindings {
         if self.classes[x as usize].distinct.contains(&y) {
             return false;
         }
-        // Keep the larger class.
-        let (keep, gone) = if self.classes[x as usize].size >= self.classes[y as usize].size {
-            (x, y)
-        } else {
-            (y, x)
-        };
+        // Keep the older class. Linking a new step merges its fresh classes
+        // into existing ones, which then usually need no change at all, so
+        // they are not copied: only marked for propagation.
+        let (keep, gone) = (x.min(y), x.max(y));
         let gone_class = (*self.classes[gone as usize]).clone();
-        if let (Some(a), Some(b)) = (self.classes[keep as usize].constant, gone_class.constant) {
+        let kept = &self.classes[keep as usize];
+        if let (Some(a), Some(b)) = (kept.constant, gone_class.constant) {
             if a != b {
                 return false;
             }
         }
+        let narrows = !kept.domain.is_subset(&gone_class.domain);
+        let gains_constant = kept.constant.is_none() && gone_class.constant.is_some();
+        let gains_distinct = !gone_class.distinct.as_slice().is_empty();
         for &d in gone_class.distinct.as_slice() {
             let dc = self.class_mut(d);
             dc.distinct.retain(|&e| e != gone);
@@ -318,9 +317,8 @@ impl LBindings {
                 dc.distinct.push(keep);
             }
         }
-        {
+        if narrows || gains_constant || gains_distinct {
             let k = self.class_mut(keep);
-            k.size += gone_class.size;
             k.domain.intersect_with(&gone_class.domain);
             for &d in gone_class.distinct.as_slice() {
                 if !k.distinct.contains(&d) {
@@ -330,6 +328,8 @@ impl LBindings {
             if k.constant.is_none() {
                 k.constant = gone_class.constant;
             }
+        } else {
+            self.touch(keep);
         }
         {
             let g = self.class_mut(gone);
@@ -337,14 +337,16 @@ impl LBindings {
             g.distinct.clear();
         }
         match self.classes[keep as usize].constant {
-            Some(o) => {
-                // Re-assert the constant against the merged distinct set.
+            // Re-assert the constant against what the merge brought in.
+            Some(o) if gains_constant || gains_distinct => {
                 let k = self.class_mut(keep);
                 k.constant = None;
                 k.domain = std::iter::once(o).collect();
                 self.assign(keep, o)
             }
-            None => self.settle(keep),
+            Some(_) => true,
+            None if narrows => self.settle(keep),
+            None => true,
         }
     }
 }
