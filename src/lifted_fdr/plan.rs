@@ -124,6 +124,52 @@ impl Threat {
     }
 }
 
+/// Which child of a flaw's refinement: enough to rebuild exactly that child
+/// from its parent, since children are generated deterministically. Queued
+/// children can be kept as `(parent, flaw, choice)` and rebuilt when popped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    NewStep { schema: u32, assign: u16, variant: u8 },
+    Reuse { step: u32, assign: u16, variant: u8 },
+    /// Initial-state support; `instance` indexes the `none` enumeration.
+    Init { instance: u32, variant: u8 },
+    /// The threat is no longer possible.
+    Drop,
+    Agree,
+    Demote,
+    Promote,
+    Separate(u8),
+    Bind(Object),
+}
+
+impl Choice {
+    fn with_variant(self, v: u8) -> Choice {
+        match self {
+            Choice::NewStep { schema, assign, .. } => Choice::NewStep { schema, assign, variant: v },
+            Choice::Reuse { step, assign, .. } => Choice::Reuse { step, assign, variant: v },
+            Choice::Init { instance, .. } => Choice::Init { instance, variant: v },
+            other => other,
+        }
+    }
+
+    fn variant(self) -> Option<u8> {
+        match self {
+            Choice::NewStep { variant, .. } | Choice::Reuse { variant, .. } | Choice::Init { variant, .. } => {
+                Some(variant)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `self` names the candidate `key`, whatever its variant.
+    fn names(self, key: Choice) -> bool {
+        self.with_variant(0) == key.with_variant(0)
+    }
+}
+
+/// Children with the choices that rebuild them.
+pub type Children = Vec<(Choice, Plan)>;
+
 #[derive(Debug, Clone)]
 pub struct Plan {
     /// Schema of real step `id` at index `id - 1`.
@@ -533,8 +579,9 @@ pub fn all_statics_possible(ctx: &Ctx, plan: &Plan) -> bool {
 /// Adds the link `producer → consumer` (bindings already unified), then the
 /// constraints that keep a `none` write from being overridden by an add of
 /// the same step, and the new threats. Several children when that constraint
-/// is a disjunction.
-fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
+/// is a disjunction; each is tagged with `key` and its variant index, and
+/// `only` keeps just the variant it names.
+fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, key: Choice, only: Option<Choice>, out: &mut Children) {
     plan.links = chain::cons(link, plan.links.take());
     let mut variants = vec![plan];
     if link.producer() != INIT_ID && link.producer() != GOAL_ID {
@@ -562,18 +609,24 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
             }
         }
     }
-    for mut plan in variants {
+    for (v, mut plan) in variants.into_iter().enumerate() {
+        let choice = key.with_variant(v as u8);
+        if only.is_some_and(|o| o.variant() != choice.variant()) {
+            continue;
+        }
         let Some(bindings) = propagate_statics(ctx, &plan) else {
             continue;
         };
         plan.bindings = bindings;
         link_threats(ctx, &mut plan, link);
-        out.push(plan);
+        out.push((choice, plan));
     }
 }
 
 /// Children resolving an open condition: new steps, reused steps, init.
-pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
+/// With `only`, just the child that choice names (for rebuilding a queued
+/// child).
+pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> Children {
     let base = plan.without_open(open);
     let fact = ctx.condition(plan, open.consumer(), open.cond).clone();
     let c = open.consumer();
@@ -581,6 +634,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
     let mut cs = Vec::new();
     // New steps.
     for &(schema_index, a) in ctx.writers.get(&fact.var).map(|v| v.as_slice()).unwrap_or(&[]) {
+        let key = Choice::NewStep {
+            schema: schema_index,
+            assign: a,
+            variant: 0,
+        };
+        if only.is_some_and(|o| !o.names(key)) {
+            continue;
+        }
         let schema = &ctx.task.schemas[schema_index as usize];
         let n = base.num_steps() + 1;
         cs.clear();
@@ -607,19 +668,11 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
         child.bindings = bindings;
         child.cost += schema.cost;
         for k in (0..schema.conditions.len()).rev() {
-            child.opens = chain::cons(
-                Open::new(n, k as u16),
-                child.opens.take(),
-            );
+            child.opens = chain::cons(Open::new(n, k as u16), child.opens.take());
             child.num_opens += 1;
         }
         step_threats(ctx, &mut child, n);
-        finish_link(
-            ctx,
-            child,
-            Link::new(n, c, open.cond, a),
-            &mut out,
-        );
+        finish_link(ctx, child, Link::new(n, c, open.cond, a), key, only, &mut out);
     }
     // Reuse.
     for w in 1..=base.num_steps() {
@@ -628,6 +681,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
         }
         let schema = ctx.schema_of(&base, w);
         for (a, assign) in schema.assigns.iter().enumerate() {
+            let key = Choice::Reuse {
+                step: w as u32,
+                assign: a as u16,
+                variant: 0,
+            };
+            if only.is_some_and(|o| !o.names(key)) {
+                continue;
+            }
             cs.clear();
             if !unifier(&assign.fact, w, &fact, c, &mut cs) {
                 continue;
@@ -643,12 +704,7 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             child.bindings = bindings;
             // A new ordering can retire no threat but may create none either:
             // existing threats are re-checked on selection.
-            finish_link(
-                ctx,
-                child,
-                Link::new(w, c, open.cond, a as u16),
-                &mut out,
-            );
+            finish_link(ctx, child, Link::new(w, c, open.cond, a as u16), key, only, &mut out);
         }
     }
     // Initial state.
@@ -658,8 +714,9 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             // One child: the condition's tuple must be an initial fact, a
             // table constraint that `propagate_statics` narrows, rather than
             // one child per matching fact.
-            if ctx.init_rows.contains_key(&(fact.var, *part)) {
-                finish_link(ctx, base.clone(), link, &mut out);
+            let key = Choice::Init { instance: 0, variant: 0 };
+            if ctx.init_rows.contains_key(&(fact.var, *part)) && only.is_none_or(|o| o.names(key)) {
+                finish_link(ctx, base.clone(), link, key, only, &mut out);
             }
         }
         LValue::None => {
@@ -689,8 +746,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
                     tuple.pop();
                 }
             }
+            let mut index = 0u32;
             product(0, &domains, &mut tuple, &mut |inv: &[Object]| {
-                if ctx.task.init.contains_key(&(fact.var, inv.to_vec())) {
+                let key = Choice::Init {
+                    instance: index,
+                    variant: 0,
+                };
+                index += 1;
+                if only.is_some_and(|o| !o.names(key)) || ctx.task.init.contains_key(&(fact.var, inv.to_vec())) {
                     return;
                 }
                 let cs: Vec<Constraint> = fact
@@ -702,7 +765,7 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
                 if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
                     let mut child = base.clone();
                     child.bindings = bindings;
-                    finish_link(ctx, child, link, &mut out);
+                    finish_link(ctx, child, link, key, only, &mut out);
                 }
             });
         }
@@ -711,14 +774,15 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
 }
 
 /// Children resolving a threat, or the plan without it when the threat is no
-/// longer possible.
-pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
+/// longer possible. With `only`, just the child that choice names.
+pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat, only: Option<Choice>) -> Children {
     let base = plan.without_threat(threat);
     let link = threat.link;
     let w = threat.step();
     if !threatens(ctx, &base, w, threat.assign, &link) {
-        return vec![base];
+        return vec![(Choice::Drop, base)];
     }
+    let wanted = |c: Choice| only.is_none_or(|o| o == c);
     let mut out = Vec::new();
     let f = ctx.condition(&base, link.consumer(), link.cond).clone();
     let g = ctx.assignment(&base, w, threat.assign).clone();
@@ -726,34 +790,37 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
     // Children are pushed least promising first: ties go to the newest.
     // Agreement: the same instance receives the protected value.
     let mut cs = Vec::new();
-    if unifier(&g, w, &f, c, &mut cs) && !matches!(f.value, LValue::None) {
+    if wanted(Choice::Agree) && unifier(&g, w, &f, c, &mut cs) && !matches!(f.value, LValue::None) {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
             let mut child = base.clone();
             child.bindings = bindings;
             if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                out.push(child);
+                out.push((Choice::Agree, child));
             }
         }
     }
     // Demotion: before the producer.
-    if link.producer() != INIT_ID {
+    if wanted(Choice::Demote) && link.producer() != INIT_ID {
         if let Some(orderings) = base.orderings.refine(before(w, link.producer())) {
             let mut child = base.clone();
             child.orderings = orderings;
-            out.push(child);
+            out.push((Choice::Demote, child));
         }
     }
     // Promotion: after the consumer.
-    if link.consumer() != GOAL_ID {
+    if wanted(Choice::Promote) && link.consumer() != GOAL_ID {
         if let Some(orderings) = base.orderings.refine(before(link.consumer(), w)) {
             let mut child = base.clone();
             child.orderings = orderings;
-            out.push(child);
+            out.push((Choice::Promote, child));
         }
     }
     // Separation on the first differing position, first position last.
     for i in (0..f.inv.len()).rev() {
+        if !wanted(Choice::Separate(i as u8)) {
+            continue;
+        }
         let mut cs: Vec<Constraint> = (0..i).map(|j| (g.inv[j], w, f.inv[j], c, true)).collect();
         cs.push((g.inv[i], w, f.inv[i], c, false));
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
@@ -761,7 +828,7 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
             child.bindings = bindings;
             if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                out.push(child);
+                out.push((Choice::Separate(i as u8), child));
             }
         }
     }
@@ -1246,7 +1313,7 @@ pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(ClassId, Vec<Object>, 
 }
 
 /// Children binding one class to each object of its domain.
-pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: ClassId, objects: &[Object]) -> Vec<Plan> {
+pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: ClassId, objects: &[Object]) -> Children {
     let mut out = Vec::new();
     // Ties go to the newest child: push in reverse so the first object is
     // tried first.
@@ -1258,7 +1325,7 @@ pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: ClassId, objects: &[Object]) -
         child.bindings = bindings;
         if let Some(bindings) = propagate_statics(ctx, &child) {
             child.bindings = bindings;
-            out.push(child);
+            out.push((Choice::Bind(o), child));
         }
     }
     out

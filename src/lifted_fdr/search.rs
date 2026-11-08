@@ -126,11 +126,33 @@ pub enum Outcome {
     LimitReached,
 }
 
+/// The flaw a queued child refined, to rebuild it from its parent.
+#[derive(Clone, Copy)]
+enum Refined {
+    Open(super::plan::Open),
+    Threat(super::plan::Threat),
+    Bind(super::binds::ClassId),
+}
+
+/// A queued plan: built, or a recipe rebuilt on pop. Recipes keep only the
+/// parent (shared with siblings) and which refinement made the child; the
+/// child is ranked when generated and then dropped, as the ground FDR
+/// planner does for new steps. At the cluster's time/memory ratio searches
+/// run out of memory long before time, so the rebuild is worth its cost.
+enum Entry {
+    Built(Rc<Plan>),
+    Recipe {
+        parent: Rc<Plan>,
+        flaw: Refined,
+        choice: super::plan::Choice,
+    },
+}
+
 struct Node {
     f: f32,
     h: f32,
     id: usize,
-    plan: Rc<Plan>,
+    entry: Entry,
 }
 
 impl PartialEq for Node {
@@ -178,10 +200,12 @@ struct Search<'a, 'c> {
     bind_policy: BindPolicy,
     mac_budget: usize,
     trace: usize,
+    /// Queue children as recipes (`POTOROO_LFDR_DEFER=0` stores them built).
+    defer: bool,
 }
 
 impl Search<'_, '_> {
-    fn push(&self, lane: &mut Running, plan: Plan, stats: &mut Stats) {
+    fn push(&self, lane: &mut Running, plan: Plan, recipe: Option<(&Rc<Plan>, Refined, super::plan::Choice)>, stats: &mut Stats) {
         stats.generated += 1;
         if self.mac_budget > 0 && !bindings_feasible(self.ctx, &plan, self.mac_budget) {
             stats.dead += 1;
@@ -194,11 +218,20 @@ impl Search<'_, '_> {
             stats.dead += 1;
             return;
         }
+        let f = plan.cost as f32 + self.weight * h;
+        let entry = match recipe {
+            Some((parent, flaw, choice)) if self.defer => Entry::Recipe {
+                parent: parent.clone(),
+                flaw,
+                choice,
+            },
+            _ => Entry::Built(Rc::new(plan)),
+        };
         lane.queue.push(Node {
-            f: plan.cost as f32 + self.weight * h,
+            f,
             h,
             id: stats.generated,
-            plan: Rc::new(plan),
+            entry,
         });
     }
 
@@ -210,7 +243,21 @@ impl Search<'_, '_> {
         };
         let ctx = self.ctx;
         stats.expanded += 1;
-        let plan = node.plan.clone();
+        let plan = match &node.entry {
+            Entry::Built(plan) => plan.clone(),
+            Entry::Recipe { parent, flaw, choice } => {
+                let started = Instant::now();
+                let rebuilt = rebuild(ctx, parent, *flaw, *choice);
+                stats.phase[3] += started.elapsed();
+                match rebuilt {
+                    Some(plan) => Rc::new(plan),
+                    None => {
+                        debug_assert!(false, "a queued recipe must rebuild");
+                        return None;
+                    }
+                }
+            }
+        };
         stats.max_steps = stats.max_steps.max(plan.num_steps());
         if plan.complete() {
             if let Some(solution) = complete(ctx, self.domain, self.problem, &plan) {
@@ -229,17 +276,17 @@ impl Search<'_, '_> {
             self.trace_node(lane, &node, &plan, &selected, &binding);
         }
         let started = Instant::now();
-        let children = match binding {
-            Some((class, objects)) => super::plan::refine_bind(ctx, &plan, class, &objects),
+        let (refined, children) = match binding {
+            Some((class, objects)) => (Refined::Bind(class), super::plan::refine_bind(ctx, &plan, class, &objects)),
             None => match selected {
-                super::flaws::Flaw::Threat(t) => refine_threat(ctx, &plan, t),
-                super::flaws::Flaw::Open(o) => refine_open(ctx, &plan, o),
-                super::flaws::Flaw::Dead => Vec::new(),
+                super::flaws::Flaw::Threat(t) => (Refined::Threat(t), refine_threat(ctx, &plan, t, None)),
+                super::flaws::Flaw::Open(o) => (Refined::Open(o), refine_open(ctx, &plan, o, None)),
+                super::flaws::Flaw::Dead => (Refined::Bind(0), Vec::new()),
             },
         };
         stats.phase[3] += started.elapsed();
-        for child in children {
-            self.push(lane, child, stats);
+        for (choice, child) in children {
+            self.push(lane, child, Some((&plan, refined, choice)), stats);
         }
         None
     }
@@ -338,6 +385,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         bind_policy: BindPolicy::from_env(),
         mac_budget: std::env::var("POTOROO_LFDR_MAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         trace: std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        defer: std::env::var("POTOROO_LFDR_DEFER").map_or(true, |v| v != "0"),
     };
     // One planning graph serves every lane.
     let mut graph = None;
@@ -354,7 +402,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         })
         .collect();
     for lane in &mut running {
-        search.push(lane, root.clone(), &mut stats);
+        search.push(lane, root.clone(), None, &mut stats);
     }
     let start = Instant::now();
     loop {
@@ -374,6 +422,18 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
             }
         }
     }
+}
+
+/// Rebuilds the child that `choice` names from `parent`.
+fn rebuild(ctx: &Ctx, parent: &Plan, flaw: Refined, choice: super::plan::Choice) -> Option<Plan> {
+    let mut children = match (flaw, choice) {
+        (Refined::Open(o), _) => refine_open(ctx, parent, o, Some(choice)),
+        (Refined::Threat(t), _) => refine_threat(ctx, parent, t, Some(choice)),
+        (Refined::Bind(class), super::plan::Choice::Bind(o)) => super::plan::refine_bind(ctx, parent, class, &[o]),
+        (Refined::Bind(_), _) => Vec::new(),
+    };
+    debug_assert!(children.len() <= 1);
+    children.pop().map(|(_, plan)| plan)
 }
 
 /// When an unbound variable is the flaw to refine.
