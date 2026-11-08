@@ -62,6 +62,10 @@ impl ObjSet {
         changed
     }
 
+    pub fn intersects(&self, other: &ObjSet) -> bool {
+        self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
+    }
+
     pub fn union_with(&mut self, other: &ObjSet) {
         if other.words.len() > self.words.len() {
             self.words.resize(other.words.len(), 0);

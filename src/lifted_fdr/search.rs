@@ -181,7 +181,7 @@ struct Search<'a, 'c> {
 }
 
 impl Search<'_, '_> {
-    fn push(&self, lane: &mut Running, mut plan: Plan, stats: &mut Stats) {
+    fn push(&self, lane: &mut Running, plan: Plan, stats: &mut Stats) {
         stats.generated += 1;
         if self.mac_budget > 0 && !bindings_feasible(self.ctx, &plan, self.mac_budget) {
             stats.dead += 1;
@@ -190,7 +190,6 @@ impl Search<'_, '_> {
         let started = Instant::now();
         let h = lane.estimator.estimate(self.ctx, &plan);
         stats.phase[0] += started.elapsed();
-        plan.domains = None;
         if !h.is_finite() {
             stats.dead += 1;
             return;
@@ -251,7 +250,7 @@ impl Search<'_, '_> {
         node: &Node,
         plan: &Plan,
         selected: &super::flaws::Flaw,
-        binding: &Option<(crate::bindings::StepVariable, Vec<Object>)>,
+        binding: &Option<(super::binds::ClassId, Vec<Object>)>,
     ) {
         let ctx = self.ctx;
         let describe = |consumer: usize, f: &super::task::LFact| {
@@ -270,7 +269,7 @@ impl Search<'_, '_> {
             ctx.task.fact_name(self.domain, self.problem, &resolved)
         };
         let flaw = match (binding, selected) {
-            (Some((class, objects)), _) => format!("bind ?{}@{} over {} objects", class.0 .0, class.1, objects.len()),
+            (Some((class, objects)), _) => format!("bind class {} over {} objects", class, objects.len()),
             (None, super::flaws::Flaw::Open(o)) => {
                 let name = if o.consumer == super::plan::GOAL_ID {
                     "goal".to_string()
@@ -407,7 +406,7 @@ fn choose_binding(
     selected: &super::flaws::Flaw,
     policy: BindPolicy,
     degree_binding: bool,
-) -> Option<(crate::bindings::StepVariable, Vec<Object>)> {
+) -> Option<(super::binds::ClassId, Vec<Object>)> {
     use super::flaws::Flaw;
     match policy {
         BindPolicy::Never => None,
@@ -447,7 +446,7 @@ fn threat_binding(
     plan: &Plan,
     selected: &super::flaws::Flaw,
     degree_rule: bool,
-) -> Option<(crate::bindings::StepVariable, Vec<Object>)> {
+) -> Option<(super::binds::ClassId, Vec<Object>)> {
     use super::flaws::Flaw;
     if matches!(selected, Flaw::Dead) || plan.num_threats == 0 {
         return None;
@@ -457,7 +456,7 @@ fn threat_binding(
             return None;
         }
     }
-    let mut touching: std::collections::HashMap<crate::bindings::StepVariable, Vec<super::plan::Threat>> =
+    let mut touching: std::collections::HashMap<super::binds::ClassId, Vec<super::plan::Threat>> =
         Default::default();
     for t in chain::iter(&plan.threats) {
         if super::plan::definite(ctx, plan, t) {
@@ -473,7 +472,7 @@ fn threat_binding(
     if touching.is_empty() {
         return None;
     }
-    let mut best: Option<(f32, usize, crate::bindings::StepVariable, Vec<Object>)> = None;
+    let mut best: Option<(f32, usize, super::binds::ClassId, Vec<Object>)> = None;
     for (class, full, domain) in super::plan::binding_candidates(ctx, plan) {
         let Some(threats) = touching.get(&class) else {
             continue;
@@ -523,14 +522,9 @@ fn threat_binding(
 /// Grounds every step variable consistently with bindings and static
 /// constraints, linearises, and validates against the STRIPS semantics.
 fn complete(ctx: &Ctx, domain: &Domain, problem: &Problem, plan: &Plan) -> Option<Solution> {
-    let mut variables = Vec::new();
-    for step in 1..=plan.num_steps() {
-        for v in &ctx.schema_of(plan, step).parameters {
-            variables.push((*v, step));
-        }
-    }
     let mut bindings = plan.bindings.clone();
-    if !ground(ctx, plan, &variables, 0, &mut bindings) {
+    let mut budget = usize::MAX;
+    if ground_within(ctx, plan, &mut bindings, &mut budget) != Some(true) {
         if std::env::var_os("POTOROO_TRACE").is_some() {
             eprintln!("  (grounding search exhausted)");
         }
@@ -576,59 +570,35 @@ fn complete(ctx: &Ctx, domain: &Domain, problem: &Problem, plan: &Plan) -> Optio
     }
 }
 
-fn ground(
-    ctx: &Ctx,
-    plan: &Plan,
-    variables: &[(crate::terms::Variable, usize)],
-    i: usize,
-    bindings: &mut Rc<crate::bindings::Bindings>,
-) -> bool {
-    let mut budget = usize::MAX;
-    ground_within(ctx, plan, variables, i, bindings, &mut budget) == Some(true)
-}
-
-/// Depth-first grounding with arc consistency at each assignment (MAC).
-/// `None` when the assignment budget runs out before an answer.
-fn ground_within(
-    ctx: &Ctx,
-    plan: &Plan,
-    variables: &[(crate::terms::Variable, usize)],
-    i: usize,
-    bindings: &mut Rc<crate::bindings::Bindings>,
-    budget: &mut usize,
-) -> Option<bool> {
-    if i == variables.len() {
+/// Depth-first grounding of the unbound classes, smallest domain first,
+/// with arc consistency at each assignment (MAC). `None` when the assignment
+/// budget runs out before an answer.
+fn ground_within(ctx: &Ctx, plan: &Plan, bindings: &mut super::binds::LBindings, budget: &mut usize) -> Option<bool> {
+    let Some(class) = bindings.unbound_classes().min_by_key(|&c| (bindings.domain(c).len(), c)) else {
         return Some(true);
-    }
-    let (v, step) = variables[i];
-    if let Term::Object(_) = bindings.binding(Term::Variable(v), step) {
-        return ground_within(ctx, plan, variables, i + 1, bindings, budget);
-    }
-    for o in bindings.domain(&ctx.types, v, step) {
+    };
+    let objects: Vec<Object> = bindings.domain(class).iter().collect();
+    for o in objects {
         if *budget == 0 {
             return None;
         }
         *budget -= 1;
-        let saved = bindings.clone();
-        let Some(next) = bindings.add(
-            &ctx.types,
-            &[crate::bindings::Binding::new(v, step, Term::Object(o), step, true)],
-            false,
-        ) else {
+        let Some(next) = bindings.bind(class, o) else {
             continue;
         };
         let mut probe = plan.clone();
         probe.bindings = next;
-        let Some(propagated) = super::plan::propagate_statics(ctx, &probe) else {
+        let Some(mut propagated) = super::plan::propagate_statics(ctx, &probe) else {
             continue;
         };
-        *bindings = propagated;
-        match ground_within(ctx, plan, variables, i + 1, bindings, budget) {
-            Some(true) => return Some(true),
+        match ground_within(ctx, plan, &mut propagated, budget) {
+            Some(true) => {
+                *bindings = propagated;
+                return Some(true);
+            }
             None => return None,
             Some(false) => {}
         }
-        *bindings = saved;
     }
     Some(false)
 }
@@ -636,15 +606,9 @@ fn ground_within(
 /// Whether the plan's binding constraints have a solution, searched within
 /// `budget` assignments; an exhausted budget counts as feasible.
 pub fn bindings_feasible(ctx: &Ctx, plan: &Plan, budget: usize) -> bool {
-    let mut variables = Vec::new();
-    for step in 1..=plan.num_steps() {
-        for v in &ctx.schema_of(plan, step).parameters {
-            variables.push((*v, step));
-        }
-    }
     let mut bindings = plan.bindings.clone();
     let mut budget = budget;
-    ground_within(ctx, plan, &variables, 0, &mut bindings, &mut budget) != Some(false)
+    ground_within(ctx, plan, &mut bindings, &mut budget) != Some(false)
 }
 
 /// Simulates the plan under STRIPS semantics (deletes before adds).

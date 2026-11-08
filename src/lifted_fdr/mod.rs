@@ -7,6 +7,7 @@
 //! whenever its value may differ, so mutual exclusion is visible to threat
 //! detection without e-deletion.
 
+pub mod binds;
 pub mod flaws;
 pub mod heuristic;
 pub mod invariants;

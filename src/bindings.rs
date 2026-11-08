@@ -667,17 +667,6 @@ impl Bindings {
         term
     }
 
-    /// The step variables recorded as non-codesignating with `var`'s class
-    /// (raw members; callers map them to representatives). Read-only.
-    pub(crate) fn non_codesignated(&self, var: Variable, step_id: usize) -> Vec<StepVariable> {
-        if step_id > self.high_step {
-            return Vec::new();
-        }
-        self.find_var_node(var, step_id)
-            .map(|(_, node)| chain::iter(&node.head.ncd_set).copied().collect())
-            .unwrap_or_default()
-    }
-
     /// A representative shared by all members of an equality class in this
     /// snapshot. Used by transient joint-domain propagation across steps.
     pub(crate) fn representative(&self, var: Variable, step_id: usize) -> StepVariable {

@@ -113,6 +113,9 @@ pub struct LSchema {
     /// Emptied by compilation: variables are global, typed by
     /// [`LiftedTask::var_types`].
     pub var_types: Vec<Type>,
+    /// The schema's global variables are `var_base .. var_base + var_count`.
+    pub var_base: u32,
+    pub var_count: u32,
     pub conditions: Vec<LFact>,
     pub statics: Vec<Atom>,
     /// Static atoms that must be false.
@@ -348,6 +351,8 @@ impl LiftedTask {
             inequalities: Vec::new(),
             assigns: Vec::new(),
             cost: action.cost,
+            var_base: 0,
+            var_count: 0,
         };
         if !action.cost_specs.is_empty() || !action.conditional_costs.is_empty() {
             if action.cost_specs.iter().any(|s| !s.is_argument_free()) || !action.conditional_costs.is_empty() {
@@ -555,6 +560,8 @@ impl LiftedTask {
 fn globalise(schema: &mut LSchema, var_types: &mut Vec<Type>) {
     let offset = var_types.len() as u32;
     var_types.extend(schema.var_types.iter().copied());
+    schema.var_base = offset;
+    schema.var_count = schema.var_types.len() as u32;
     let map = |t: &mut Term| {
         if let Term::Variable(v) = t {
             *v = Variable(v.0 + offset);

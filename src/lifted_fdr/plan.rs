@@ -1,7 +1,7 @@
 //! Lifted FDR partial plans and their refinement.
 //!
-//! A step is a schema whose variables are scoped by the step id in the shared
-//! [`Bindings`]. A causal link protects the consumer's condition `G(t̄)=y`
+//! A step is a schema whose variables are scoped by the step id in the
+//! plan's [`LBindings`]. A causal link protects the consumer's condition `G(t̄)=y`
 //! from its producer to its consumer. Step `w` with assignment `G(ū):=x`
 //! threatens it when `w` may fall between them, `ū` may co-designate with `t̄`,
 //! and `x` may differ from `y` (the SAS⁺ clobbering test, lifted as in FAPE).
@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::bindings::{Binding, Bindings, StepVarTypes, TypeContext};
+use crate::bindings::{StepVarTypes, TypeContext};
 use crate::chain::{self, Chain};
 use crate::formula::Atom;
 use crate::orderings::{BinaryOrderings, Ordering, StepTime};
@@ -22,6 +22,7 @@ use crate::predicates::Predicate;
 use crate::terms::{Object, Term, Variable};
 use crate::types::Type;
 
+use super::binds::{ClassId, Constraint, LBindings, Resolved};
 use super::objset::ObjSet;
 use super::task::{LFact, LValue, LiftedTask};
 
@@ -61,17 +62,11 @@ pub struct Plan {
     pub opens: Option<Rc<Chain<Open>>>,
     pub threats: Option<Rc<Chain<Threat>>>,
     pub orderings: Rc<BinaryOrderings>,
-    pub bindings: Rc<Bindings>,
+    pub bindings: LBindings,
     pub cost: usize,
     pub num_opens: usize,
     pub num_threats: usize,
-    /// Domains from the propagation that produced this plan, kept only until
-    /// its heuristic evaluation so the evaluation need not propagate again.
-    pub domains: Option<Rc<Domains>>,
 }
-
-/// Narrowed domains per equality class.
-pub type Domains = crate::fasthash::FastMap<crate::bindings::StepVariable, ObjSet>;
 
 /// A relation (static predicate or a variable's initial values) with a
 /// membership set and per-position row indexes.
@@ -204,9 +199,6 @@ pub struct Ctx<'a> {
     /// Interchangeable objects (Fox & Long), for breaking value symmetry in
     /// binding flaws; `None` disables it.
     pub symmetries: Option<Rc<crate::symmetry::ObjectSymmetries>>,
-    /// A new step's parameters still free after linking are bound on
-    /// insertion when their domain has at most this many objects (0: never).
-    pub bind_limit: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -252,30 +244,25 @@ impl<'a> Ctx<'a> {
             statics: StaticIndex::new(&task.static_atoms),
             writers,
             init_by_var,
-            bind_limit: std::env::var("POTOROO_LFDR_BIND")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
         }
     }
 
-    /// The possible objects of an unbound class: its type's objects minus the
-    /// constants it may not codesignate with ([`Bindings::domain`], as a
-    /// bitset).
-    pub fn class_domain(&self, b: &Bindings, var: Variable, step: usize) -> ObjSet {
+    /// The objects of a global variable's type.
+    pub fn type_set(&self, var: Variable) -> ObjSet {
         let ty = self.task.var_types[var.0 as usize];
-        let mut set = self
-            .type_sets
+        self.type_sets
             .borrow_mut()
             .entry(ty)
             .or_insert_with(|| self.types.compatible_objects(ty).into_iter().collect())
-            .clone();
-        for (v, s) in b.non_codesignated(var, step) {
-            if let Term::Object(o) = b.binding(Term::Variable(v), s) {
-                set.remove(o);
-            }
-        }
-        set
+            .clone()
+    }
+
+    /// Adds a step of `schema` to the plan's bindings.
+    fn add_step_bindings(&self, bindings: &mut LBindings, schema: &super::task::LSchema) {
+        bindings.add_step(
+            schema.var_base,
+            (0..schema.var_count).map(|i| self.type_set(Variable(schema.var_base + i))),
+        );
     }
 
     pub fn schema_of(&self, plan: &Plan, step: usize) -> &super::task::LSchema {
@@ -296,29 +283,9 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// An equality or inequality between scoped terms.
-type Constraint = (Term, usize, Term, usize, bool);
-
 /// Adds scoped (in)equalities, or `None` if inconsistent.
-fn constrain(ctx: &Ctx, bindings: &Rc<Bindings>, constraints: &[Constraint]) -> Option<Rc<Bindings>> {
-    let mut new = Vec::with_capacity(constraints.len());
-    for &(l, ls, r, rs, eq) in constraints {
-        let l = bindings.binding(l, ls);
-        let r = bindings.binding(r, rs);
-        match (l, r) {
-            (Term::Object(a), Term::Object(b)) => {
-                if (a == b) != eq {
-                    return None;
-                }
-            }
-            (Term::Variable(v), t) => new.push(Binding::new(v, ls, t, rs, eq)),
-            (t, Term::Variable(v)) => new.push(Binding::new(v, rs, t, ls, eq)),
-        }
-    }
-    if new.is_empty() {
-        return Some(bindings.clone());
-    }
-    bindings.add(&ctx.types, &new, false)
+fn constrain(_ctx: &Ctx, bindings: &LBindings, constraints: &[Constraint]) -> Option<LBindings> {
+    bindings.add(constraints)
 }
 
 /// Equalities unifying two facts' instances and values, or `None` when their
@@ -354,7 +321,7 @@ impl Plan {
                 opens,
             );
         }
-        let mut bindings = Bindings::empty();
+        let mut bindings = LBindings::default();
         let goal_constraints: Vec<Constraint> = ctx
             .task
             .goal_equalities
@@ -378,7 +345,6 @@ impl Plan {
             bindings,
             cost: 0,
             num_threats: 0,
-            domains: None,
         })
     }
 
@@ -436,7 +402,7 @@ pub fn threatens(ctx: &Ctx, plan: &Plan, w: usize, assign: u16, link: &Link) -> 
         .inv
         .iter()
         .zip(&g.inv)
-        .all(|(t, u)| b.terms_can_equal(&ctx.types, *u, w, *t, c))
+        .all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
     {
         return false;
     }
@@ -534,11 +500,10 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
         }
     }
     for mut plan in variants {
-        let Some((bindings, domains)) = propagate_domains(ctx, &plan) else {
+        let Some(bindings) = propagate_statics(ctx, &plan) else {
             continue;
         };
         plan.bindings = bindings;
-        plan.domains = Some(Rc::new(domains));
         link_threats(ctx, &mut plan, link);
         out.push(plan);
     }
@@ -568,7 +533,9 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
         let Some(orderings) = base.orderings.refine_with_step(before(n, c), n) else {
             continue;
         };
-        let Some(bindings) = constrain(ctx, &base.bindings, &cs) else {
+        let mut with_step = base.bindings.clone();
+        ctx.add_step_bindings(&mut with_step, schema);
+        let Some(bindings) = constrain(ctx, &with_step, &cs) else {
             continue;
         };
         let mut child = base.clone();
@@ -589,7 +556,6 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             child.num_opens += 1;
         }
         step_threats(ctx, &mut child, n);
-        let mut linked = Vec::new();
         finish_link(
             ctx,
             child,
@@ -599,11 +565,8 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
                 cond: open.cond,
                 assign: a,
             },
-            &mut linked,
+            &mut out,
         );
-        for plan in linked {
-            bind_small(ctx, plan, n, ctx.bind_limit, &mut out);
-        }
     }
     // Reuse.
     for w in 1..=base.num_steps() {
@@ -661,9 +624,9 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             let domains: Vec<Vec<Object>> = fact
                 .inv
                 .iter()
-                .map(|t| match base.bindings.binding(*t, c) {
-                    Term::Object(o) => vec![o],
-                    Term::Variable(v) => base.bindings.domain(&ctx.types, v, c).into_iter().collect(),
+                .map(|t| match base.bindings.resolve(*t, c) {
+                    Resolved::Object(o) => vec![o],
+                    Resolved::Class(k) => base.bindings.domain(k).iter().collect(),
                 })
                 .collect();
             let mut tuple = Vec::with_capacity(domains.len());
@@ -724,9 +687,8 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
             let mut child = base.clone();
             child.bindings = bindings;
-            if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
+            if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                child.domains = Some(Rc::new(domains));
                 out.push(child);
             }
         }
@@ -754,14 +716,32 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
             let mut child = base.clone();
             child.bindings = bindings;
-            if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
+            if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                child.domains = Some(Rc::new(domains));
                 out.push(child);
             }
         }
     }
     out
+}
+
+/// Whether a unifier between a not-yet-added step `n` and the plan is
+/// consistent as far as types and existing domains tell: an upper bound for
+/// counting refinements without adding the step.
+fn new_step_compatible(ctx: &Ctx, plan: &Plan, cs: &[Constraint], n: usize) -> bool {
+    let side = |t: Term, step: usize| -> Option<ObjSet> {
+        match t {
+            Term::Object(o) => Some(std::iter::once(o).collect()),
+            Term::Variable(v) if step == n => Some(ctx.type_set(v)),
+            Term::Variable(_) => match plan.bindings.resolve(t, step) {
+                Resolved::Object(o) => Some(std::iter::once(o).collect()),
+                Resolved::Class(k) => Some(plan.bindings.domain(k).clone()),
+            },
+        }
+    };
+    cs.iter().all(|&(l, ls, r, rs, equal)| {
+        !equal || matches!((side(l, ls), side(r, rs)), (Some(a), Some(b)) if a.intersects(&b))
+    })
 }
 
 /// Supporters of an open condition whose unifier is consistent, counted up to
@@ -776,7 +756,7 @@ pub fn count_refinements(ctx: &Ctx, plan: &Plan, open: Open, limit: usize) -> us
     for &(schema_index, a) in ctx.writers.get(&fact.var).map(|v| v.as_slice()).unwrap_or(&[]) {
         let schema = &ctx.task.schemas[schema_index as usize];
         cs.clear();
-        if unifier(&schema.assigns[a as usize].fact, n, fact, c, &mut cs) && consistent(&cs) {
+        if unifier(&schema.assigns[a as usize].fact, n, fact, c, &mut cs) && new_step_compatible(ctx, plan, &cs, n) {
             count += 1;
             if count >= limit {
                 return count;
@@ -862,44 +842,50 @@ pub fn definite(ctx: &Ctx, plan: &Plan, threat: &Threat) -> bool {
 }
 
 /// Generalised arc consistency over the steps' static atoms and over the
-/// initial-state links (their tuple must be an initial fact). Domains are kept
-/// per equality class (a representative step variable), start from the type
-/// and non-codesignation domain, and shrink to the projections of the static
-/// rows that agree with them. `None` when some atom has no supporting row.
-/// Classes left with one object are bound, which also sharpens threat
-/// detection and the heuristic's patterns.
-pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<Rc<Bindings>> {
-    propagate_domains(ctx, plan).map(|(bindings, _)| bindings)
+/// initial-state links (their tuple must be an initial fact), per equality
+/// class, then Hall's condition over distinct classes. The narrowed domains
+/// are written back to the bindings, which binds classes left with one
+/// object; that may narrow distinct classes, so the pass repeats until
+/// nothing changes. `None` when some constraint has no supporting row.
+pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<LBindings> {
+    let mut bindings = plan.bindings.clone();
+    loop {
+        let narrowed = narrow(ctx, plan, &bindings)?;
+        if narrowed.is_empty() {
+            break;
+        }
+        for (class, domain) in narrowed {
+            if !bindings.restrict(class, &domain) {
+                return None;
+            }
+        }
+    }
+    // Negated statics, once decided (positive ones are table constraints).
+    for step in 1..=plan.num_steps() {
+        for atom in &ctx.schema_of(plan, step).negated_statics {
+            let terms: Vec<Term> = atom.terms.iter().map(|t| bindings.binding(*t, step)).collect();
+            if terms.iter().all(|t| t.object())
+                && ctx.statics.contains(&Atom {
+                    predicate: atom.predicate,
+                    terms,
+                })
+            {
+                return None;
+            }
+        }
+    }
+    Some(bindings)
 }
 
-/// [`propagate_statics`], also returning the narrowed domains of the classes
-/// that table or distinctness constraints touch.
-pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domains)> {
-    use crate::bindings::StepVariable;
-    let b = &plan.bindings;
-    let mut domains: Domains = Domains::default();
-    // Table constraints over resolved terms.
+/// One arc-consistency fixpoint under `b`: the classes whose domains shrank,
+/// with their new domains, or `None` when inconsistent.
+fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)>> {
+    let mut domains: crate::fasthash::FastMap<ClassId, ObjSet> = Default::default();
     struct Constraint<'t> {
-        terms: Vec<Result<Object, StepVariable>>,
+        terms: Vec<Resolved>,
         table: &'t Table,
     }
-    // Step variables recur across constraints: resolve each once.
-    let memo: std::cell::RefCell<crate::fasthash::FastMap<(Variable, usize), Result<Object, StepVariable>>> =
-        Default::default();
-    let resolve = |terms: &[Term], step: usize| -> Vec<Result<Object, StepVariable>> {
-        terms
-            .iter()
-            .map(|t| match *t {
-                Term::Object(o) => Ok(o),
-                Term::Variable(v) => *memo.borrow_mut().entry((v, step)).or_insert_with(|| {
-                    match b.binding(Term::Variable(v), step) {
-                        Term::Object(o) => Ok(o),
-                        Term::Variable(v) => Err(b.representative(v, step)),
-                    }
-                }),
-            })
-            .collect()
-    };
+    let resolve = |terms: &[Term], step: usize| -> Vec<Resolved> { terms.iter().map(|t| b.resolve(*t, step)).collect() };
     let empty = Table::default();
     let mut constraints: Vec<Constraint> = Vec::new();
     for step in 1..=plan.num_steps() {
@@ -925,30 +911,35 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         }
     }
     // Ground constraints are membership tests; the rest seed the domains.
-    let mut by_class: crate::fasthash::FastMap<StepVariable, Vec<usize>> = Default::default();
+    let mut by_class: crate::fasthash::FastMap<ClassId, Vec<usize>> = Default::default();
+    let object = |t: &Resolved| match t {
+        Resolved::Object(o) => Some(*o),
+        Resolved::Class(_) => None,
+    };
     for (index, c) in constraints.iter().enumerate() {
-        if c.terms.iter().all(|t| t.is_ok()) {
-            let ground: Vec<Object> = c.terms.iter().map(|t| *t.as_ref().unwrap()).collect();
+        if c.terms.iter().all(|t| object(t).is_some()) {
+            let ground: Vec<Object> = c.terms.iter().filter_map(object).collect();
             if !c.table.contains(&ground) {
                 return None;
             }
             continue;
         }
         for t in &c.terms {
-            if let Err(rep) = t {
-                by_class.entry(*rep).or_default().push(index);
-                domains.entry(*rep).or_insert_with(|| ctx.class_domain(b, rep.0, rep.1));
+            if let Resolved::Class(k) = t {
+                by_class.entry(*k).or_default().push(index);
+                domains.entry(*k).or_insert_with(|| b.domain(*k).clone());
             }
         }
     }
     let mut queued = vec![false; constraints.len()];
     let mut worklist: Vec<usize> = Vec::new();
     for (index, c) in constraints.iter().enumerate() {
-        if c.terms.iter().any(|t| t.is_err()) {
+        if c.terms.iter().any(|t| object(t).is_none()) {
             queued[index] = true;
             worklist.push(index);
         }
     }
+    let mut support: Vec<ObjSet> = Vec::new();
     while let Some(index) = worklist.pop() {
         queued[index] = false;
         let c = &constraints[index];
@@ -956,7 +947,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         // small domain's objects, else every row.
         let mut candidates: Option<Vec<u32>> = None;
         for (i, t) in c.terms.iter().enumerate() {
-            if let Ok(o) = t {
+            if let Resolved::Object(o) = t {
                 let list = c.table.with(i, *o);
                 if candidates.as_ref().is_none_or(|l| list.len() < l.len()) {
                     candidates = Some(list.to_vec());
@@ -966,8 +957,8 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         if candidates.is_none() {
             let mut best: Option<(usize, usize)> = None;
             for (i, t) in c.terms.iter().enumerate() {
-                if let Err(rep) = t {
-                    let size: usize = domains[rep].iter().map(|o| c.table.with(i, o).len()).sum();
+                if let Resolved::Class(k) = t {
+                    let size: usize = domains[k].iter().map(|o| c.table.with(i, o).len()).sum();
                     if best.is_none_or(|(_, s)| size < s) {
                         best = Some((i, size));
                     }
@@ -975,9 +966,9 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
             }
             if let Some((i, size)) = best {
                 if size < c.table.rows.len() {
-                    let Err(rep) = c.terms[i] else { unreachable!() };
+                    let Resolved::Class(k) = c.terms[i] else { unreachable!() };
                     let mut list: Vec<u32> =
-                        domains[&rep].iter().flat_map(|o| c.table.with(i, o).iter().copied()).collect();
+                        domains[&k].iter().flat_map(|o| c.table.with(i, o).iter().copied()).collect();
                     list.sort_unstable();
                     candidates = Some(list);
                 }
@@ -991,35 +982,36 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
                 &all
             }
         };
-        let mut support: Vec<ObjSet> = vec![ObjSet::default(); c.terms.len()];
+        support.clear();
+        support.resize(c.terms.len(), ObjSet::default());
         let mut any = false;
         'rows: for &r in rows {
             let row = &c.table.rows[r as usize];
-            let mut seen: Vec<(StepVariable, Object)> = Vec::new();
+            let mut seen: Vec<(ClassId, Object)> = Vec::new();
             for (i, t) in c.terms.iter().enumerate() {
                 match t {
-                    Ok(o) => {
+                    Resolved::Object(o) => {
                         if row[i] != *o {
                             continue 'rows;
                         }
                     }
-                    Err(rep) => {
-                        if !domains[rep].contains(row[i]) {
+                    Resolved::Class(k) => {
+                        if !domains[k].contains(row[i]) {
                             continue 'rows;
                         }
-                        if let Some((_, o)) = seen.iter().find(|(r, _)| r == rep) {
+                        if let Some((_, o)) = seen.iter().find(|(r, _)| r == k) {
                             if *o != row[i] {
                                 continue 'rows;
                             }
                         } else {
-                            seen.push((*rep, row[i]));
+                            seen.push((*k, row[i]));
                         }
                     }
                 }
             }
             any = true;
             for (i, t) in c.terms.iter().enumerate() {
-                if t.is_err() {
+                if let Resolved::Class(_) = t {
                     support[i].insert(row[i]);
                 }
             }
@@ -1028,10 +1020,13 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
             return None;
         }
         for (i, t) in c.terms.iter().enumerate() {
-            if let Err(rep) = t {
-                let domain = domains.get_mut(rep).unwrap();
+            if let Resolved::Class(k) = t {
+                let domain = domains.get_mut(k).unwrap();
                 if domain.intersect_with(&support[i]) {
-                    for &other in &by_class[rep] {
+                    if domain.is_empty() {
+                        return None;
+                    }
+                    for &other in &by_class[k] {
                         if other != index && !queued[other] {
                             queued[other] = true;
                             worklist.push(other);
@@ -1041,69 +1036,15 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
             }
         }
     }
-    if !distinct_feasible(ctx, plan, &mut domains) {
+    if !distinct_feasible(b, &mut domains) {
         return None;
     }
-    let mut new = Vec::new();
-    for (&(v, step), domain) in &domains {
-        if let Some(o) = domain.single() {
-            new.push(Binding::new(v, step, Term::Object(o), step, true));
-        }
-    }
-    let bindings = if new.is_empty() { b.clone() } else { b.add(&ctx.types, &new, false)? };
-    // Negated statics, once decided (positive ones were checked above).
-    for step in 1..=plan.num_steps() {
-        for atom in &ctx.schema_of(plan, step).negated_statics {
-            let terms: Vec<Term> = atom.terms.iter().map(|t| bindings.binding(*t, step)).collect();
-            if terms.iter().all(|t| t.object())
-                && ctx.statics.contains(&Atom {
-                    predicate: atom.predicate,
-                    terms,
-                })
-            {
-                return None;
-            }
-        }
-    }
-    Some((bindings, domains))
+    let mut narrowed: Vec<(ClassId, ObjSet)> =
+        domains.into_iter().filter(|(k, d)| d != b.domain(*k)).collect();
+    narrowed.sort_by_key(|(k, _)| *k);
+    Some(narrowed)
 }
 
-/// Binds each free parameter of `step` whose domain has at most `limit`
-/// objects, one child per object (selective early commitment).
-fn bind_small(ctx: &Ctx, plan: Plan, step: usize, limit: usize, out: &mut Vec<Plan>) {
-    if limit == 0 {
-        out.push(plan);
-        return;
-    }
-    let free = ctx.schema_of(&plan, step).parameters.iter().find_map(|v| {
-        match plan.bindings.binding(Term::Variable(*v), step) {
-            Term::Variable(var) => {
-                let domain = plan.bindings.domain(&ctx.types, var, step);
-                (domain.len() <= limit).then_some((var, domain))
-            }
-            Term::Object(_) => None,
-        }
-    });
-    let Some((var, domain)) = free else {
-        out.push(plan);
-        return;
-    };
-    for o in domain {
-        let Some(bindings) = plan
-            .bindings
-            .add(&ctx.types, &[Binding::new(var, step, Term::Object(o), step, true)], false)
-        else {
-            continue;
-        };
-        let mut child = plan.clone();
-        child.bindings = bindings;
-        let Some(bindings) = propagate_statics(ctx, &child) else {
-            continue;
-        };
-        child.bindings = bindings;
-        bind_small(ctx, child, step, limit, out);
-    }
-}
 
 /// Whether the only consistent supporter would be a new step (no reuse, no
 /// initial fact).
@@ -1194,7 +1135,7 @@ pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
             && ctx.schema_of(plan, w).assigns.iter().any(|a| {
                 let g = &a.fact;
                 g.var == f.var
-                    && f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_can_equal(&ctx.types, *u, w, *t, c))
+                    && f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
                     && match (&f.value, &g.value) {
                         (LValue::None, LValue::None) => false,
                         (LValue::Part { part: p, args: x }, LValue::Part { part: q, args: y }) if p == q => {
@@ -1206,58 +1147,29 @@ pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
     })
 }
 
-/// Hall's condition on non-codesignation: a set of pairwise distinct classes
+/// Hall's condition on distinct classes: a set of pairwise distinct classes
 /// needs at least as many objects as it has members. Sets are grown greedily
 /// from each class over its distinct neighbours, so this is a sound but
 /// incomplete all-different check (Younes & Simmons, AIPS 2002, note that
 /// separation inequalities alone hide such conflicts).
-fn distinct_feasible(
-    ctx: &Ctx,
-    plan: &Plan,
-    domains: &mut Domains,
-) -> bool {
-    use crate::bindings::StepVariable;
-    let b = &plan.bindings;
-    let mut classes: Vec<StepVariable> = Vec::new();
-    let mut seen = HashSet::new();
-    for step in 1..=plan.num_steps() {
-        for v in &ctx.schema_of(plan, step).parameters {
-            if let Term::Variable(var) = b.binding(Term::Variable(*v), step) {
-                let rep = b.representative(var, step);
-                if seen.insert(rep) {
-                    classes.push(rep);
-                }
-            }
-        }
-    }
-    let mut neighbours: HashMap<StepVariable, HashSet<StepVariable>> = HashMap::new();
-    for &rep in &classes {
-        let set: HashSet<StepVariable> = b
-            .non_codesignated(rep.0, rep.1)
-            .into_iter()
-            .filter_map(|(v, s)| match b.binding(Term::Variable(v), s) {
-                Term::Variable(var) => Some(b.representative(var, s)),
-                Term::Object(_) => None,
-            })
-            .filter(|r| *r != rep)
+fn distinct_feasible(b: &LBindings, domains: &mut crate::fasthash::FastMap<ClassId, ObjSet>) -> bool {
+    for start in b.unbound_classes() {
+        let adjacent: Vec<ClassId> = b
+            .distinct(start)
+            .iter()
+            .copied()
+            .filter(|&d| b.domain(d).len() > 1)
             .collect();
-        if !set.is_empty() {
-            neighbours.insert(rep, set);
+        if adjacent.is_empty() {
+            continue;
         }
-    }
-    if neighbours.is_empty() {
-        return true;
-    }
-    let domain_of = |rep: StepVariable, domains: &mut Domains| -> ObjSet {
-        domains.entry(rep).or_insert_with(|| ctx.class_domain(b, rep.0, rep.1)).clone()
-    };
-    for (&start, adjacent) in &neighbours {
+        let domain_of = |k: ClassId, domains: &crate::fasthash::FastMap<ClassId, ObjSet>| -> ObjSet {
+            domains.get(&k).cloned().unwrap_or_else(|| b.domain(k).clone())
+        };
         let mut clique = vec![start];
         let mut union = domain_of(start, domains);
-        let mut candidates: Vec<StepVariable> = adjacent.iter().copied().collect();
-        candidates.sort();
-        for u in candidates {
-            if clique.iter().all(|c| neighbours.get(&u).is_some_and(|n| n.contains(c))) {
+        for u in adjacent {
+            if clique.iter().all(|c| b.distinct(u).contains(c)) {
                 clique.push(u);
                 union.union_with(&domain_of(u, domains));
                 if clique.len() > union.len() {
@@ -1269,61 +1181,40 @@ fn distinct_feasible(
     true
 }
 
-/// Unbound step-parameter classes with their propagated domains (two or more
-/// objects; singletons are bound by propagation), smallest first, each with
-/// the domain after value-symmetry breaking (the children worth trying).
-pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(crate::bindings::StepVariable, Vec<Object>, Vec<Object>)> {
-    let Some((_, domains)) = propagate_domains(ctx, plan) else {
-        return Vec::new();
-    };
+/// Unbound step-parameter classes with their domains (two or more objects;
+/// singletons are bound eagerly), smallest first, each with the domain after
+/// value-symmetry breaking (the children worth trying).
+pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(ClassId, Vec<Object>, Vec<Object>)> {
     let b = &plan.bindings;
     let used = if ctx.symmetries.is_some() { used_objects(ctx, plan) } else { HashSet::new() };
-    let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for step in 1..=plan.num_steps() {
-        for v in &ctx.schema_of(plan, step).parameters {
-            let Term::Variable(var) = b.binding(Term::Variable(*v), step) else {
-                continue;
-            };
-            let rep = b.representative(var, step);
-            if !seen.insert(rep) {
-                continue;
+    for class in b.unbound_classes() {
+        let domain: Vec<Object> = b.domain(class).iter().collect();
+        if domain.len() >= 2 {
+            let mut reduced = domain.clone();
+            if let Some(symmetries) = &ctx.symmetries {
+                break_symmetry(symmetries, &mut reduced, &used);
             }
-            let mut domain: Vec<Object> = match domains.get(&rep) {
-                Some(d) => d.iter().collect(),
-                None => ctx.class_domain(b, var, step).iter().collect(),
-            };
-            domain.sort();
-            if domain.len() >= 2 {
-                let mut reduced = domain.clone();
-                if let Some(symmetries) = &ctx.symmetries {
-                    break_symmetry(symmetries, &mut reduced, &used);
-                }
-                out.push((rep, domain, reduced));
-            }
+            out.push((class, domain, reduced));
         }
     }
-    out.sort_by_key(|(rep, _, d)| (d.len(), *rep));
+    out.sort_by_key(|(class, _, d)| (d.len(), *class));
     out
 }
 
 /// Children binding one class to each object of its domain.
-pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: crate::bindings::StepVariable, objects: &[Object]) -> Vec<Plan> {
+pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: ClassId, objects: &[Object]) -> Vec<Plan> {
     let mut out = Vec::new();
     // Ties go to the newest child: push in reverse so the first object is
     // tried first.
     for &o in objects.iter().rev() {
-        let Some(bindings) = plan
-            .bindings
-            .add(&ctx.types, &[Binding::new(class.0, class.1, Term::Object(o), class.1, true)], false)
-        else {
+        let Some(bindings) = plan.bindings.bind(class, o) else {
             continue;
         };
         let mut child = plan.clone();
         child.bindings = bindings;
-        if let Some((bindings, domains)) = propagate_domains(ctx, &child) {
+        if let Some(bindings) = propagate_statics(ctx, &child) {
             child.bindings = bindings;
-            child.domains = Some(Rc::new(domains));
             out.push(child);
         }
     }
@@ -1331,7 +1222,7 @@ pub fn refine_bind(ctx: &Ctx, plan: &Plan, class: crate::bindings::StepVariable,
 }
 
 /// Classes appearing in a threat's instance or values.
-pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<crate::bindings::StepVariable> {
+pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<ClassId> {
     let b = &plan.bindings;
     let link = &threat.link;
     let mut out = Vec::new();
@@ -1341,8 +1232,8 @@ pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<crate::bin
             terms.extend(args.iter().copied());
         }
         for t in terms {
-            if let Term::Variable(v) = b.binding(t, step) {
-                out.push(b.representative(v, step));
+            if let Resolved::Class(k) = b.resolve(t, step) {
+                out.push(k);
             }
         }
     };
@@ -1358,16 +1249,13 @@ pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<crate::bin
 pub fn viable_values(
     ctx: &Ctx,
     plan: &Plan,
-    class: crate::bindings::StepVariable,
+    class: ClassId,
     objects: &[Object],
     touching: &[Threat],
 ) -> Vec<(Object, usize)> {
     let mut out = Vec::new();
     for &o in objects {
-        let Some(bindings) = plan
-            .bindings
-            .add(&ctx.types, &[Binding::new(class.0, class.1, Term::Object(o), class.1, true)], false)
-        else {
+        let Some(bindings) = plan.bindings.bind(class, o) else {
             continue;
         };
         let mut probe = plan.clone();
