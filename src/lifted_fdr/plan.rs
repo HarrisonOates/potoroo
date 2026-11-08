@@ -198,6 +198,9 @@ pub struct Ctx<'a> {
     pub init_rows: HashMap<(u32, u16), Table>,
     /// Static relations by predicate.
     pub static_tables: HashMap<Predicate, Table>,
+    /// Interchangeable objects (Fox & Long), for breaking value symmetry in
+    /// binding flaws; `None` disables it.
+    pub symmetries: Option<Rc<crate::symmetry::ObjectSymmetries>>,
     /// A new step's parameters still free after linking are bound on
     /// insertion when their domain has at most this many objects (0: never).
     pub bind_limit: usize,
@@ -241,6 +244,7 @@ impl<'a> Ctx<'a> {
             types,
             init_rows,
             static_tables,
+            symmetries: None,
             statics: StaticIndex::new(&task.static_atoms),
             writers,
             init_by_var,
@@ -1235,12 +1239,14 @@ fn distinct_feasible(
 }
 
 /// Unbound step-parameter classes with their propagated domains (two or more
-/// objects; singletons are bound by propagation), smallest first.
-pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(crate::bindings::StepVariable, Vec<Object>)> {
+/// objects; singletons are bound by propagation), smallest first, each with
+/// the domain after value-symmetry breaking (the children worth trying).
+pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(crate::bindings::StepVariable, Vec<Object>, Vec<Object>)> {
     let Some((_, domains)) = propagate_domains(ctx, plan) else {
         return Vec::new();
     };
     let b = &plan.bindings;
+    let used = if ctx.symmetries.is_some() { used_objects(ctx, plan) } else { HashSet::new() };
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for step in 1..=plan.num_steps() {
@@ -1258,11 +1264,15 @@ pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(crate::bindings::StepV
             };
             domain.sort();
             if domain.len() >= 2 {
-                out.push((rep, domain));
+                let mut reduced = domain.clone();
+                if let Some(symmetries) = &ctx.symmetries {
+                    break_symmetry(symmetries, &mut reduced, &used);
+                }
+                out.push((rep, domain, reduced));
             }
         }
     }
-    out.sort_by_key(|(rep, d)| (d.len(), *rep));
+    out.sort_by_key(|(rep, _, d)| (d.len(), *rep));
     out
 }
 
@@ -1348,4 +1358,42 @@ pub fn viable_values(
         }
     }
     out
+}
+
+/// Objects the plan already names: bound step parameters.
+fn used_objects(ctx: &Ctx, plan: &Plan) -> HashSet<Object> {
+    let mut used = HashSet::new();
+    for step in 1..=plan.num_steps() {
+        for v in &ctx.schema_of(plan, step).parameters {
+            if let Term::Object(o) = plan.bindings.binding(Term::Variable(*v), step) {
+                used.insert(o);
+            }
+        }
+    }
+    used
+}
+
+/// Keeps, of each class of interchangeable objects, the members the plan
+/// already uses and the first unused one: binding to another unused member
+/// yields a renaming of that child.
+fn break_symmetry(symmetries: &crate::symmetry::ObjectSymmetries, domain: &mut Vec<Object>, used: &HashSet<Object>) {
+    let mut first_unused: HashMap<usize, (usize, Object)> = HashMap::new();
+    for &o in domain.iter() {
+        if used.contains(&o) {
+            continue;
+        }
+        if let Some((class, rank)) = symmetries.by_object(o) {
+            let entry = first_unused.entry(class).or_insert((rank, o));
+            if rank < entry.0 {
+                *entry = (rank, o);
+            }
+        }
+    }
+    domain.retain(|o| {
+        used.contains(o)
+            || match symmetries.by_object(*o) {
+                None => true,
+                Some((class, _)) => first_unused[&class].1 == *o,
+            }
+    });
 }

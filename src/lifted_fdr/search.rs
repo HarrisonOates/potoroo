@@ -17,10 +17,16 @@ use super::heuristic::Estimator;
 use super::plan::{refine_open, refine_threat, Ctx, GlobalTypes, Plan};
 use super::task::{LiftedTask, Unsupported};
 
-/// The lanes run when none are given: the two flaw orders that were
-/// complementary on the development panel, each with domain-aware and
-/// pattern ADD (`investigation/lifted-fdr/findings.md`).
-pub const DEFAULT_LANES: [&str; 4] = ["ZLIFO@ADD", "MW-Loc@ADD", "ZLIFO@PADD", "MW-Loc@PADD"];
+/// The lanes run when none are given: ZLIFO and MW-Loc with domain-aware
+/// and pattern ADD, with and without degree binding where the development
+/// panel showed each to matter (`investigation/lifted-fdr/findings.md`).
+pub const DEFAULT_LANES: [&str; 5] = [
+    "ZLIFO@ADD",
+    "ZLIFO@ADD+deg",
+    "MW-Loc@ADD+deg",
+    "ZLIFO@PADD",
+    "MW-Loc@PADD+deg",
+];
 
 /// One independent best-first search: a flaw order and a ranking heuristic.
 #[derive(Debug, Clone)]
@@ -28,19 +34,27 @@ pub struct Lane {
     pub name: String,
     pub flaw_order: crate::heuristics::FlawSelectionOrder,
     pub heuristic: super::heuristic::Kind,
+    /// Bind any class whose surviving domain is no larger than the number of
+    /// separable threats it touches (`+deg`).
+    pub degree_binding: bool,
 }
 
 impl Lane {
-    /// Parses `ORDER[@HEUR]`; the heuristic defaults to `ADD`.
+    /// Parses `ORDER[@HEUR][+deg]`; the heuristic defaults to `ADD`.
     pub fn parse(spec: &str) -> Result<Lane, String> {
-        let (order, heuristic) = match spec.rsplit_once('@') {
+        let (rest, degree_binding) = match spec.strip_suffix("+deg") {
+            Some(rest) => (rest, true),
+            None => (spec, false),
+        };
+        let (order, heuristic) = match rest.rsplit_once('@') {
             Some((order, heuristic)) => (order, heuristic),
-            None => (spec, "ADD"),
+            None => (rest, "ADD"),
         };
         Ok(Lane {
             name: spec.to_string(),
             flaw_order: crate::heuristics::FlawSelectionOrder::parse(order)?,
             heuristic: super::heuristic::Kind::parse(heuristic)?,
+            degree_binding,
         })
     }
 }
@@ -210,7 +224,7 @@ impl Search<'_, '_> {
         let selected = super::flaws::select(ctx, &plan, &lane.lane.flaw_order, &lane.estimator);
         stats.phase[1] += started.elapsed();
         let started = Instant::now();
-        let binding = choose_binding(ctx, &plan, &selected, self.bind_policy);
+        let binding = choose_binding(ctx, &plan, &selected, self.bind_policy, lane.lane.degree_binding);
         stats.phase[2] += started.elapsed();
         if stats.expanded <= self.trace {
             self.trace_node(lane, &node, &plan, &selected, &binding);
@@ -295,7 +309,14 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         constants: &domain.constants,
         step_vars: &global,
     };
-    let ctx = Ctx::new(task, types);
+    let mut ctx = Ctx::new(task, types);
+    if std::env::var("POTOROO_LFDR_SYM").map_or(true, |v| v != "0") {
+        let symmetries = crate::symmetry::ObjectSymmetries::compute(domain, problem);
+        if !symmetries.is_empty() {
+            ctx.symmetries = Some(Rc::new(symmetries));
+        }
+    }
+    let ctx = ctx;
     let mut stats = Stats::default();
     if task.unsolvable {
         return (Outcome::NoSolution, stats);
@@ -385,6 +406,7 @@ fn choose_binding(
     plan: &Plan,
     selected: &super::flaws::Flaw,
     policy: BindPolicy,
+    degree_binding: bool,
 ) -> Option<(crate::bindings::StepVariable, Vec<Object>)> {
     use super::flaws::Flaw;
     match policy {
@@ -398,11 +420,11 @@ fn choose_binding(
                     return None;
                 }
             }
-            super::plan::binding_candidates(ctx, plan).into_iter().next()
+            super::plan::binding_candidates(ctx, plan).into_iter().next().map(|(c, _, d)| (c, d))
         }
-        BindPolicy::Threat => threat_binding(ctx, plan, selected),
+        BindPolicy::Threat => threat_binding(ctx, plan, selected, degree_binding),
         BindPolicy::Lr => {
-            let (class, objects) = super::plan::binding_candidates(ctx, plan).into_iter().next()?;
+            let (class, _, objects) = super::plan::binding_candidates(ctx, plan).into_iter().next()?;
             let repairs = match selected {
                 Flaw::Dead => return None,
                 Flaw::Threat(t) => super::plan::count_threat_options(ctx, plan, t).unwrap_or(0),
@@ -424,6 +446,7 @@ fn threat_binding(
     ctx: &Ctx,
     plan: &Plan,
     selected: &super::flaws::Flaw,
+    degree_rule: bool,
 ) -> Option<(crate::bindings::StepVariable, Vec<Object>)> {
     use super::flaws::Flaw;
     if matches!(selected, Flaw::Dead) || plan.num_threats == 0 {
@@ -450,9 +473,8 @@ fn threat_binding(
     if touching.is_empty() {
         return None;
     }
-    let mut best: Option<(f32, crate::bindings::StepVariable, Vec<Object>)> = None;
-    let degree_rule = std::env::var("POTOROO_LFDR_DEG").map_or(true, |v| v != "0");
-    for (class, domain) in super::plan::binding_candidates(ctx, plan) {
+    let mut best: Option<(f32, usize, crate::bindings::StepVariable, Vec<Object>)> = None;
+    for (class, full, domain) in super::plan::binding_candidates(ctx, plan) {
         let Some(threats) = touching.get(&class) else {
             continue;
         };
@@ -460,18 +482,30 @@ fn threat_binding(
             continue;
         }
         let mut viable = super::plan::viable_values(ctx, plan, class, &domain, threats);
-        if viable.len() <= 1 {
-            // Dead (no object) or forced (one object): take it now.
+        // Symmetric objects stand or fall together, so no viable
+        // representative means none at all. One representative is forced only
+        // when symmetry did not remove its alternatives.
+        let forced = viable.len() == 1
+            && (full.len() == domain.len()
+                || super::plan::viable_values(ctx, plan, class, &full, threats).len() == 1);
+        if viable.is_empty() || forced {
             let objects = viable.into_iter().map(|(o, _)| o).collect();
             return Some((class, objects));
         }
+        // Decide on the unreduced size: symmetry shrinks a binding's
+        // children, not its commitment (pruned objects stay possible for
+        // other classes), so it must not make binding look cheaper.
+        let size = viable.len() + (full.len() - domain.len());
+        if size <= 1 {
+            continue;
+        }
         viable.sort_by_key(|(o, removed)| (std::cmp::Reverse(*removed), *o));
-        let score = viable.len() as f32 / threats.len() as f32;
-        if best.as_ref().is_none_or(|(s, _, _)| score < *s) {
-            best = Some((score, class, viable.into_iter().map(|(o, _)| o).collect()));
+        let score = size as f32 / threats.len() as f32;
+        if best.as_ref().is_none_or(|(s, _, _, _)| score < *s) {
+            best = Some((score, size, class, viable.into_iter().map(|(o, _)| o).collect()));
         }
     }
-    let (score, class, objects) = best?;
+    let (score, size, class, objects) = best?;
     // A class whose surviving domain is no larger than the number of
     // separable threats it touches settles at least as many threats as it
     // creates children: bind it whatever the selected flaw.
@@ -480,10 +514,10 @@ fn threat_binding(
     }
     let repairs = match selected {
         Flaw::Threat(t) => super::plan::count_threat_options(ctx, plan, t).unwrap_or(0),
-        Flaw::Open(o) => super::plan::count_refinements(ctx, plan, *o, objects.len() + 1),
+        Flaw::Open(o) => super::plan::count_refinements(ctx, plan, *o, size + 1),
         Flaw::Dead => return None,
     };
-    (objects.len() < repairs).then_some((class, objects))
+    (size < repairs).then_some((class, objects))
 }
 
 /// Grounds every step variable consistently with bindings and static

@@ -1322,8 +1322,9 @@ fn print_help() {
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20     --lifted-fdr           lifted POCL search over schematic SAS+ variables\n\
-         \x20     --lane=ORDER[@HEUR]    a --lifted-fdr search lane (repeatable; HEUR is\n\
-         \x20                            ADD, PADD, ADDR or OC); lanes run round-robin\n\
+         \x20     --lane=ORDER[@HEUR][+deg]  a --lifted-fdr search lane (repeatable;\n\
+         \x20                            HEUR is ADD, PADD, ADDR or OC; +deg binds\n\
+         \x20                            threat-heavy variables); lanes run round-robin\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD/LIFO)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\

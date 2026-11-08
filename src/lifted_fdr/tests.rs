@@ -414,6 +414,7 @@ fn solve_config(domain: &Domain, problem: &Problem, kind: super::heuristic::Kind
             name: "test".into(),
             flaw_order: crate::heuristics::FlawSelectionOrder::parse("ZLIFO").unwrap(),
             heuristic: kind,
+            degree_binding: false,
         }],
         node_limit: 200_000,
         ..super::Config::default()
