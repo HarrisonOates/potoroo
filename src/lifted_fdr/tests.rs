@@ -135,15 +135,17 @@ fn literals(f: &Formula, out: &mut Vec<Formula>) {
 }
 
 fn holds_strips(f: &Formula, s: &[Option<Object>], atoms: &HashSet<Atom>) -> bool {
-    let mut lits = Vec::new();
-    literals(f, &mut lits);
-    lits.iter().all(|l| match l {
+    match f {
+        Formula::True => true,
+        Formula::False => false,
         Formula::Atom(a) => atoms.contains(&ground(a, s)),
         Formula::Negation(a) => !atoms.contains(&ground(a, s)),
         Formula::Equality { left, right, .. } => subst(*left, s) == subst(*right, s),
         Formula::Inequality { left, right, .. } => subst(*left, s) != subst(*right, s),
-        _ => panic!("unsupported literal in oracle"),
-    })
+        Formula::Conjunction(fs) => fs.iter().all(|f| holds_strips(f, s, atoms)),
+        Formula::Disjunction(fs) => fs.iter().any(|f| holds_strips(f, s, atoms)),
+        _ => panic!("unsupported formula in oracle"),
+    }
 }
 
 type FdrState = HashMap<(u32, Vec<Object>), LValue>;
@@ -246,33 +248,34 @@ pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usiz
                 .into_iter()
                 .filter(|s| holds_strips(&action.precondition, s, &strips))
                 .collect();
-                let schema = &task.schemas[index];
-                let mut fdr_positive: Vec<Atom> =
-                    schema.conditions.iter().filter_map(|c| task.atom_of(c)).collect();
-                fdr_positive.extend(schema.statics.iter().cloned());
+                // Every DNF schema of this action, with its applicable
+                // substitutions.
                 let mut all = fdr_atoms(&task, &fdr);
                 all.extend(task.static_atoms.iter().cloned());
-                let fdr_ok: Vec<_> = substitutions(
-                    domain,
-                    problem,
-                    &schema.parameters,
-                    &task.var_types,
-                    &fdr_positive,
-                    &all,
-                )
-                .into_iter()
-                .filter(|s| fdr_applicable(&task, index, s, &fdr))
-                .collect();
+                let mut fdr_ok: Vec<(usize, Vec<Option<Object>>)> = Vec::new();
+                for (schema_index, schema) in task.schemas.iter().enumerate().filter(|(_, s)| s.action == index) {
+                    let mut fdr_positive: Vec<Atom> =
+                        schema.conditions.iter().filter_map(|c| task.atom_of(c)).collect();
+                    fdr_positive.extend(schema.statics.iter().cloned());
+                    for sub in substitutions(domain, problem, &schema.parameters, &task.var_types, &fdr_positive, &all) {
+                        if fdr_applicable(&task, schema_index, &sub, &fdr) {
+                            fdr_ok.push((schema_index, sub));
+                        }
+                    }
+                }
+                let schema_index = task.schemas.iter().position(|s| s.action == index).unwrap();
+                let schema = &task.schemas[schema_index];
                 let tuple = |params: &[Variable], s: &Vec<Option<Object>>| -> Vec<Object> {
                     params.iter().map(|v| s[v.0 as usize].unwrap()).collect()
                 };
                 let strips_tuples: Vec<Vec<Object>> =
                     strips_ok.iter().map(|s| tuple(&action.parameters, s)).collect();
                 let mut fdr_tuples: Vec<Vec<Object>> =
-                    fdr_ok.iter().map(|s| tuple(&schema.parameters, s)).collect();
+                    fdr_ok.iter().map(|(i, s)| tuple(&task.schemas[*i].parameters, s)).collect();
                 let mut sorted = strips_tuples.clone();
                 sorted.sort();
                 fdr_tuples.sort();
+                fdr_tuples.dedup();
                 assert_eq!(sorted, fdr_tuples, "applicability differs for {}", action.name);
                 for (s, args) in strips_ok.into_iter().zip(strips_tuples) {
                     let mut global = vec![None; task.var_types.len()];
@@ -290,7 +293,7 @@ pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usiz
                             next.insert(ground(a, &s));
                         }
                     }
-                    successors.push((next, fdr_apply(&task, index, &global, &fdr)));
+                    successors.push((next, fdr_apply(&task, schema_index, &global, &fdr)));
                 }
             }
             if successors.is_empty() {

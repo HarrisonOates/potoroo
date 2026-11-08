@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 use crate::domain::Domain;
 use crate::formula::{Atom, Formula, Literal};
@@ -167,9 +168,15 @@ impl LiftedTask {
         };
         task.choose_cover(domain, &invariants, &fluent, &negated);
         for (index, action) in domain.actions.iter().enumerate() {
-            let mut schema = task.rewrite_schema(domain, index, action)?;
-            globalise(&mut schema, &mut task.var_types);
-            task.schemas.push(schema);
+            // One schema per disjunct of the precondition's DNF.
+            let branches = dnf(&action.precondition)
+                .ok_or_else(|| Unsupported(format!("a quantifier or over {MAX_BRANCHES} disjuncts in {}", action.name)))?;
+            for branch in branches {
+                let precondition = Formula::Conjunction(branch);
+                let mut schema = task.rewrite_schema(domain, index, action, &precondition)?;
+                globalise(&mut schema, &mut task.var_types);
+                task.schemas.push(schema);
+            }
         }
         for atom in &problem.init_order {
             if !fluent.contains(&atom.predicate) {
@@ -327,6 +334,7 @@ impl LiftedTask {
         domain: &Domain,
         index: usize,
         action: &crate::action::ActionSchema,
+        precondition: &Formula,
     ) -> Result<LSchema, Unsupported> {
         let mut schema = LSchema {
             action: index,
@@ -347,7 +355,7 @@ impl LiftedTask {
             }
         }
         let mut literals = Vec::new();
-        flatten(&action.precondition, &mut literals, &mut schema.equalities, &mut schema.inequalities)
+        flatten(precondition, &mut literals, &mut schema.equalities, &mut schema.inequalities)
             .map_err(|what| Unsupported(format!("{what} in the precondition of {}", action.name)))?;
         for (positive, atom) in literals {
             if domain.predicates.is_static(atom.predicate) || !self.covered.contains_key(&atom.predicate) {
@@ -610,6 +618,52 @@ fn negated_predicates(domain: &Domain, problem: &Problem) -> Result<HashSet<Pred
     }
     go(&problem.goal, &mut out);
     Ok(out)
+}
+
+/// Largest number of disjuncts a precondition may expand to.
+const MAX_BRANCHES: usize = 16;
+
+/// Disjunctive normal form as conjunctions of literals and (in)equalities, or
+/// `None` for quantifiers or more than [`MAX_BRANCHES`] disjuncts. An empty
+/// list is unsatisfiable.
+fn dnf(f: &Formula) -> Option<Vec<Vec<Rc<Formula>>>> {
+    match f {
+        Formula::True => Some(vec![Vec::new()]),
+        Formula::False => Some(Vec::new()),
+        Formula::Atom(_) | Formula::Negation(_) | Formula::Equality { .. } | Formula::Inequality { .. } => {
+            Some(vec![vec![Rc::new(f.clone())]])
+        }
+        Formula::Conjunction(parts) => {
+            let mut out: Vec<Vec<Rc<Formula>>> = vec![Vec::new()];
+            for part in parts {
+                let branches = dnf(part)?;
+                let mut next = Vec::new();
+                for prefix in &out {
+                    for branch in &branches {
+                        let mut joined = prefix.clone();
+                        joined.extend(branch.iter().cloned());
+                        next.push(joined);
+                    }
+                }
+                if next.len() > MAX_BRANCHES {
+                    return None;
+                }
+                out = next;
+            }
+            Some(out)
+        }
+        Formula::Disjunction(parts) => {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend(dnf(part)?);
+                if out.len() > MAX_BRANCHES {
+                    return None;
+                }
+            }
+            Some(out)
+        }
+        Formula::Exists { .. } | Formula::Forall { .. } => None,
+    }
 }
 
 /// Splits a conjunction into literals and (in)equalities.
