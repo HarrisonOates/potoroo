@@ -37,6 +37,7 @@ pub mod htn;
 pub(crate) mod instantiate;
 pub(crate) mod joint_domains;
 pub mod landmarks;
+pub mod lifted_fdr;
 pub mod lifted_mutex;
 pub(crate) mod lmcut;
 pub mod lplan;

@@ -39,6 +39,7 @@ struct Cli {
     /// algorithms, heuristics, flaw orders, weights, and limits still come from
     /// `params`.
     fdr_pocl: bool,
+    lifted_fdr: bool,
     verbosity: u32,
     files: Vec<String>,
     /// Effective flaw-order names, retained for readable telemetry.
@@ -342,7 +343,9 @@ fn run() -> Result<ExitCode, String> {
         // Include translation and grounding in the wall-clock deadline.
         let deadline = cli.time_limit.map(|limit| timer + limit);
         let portfolio = cli.portfolio();
-        let (outcome, stats) = if cli.fdr_pocl {
+        let (outcome, stats) = if cli.lifted_fdr {
+            run_lifted_fdr(&cli, domain, problem, deadline)?
+        } else if cli.fdr_pocl {
             run_fdr_portfolio(&cli, domain, problem, &portfolio, deadline)?
         } else {
             run_lifted_portfolio(&cli, domain, problem, &portfolio, deadline)?
@@ -561,6 +564,60 @@ fn run_lifted_portfolio(
         };
         Ok((outcome, RunStats::from(stats)))
     })
+}
+
+/// Runs lifted finite-domain POCL search (`--lifted-fdr`).
+fn run_lifted_fdr(
+    cli: &Cli,
+    domain: &Domain,
+    problem: &Problem,
+    deadline: Option<Instant>,
+) -> Result<(RunOutcome, RunStats), String> {
+    use potoroo::lifted_fdr::{heuristic::Kind, Config, Outcome};
+    let name = cli.heuristic_name.to_ascii_uppercase();
+    let heuristic = if name.starts_with("OC") {
+        Kind::Oc
+    } else if name.starts_with("ADDR") {
+        Kind::Addr
+    } else {
+        Kind::Add
+    };
+    let config = Config {
+        heuristic,
+        weight: cli.params.weight,
+        node_limit: cli.params.search_limits.first().copied().unwrap_or(usize::MAX),
+        time_limit: deadline.map(|d| d.saturating_duration_since(Instant::now())),
+        flaw_order: (!cli.flaw_order_names.is_empty()).then(|| cli.params.flaw_orders[0].clone()),
+    };
+    let start = Instant::now();
+    let (outcome, stats) = potoroo::lifted_fdr::solve(domain, problem, &config).map_err(|e| e.to_string())?;
+    let run_stats = RunStats {
+        nodes_generated: stats.generated,
+        nodes_visited: stats.expanded,
+        pruned: stats.dead,
+        max_steps: stats.max_steps,
+        ..RunStats::default()
+    };
+    if cli.verbosity > 0 {
+        eprintln!(
+            "Search finished: lifted FDR in {:.2}s | visited {} | generated {} | pruned {} | largest plan steps={}",
+            start.elapsed().as_secs_f64(),
+            stats.expanded,
+            stats.generated,
+            stats.dead,
+            stats.max_steps
+        );
+    }
+    let outcome = match outcome {
+        Outcome::Solved(solution) => RunOutcome::Solved {
+            plan: solution.format(domain, problem),
+            steps: solution.actions.len(),
+            cost: solution.cost,
+        },
+        Outcome::LimitReached => RunOutcome::LimitReached,
+        Outcome::NoSolution => RunOutcome::NoSolution,
+    };
+    Ok((outcome, run_stats))
 }
 
 /// Runs the portfolio over the finite-domain representation.
@@ -891,6 +948,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut params = Parameters::default();
     let mut verbosity = 0u32;
     let mut fdr_pocl = false;
+    let mut lifted_fdr = false;
     let mut files = Vec::new();
     let mut heuristic_name = String::from("ADD/LIFO");
     let mut algorithm_name = String::from("A");
@@ -970,6 +1028,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
                 flaw_order_names.push(v);
             }
             "P" => fdr_pocl = true,
+            "lifted-fdr" => lifted_fdr = true,
             "g" => params.ground_actions = true,
             "h" => {
                 let v = required_value!();
@@ -1106,6 +1165,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     Ok(Some(Cli {
         params,
         fdr_pocl,
+        lifted_fdr,
         verbosity,
         files,
         flaw_order_names,
@@ -1154,6 +1214,7 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "domain-constraints" => "d",
         "flaw-order" => "f",
         "fdr-pocl" => "P",
+        "lifted-fdr" => "lifted-fdr",
         "ground-actions" => "g",
         "heuristic" => "h",
         "help" => "H",
@@ -1247,6 +1308,7 @@ fn print_help() {
          \x20 -a, --action-cost=COST     action cost: TASK, UNIT, DURATION, RELATIVE\n\
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
+         \x20     --lifted-fdr           lifted POCL search over schematic SAS+ variables\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD/LIFO)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
