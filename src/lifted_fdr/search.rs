@@ -17,31 +17,53 @@ use super::heuristic::Estimator;
 use super::plan::{refine_open, refine_threat, Ctx, GlobalTypes, Plan};
 use super::task::{LiftedTask, Unsupported};
 
-/// VHPOP's MW-Loc: threats by fewest refinements, then the newest step's open
-/// conditions by most estimated work. Best on the development panel among
-/// ZLIFO, LCFR, LCFR-DSep, DSep-LC, LCFR-Loc-Conf, MW-Loc and MC-Loc
-/// (`investigation/lifted-fdr/findings.md`).
-pub const DEFAULT_FLAW_ORDER: &str = "MW-Loc";
+/// The lanes run when none are given: the two flaw orders that were
+/// complementary on the development panel, each with domain-aware and
+/// pattern ADD (`investigation/lifted-fdr/findings.md`).
+pub const DEFAULT_LANES: [&str; 4] = ["ZLIFO@ADD", "MW-Loc@ADD", "ZLIFO@PADD", "MW-Loc@PADD"];
+
+/// One independent best-first search: a flaw order and a ranking heuristic.
+#[derive(Debug, Clone)]
+pub struct Lane {
+    pub name: String,
+    pub flaw_order: crate::heuristics::FlawSelectionOrder,
+    pub heuristic: super::heuristic::Kind,
+}
+
+impl Lane {
+    /// Parses `ORDER[@HEUR]`; the heuristic defaults to `ADD`.
+    pub fn parse(spec: &str) -> Result<Lane, String> {
+        let (order, heuristic) = match spec.rsplit_once('@') {
+            Some((order, heuristic)) => (order, heuristic),
+            None => (spec, "ADD"),
+        };
+        Ok(Lane {
+            name: spec.to_string(),
+            flaw_order: crate::heuristics::FlawSelectionOrder::parse(order)?,
+            heuristic: super::heuristic::Kind::parse(heuristic)?,
+        })
+    }
+}
 
 /// Search configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub heuristic: super::heuristic::Kind,
+    /// Lanes expanded round-robin, one node each per round; the first plan
+    /// found by any lane is returned. Empty selects [`DEFAULT_LANES`].
+    pub lanes: Vec<Lane>,
     pub weight: f32,
+    /// Limit on nodes generated across all lanes.
     pub node_limit: usize,
     pub time_limit: Option<Duration>,
-    /// Flaw-selection order (`-f`); `None` selects [`DEFAULT_FLAW_ORDER`].
-    pub flaw_order: Option<crate::heuristics::FlawSelectionOrder>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            heuristic: super::heuristic::Kind::Add,
+            lanes: Vec::new(),
             weight: 1.0,
             node_limit: usize::MAX,
             time_limit: None,
-            flaw_order: None,
         }
     }
 }
@@ -55,6 +77,8 @@ pub struct Stats {
     pub expanded: usize,
     pub dead: usize,
     pub max_steps: usize,
+    /// The lane that found the plan.
+    pub solved_by: Option<String>,
 }
 
 /// A validated, totally ordered plan: schema names and arguments.
@@ -123,6 +147,146 @@ pub fn solve(domain: &Domain, problem: &Problem, config: &Config) -> Result<(Out
     Ok(solve_task(domain, problem, &task, config))
 }
 
+/// A lane's open list and heuristic.
+struct Running<'a> {
+    lane: &'a Lane,
+    estimator: Estimator,
+    queue: BinaryHeap<Node>,
+    exhausted: bool,
+}
+
+/// Shared search state and knobs.
+struct Search<'a, 'c> {
+    ctx: &'c Ctx<'a>,
+    domain: &'a Domain,
+    problem: &'a Problem,
+    weight: f32,
+    bind_policy: BindPolicy,
+    mac_budget: usize,
+    trace: usize,
+}
+
+impl Search<'_, '_> {
+    fn push(&self, lane: &mut Running, mut plan: Plan, stats: &mut Stats) {
+        stats.generated += 1;
+        if self.mac_budget > 0 && !bindings_feasible(self.ctx, &plan, self.mac_budget) {
+            stats.dead += 1;
+            return;
+        }
+        let started = Instant::now();
+        let h = lane.estimator.estimate(self.ctx, &plan);
+        stats.phase[0] += started.elapsed();
+        plan.domains = None;
+        if !h.is_finite() {
+            stats.dead += 1;
+            return;
+        }
+        lane.queue.push(Node {
+            f: plan.cost as f32 + self.weight * h,
+            h,
+            id: stats.generated,
+            plan: Rc::new(plan),
+        });
+    }
+
+    /// Expands the lane's best node: a solution, or `None`.
+    fn expand(&self, lane: &mut Running, stats: &mut Stats) -> Option<Solution> {
+        let Some(node) = lane.queue.pop() else {
+            lane.exhausted = true;
+            return None;
+        };
+        let ctx = self.ctx;
+        stats.expanded += 1;
+        let plan = node.plan.clone();
+        stats.max_steps = stats.max_steps.max(plan.num_steps());
+        if plan.complete() {
+            if let Some(solution) = complete(ctx, self.domain, self.problem, &plan) {
+                return Some(solution);
+            }
+            stats.dead += 1;
+            return None;
+        }
+        let started = Instant::now();
+        let selected = super::flaws::select(ctx, &plan, &lane.lane.flaw_order, &lane.estimator);
+        stats.phase[1] += started.elapsed();
+        let started = Instant::now();
+        let binding = choose_binding(ctx, &plan, &selected, self.bind_policy);
+        stats.phase[2] += started.elapsed();
+        if stats.expanded <= self.trace {
+            self.trace_node(lane, &node, &plan, &selected, &binding);
+        }
+        let started = Instant::now();
+        let children = match binding {
+            Some((class, objects)) => super::plan::refine_bind(ctx, &plan, class, &objects),
+            None => match selected {
+                super::flaws::Flaw::Threat(t) => refine_threat(ctx, &plan, t),
+                super::flaws::Flaw::Open(o) => refine_open(ctx, &plan, o),
+                super::flaws::Flaw::Dead => Vec::new(),
+            },
+        };
+        stats.phase[3] += started.elapsed();
+        for child in children {
+            self.push(lane, child, stats);
+        }
+        None
+    }
+
+    fn trace_node(
+        &self,
+        lane: &Running,
+        node: &Node,
+        plan: &Plan,
+        selected: &super::flaws::Flaw,
+        binding: &Option<(crate::bindings::StepVariable, Vec<Object>)>,
+    ) {
+        let ctx = self.ctx;
+        let describe = |consumer: usize, f: &super::task::LFact| {
+            let resolve = |t: &Term| plan.bindings.binding(*t, consumer);
+            let resolved = super::task::LFact {
+                var: f.var,
+                inv: f.inv.iter().map(resolve).collect(),
+                value: match &f.value {
+                    super::task::LValue::None => super::task::LValue::None,
+                    super::task::LValue::Part { part, args } => super::task::LValue::Part {
+                        part: *part,
+                        args: args.iter().map(resolve).collect(),
+                    },
+                },
+            };
+            ctx.task.fact_name(self.domain, self.problem, &resolved)
+        };
+        let flaw = match (binding, selected) {
+            (Some((class, objects)), _) => format!("bind ?{}@{} over {} objects", class.0 .0, class.1, objects.len()),
+            (None, super::flaws::Flaw::Open(o)) => {
+                let name = if o.consumer == super::plan::GOAL_ID {
+                    "goal".to_string()
+                } else {
+                    ctx.schema_of(plan, o.consumer).name.clone()
+                };
+                format!("open {} for {}@{}", describe(o.consumer, ctx.condition(plan, o.consumer, o.cond)), name, o.consumer)
+            }
+            (None, super::flaws::Flaw::Threat(t)) => format!(
+                "threat step {} ({}) on {}",
+                t.step,
+                ctx.schema_of(plan, t.step).name,
+                describe(t.link.consumer, ctx.condition(plan, t.link.consumer, t.link.cond))
+            ),
+            (None, super::flaws::Flaw::Dead) => "dead".to_string(),
+        };
+        eprintln!(
+            "expand [{}] f={} h={} cost={} steps={} opens={} threats={} | {}",
+            lane.lane.name,
+            node.f,
+            node.h,
+            plan.cost,
+            plan.num_steps(),
+            plan.num_opens,
+            plan.num_threats,
+            flaw
+        );
+    }
+}
+
 pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config: &Config) -> (Outcome, Stats) {
     let global = GlobalTypes(task.var_types.clone());
     let types = TypeContext {
@@ -132,188 +296,61 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         step_vars: &global,
     };
     let ctx = Ctx::new(task, types);
-    let estimator = Estimator::new(&ctx, domain, problem, config.heuristic);
     let mut stats = Stats::default();
     let Some(root) = Plan::initial(&ctx) else {
         return (Outcome::NoSolution, stats);
     };
-    let flaw_order = config.flaw_order.clone().unwrap_or_else(|| {
-        crate::heuristics::FlawSelectionOrder::parse(DEFAULT_FLAW_ORDER).expect("valid default")
-    });
-    let trace: usize = std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let start = Instant::now();
-    let mut queue = BinaryHeap::new();
-    let bind_policy = BindPolicy::from_env();
-    let mac_budget: usize = std::env::var("POTOROO_LFDR_MAC")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let push = |queue: &mut BinaryHeap<Node>, mut plan: Plan, stats: &mut Stats| {
-        stats.generated += 1;
-        if mac_budget > 0 && !bindings_feasible(&ctx, &plan, mac_budget) {
-            stats.dead += 1;
-            return;
-        }
-        let started = Instant::now();
-        let h = estimator.estimate(&ctx, &plan);
-        stats.phase[0] += started.elapsed();
-        plan.domains = None;
-        if !h.is_finite() {
-            stats.dead += 1;
-            return;
-        }
-        queue.push(Node {
-            f: plan.cost as f32 + config.weight * h,
-            h,
-            id: stats.generated,
-            plan: Rc::new(plan),
-        });
+    let defaults: Vec<Lane>;
+    let lanes: &[Lane] = if config.lanes.is_empty() {
+        defaults = DEFAULT_LANES.iter().map(|l| Lane::parse(l).expect("valid default lane")).collect();
+        &defaults
+    } else {
+        &config.lanes
     };
-    push(&mut queue, root, &mut stats);
-    while let Some(node) = queue.pop() {
-        if stats.generated >= config.node_limit
-            || config.time_limit.is_some_and(|limit| start.elapsed() > limit)
-        {
-            return (Outcome::LimitReached, stats);
-        }
-        stats.expanded += 1;
-        let plan = node.plan;
-        if stats.expanded <= trace {
-            eprintln!(
-                "expand f={} h={} cost={} steps={} opens={} threats={}",
-                node.f,
-                node.h,
-                plan.cost,
-                plan.num_steps(),
-                plan.num_opens,
-                plan.num_threats
-            );
-            if let Some(open) = chain::iter(&plan.opens).next() {
-                if plan.num_threats == 0 {
-                    let f = ctx.condition(&plan, open.consumer, open.cond);
-                    let resolved = super::task::LFact {
-                        var: f.var,
-                        inv: f.inv.iter().map(|t| plan.bindings.binding(*t, open.consumer)).collect(),
-                        value: match &f.value {
-                            super::task::LValue::None => super::task::LValue::None,
-                            super::task::LValue::Part { part, args } => super::task::LValue::Part {
-                                part: *part,
-                                args: args.iter().map(|t| plan.bindings.binding(*t, open.consumer)).collect(),
-                            },
-                        },
-                    };
-                    eprintln!("   newest open @{}: {}", open.consumer, ctx.task.fact_name(domain, problem, &resolved));
-                }
+    let search = Search {
+        ctx: &ctx,
+        domain,
+        problem,
+        weight: config.weight,
+        bind_policy: BindPolicy::from_env(),
+        mac_budget: std::env::var("POTOROO_LFDR_MAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        trace: std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+    };
+    // One planning graph serves every lane.
+    let mut graph = None;
+    let mut running: Vec<Running> = lanes
+        .iter()
+        .map(|lane| {
+            let estimator = Estimator::new_shared(domain, problem, lane.heuristic, &mut graph);
+            Running {
+                lane,
+                estimator,
+                queue: BinaryHeap::new(),
+                exhausted: false,
             }
+        })
+        .collect();
+    for lane in &mut running {
+        search.push(lane, root.clone(), &mut stats);
+    }
+    let start = Instant::now();
+    loop {
+        if running.iter().all(|l| l.exhausted) {
+            return (Outcome::NoSolution, stats);
         }
-        stats.max_steps = stats.max_steps.max(plan.num_steps());
-        if plan.complete() {
-            if let Some(solution) = complete(&ctx, domain, problem, &plan) {
+        for lane in &mut running {
+            if lane.exhausted {
+                continue;
+            }
+            if stats.generated >= config.node_limit || config.time_limit.is_some_and(|limit| start.elapsed() > limit) {
+                return (Outcome::LimitReached, stats);
+            }
+            if let Some(solution) = search.expand(lane, &mut stats) {
+                stats.solved_by = Some(lane.lane.name.clone());
                 return (Outcome::Solved(solution), stats);
             }
-            if stats.dead < 3 && trace > 0 {
-                eprintln!(
-                    "grounding failed for a complete plan (propagation {}):",
-                    if super::plan::propagate_statics(&ctx, &plan).is_some() { "consistent" } else { "INCONSISTENT" }
-                );
-                for link in chain::iter(&plan.links) {
-                    for w in 1..=plan.num_steps() {
-                        for a in 0..ctx.schema_of(&plan, w).assigns.len() {
-                            if super::plan::threatens(&ctx, &plan, w, a as u16, link) {
-                                eprintln!("  MISSED THREAT: step {w} assign {a} on link {:?}", link);
-                            }
-                        }
-                    }
-                }
-                for link in chain::iter(&plan.links) {
-                    if link.producer == super::plan::INIT_ID {
-                        let f = ctx.condition(&plan, link.consumer, link.cond);
-                        let resolved = super::task::LFact {
-                            var: f.var,
-                            inv: f.inv.iter().map(|t| plan.bindings.binding(*t, link.consumer)).collect(),
-                            value: match &f.value {
-                                super::task::LValue::None => super::task::LValue::None,
-                                super::task::LValue::Part { part, args } => super::task::LValue::Part {
-                                    part: *part,
-                                    args: args.iter().map(|t| plan.bindings.binding(*t, link.consumer)).collect(),
-                                },
-                            },
-                        };
-                        eprintln!("  init -> {}: {}", link.consumer, ctx.task.fact_name(domain, problem, &resolved));
-                    }
-                }
-                for step in 1..=plan.num_steps() {
-                    let schema = ctx.schema_of(&plan, step);
-                    let args: Vec<String> = schema
-                        .parameters
-                        .iter()
-                        .map(|v| match plan.bindings.binding(Term::Variable(*v), step) {
-                            Term::Object(o) => problem.objects.object_name(Some(&domain.constants), o).to_string(),
-                            Term::Variable(v) => {
-                                let rep = plan.bindings.representative(v, step);
-                                let ncd = plan.bindings.non_codesignated(v, step).len();
-                                format!("?{}@{}#{}!{}", rep.0 .0, rep.1, plan.bindings.domain(&ctx.types, v, step).len(), ncd)
-                            }
-                        })
-                        .collect();
-                    let statics: Vec<String> = schema.statics.iter().map(|a| domain.predicates.name(a.predicate).to_string()).collect();
-                    eprintln!("  {step}: {} {} statics {:?} ok={}", schema.name, args.join(" "), statics, super::plan::step_statics_possible(&ctx, &plan, step));
-                }
-            }
-            stats.dead += 1;
-            continue;
-        }
-        let started = Instant::now();
-        let selected = super::flaws::select(&ctx, &plan, &flaw_order, &estimator);
-        stats.phase[1] += started.elapsed();
-        let started = Instant::now();
-        let binding = choose_binding(&ctx, &plan, &selected, bind_policy);
-        stats.phase[2] += started.elapsed();
-        if stats.expanded <= trace {
-            let describe = |consumer: usize, f: &super::task::LFact| {
-                let resolved = super::task::LFact {
-                    var: f.var,
-                    inv: f.inv.iter().map(|t| plan.bindings.binding(*t, consumer)).collect(),
-                    value: match &f.value {
-                        super::task::LValue::None => super::task::LValue::None,
-                        super::task::LValue::Part { part, args } => super::task::LValue::Part {
-                            part: *part,
-                            args: args.iter().map(|t| plan.bindings.binding(*t, consumer)).collect(),
-                        },
-                    },
-                };
-                ctx.task.fact_name(domain, problem, &resolved)
-            };
-            match (&binding, &selected) {
-                (Some((class, objects)), _) => eprintln!("   flaw: bind ?{}@{} over {} objects", class.0 .0, class.1, objects.len()),
-                (None, super::flaws::Flaw::Open(o)) => {
-                    let name = if o.consumer == super::plan::GOAL_ID { "goal".to_string() } else { ctx.schema_of(&plan, o.consumer).name.clone() };
-                    eprintln!("   flaw: open {} for {}@{}", describe(o.consumer, ctx.condition(&plan, o.consumer, o.cond)), name, o.consumer)
-                }
-                (None, super::flaws::Flaw::Threat(t)) => eprintln!(
-                    "   flaw: threat step {} ({}) on {}",
-                    t.step,
-                    ctx.schema_of(&plan, t.step).name,
-                    describe(t.link.consumer, ctx.condition(&plan, t.link.consumer, t.link.cond))
-                ),
-                (None, super::flaws::Flaw::Dead) => eprintln!("   flaw: dead"),
-            }
-        }
-        let started = Instant::now();
-        let children = match binding {
-            Some((class, objects)) => super::plan::refine_bind(&ctx, &plan, class, &objects),
-            None => match selected {
-                super::flaws::Flaw::Threat(t) => refine_threat(&ctx, &plan, t),
-                super::flaws::Flaw::Open(o) => refine_open(&ctx, &plan, o),
-                super::flaws::Flaw::Dead => Vec::new(),
-            },
-        };
-        stats.phase[3] += started.elapsed();
-        for child in children {
-            push(&mut queue, child, &mut stats);
         }
     }
-    (Outcome::NoSolution, stats)
 }
 
 /// When an unbound variable is the flaw to refine.

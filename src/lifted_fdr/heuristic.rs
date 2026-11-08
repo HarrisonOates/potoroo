@@ -29,6 +29,9 @@ use super::task::LValue;
 pub enum Kind {
     /// Number of open conditions.
     Oc,
+    /// ADD over the graph's pattern minimum, ignoring narrowed domains
+    /// (VHPOP's lifted ADD).
+    Padd,
     /// Additive cost of open conditions (VHPOP ADD; no reuse, as FDR `ADD`).
     Add,
     /// ADD where a condition an existing step already supplies costs nothing.
@@ -40,28 +43,44 @@ pub use super::plan::Domains;
 /// Largest product of narrowed domains enumerated per condition.
 const ENUMERATION_LIMIT: usize = 512;
 
+impl Kind {
+    pub fn parse(name: &str) -> Result<Kind, String> {
+        match name.to_ascii_uppercase().as_str() {
+            "OC" => Ok(Kind::Oc),
+            "ADD" => Ok(Kind::Add),
+            "PADD" => Ok(Kind::Padd),
+            "ADDR" => Ok(Kind::Addr),
+            _ => Err(format!("unknown lifted FDR heuristic `{name}` (OC, ADD, PADD, ADDR)")),
+        }
+    }
+}
+
 pub struct Estimator {
     kind: Kind,
-    /// Evaluate conditions over propagated binding domains
-    /// (`POTOROO_LFDR_HDOM=0` disables).
+    /// Evaluate conditions over propagated binding domains (not for PADD).
     use_domains: bool,
     graph: Option<Rc<PlanningGraph>>,
 }
 
 impl Estimator {
-    pub fn new(_ctx: &Ctx, domain: &Domain, problem: &Problem, kind: Kind) -> Self {
-        let graph = match kind {
-            Kind::Oc => None,
-            Kind::Add | Kind::Addr => {
-                let params = Parameters::default();
-                let search = SearchContext::new(domain, problem, &params);
-                Some(search.planning_graph())
-            }
-        };
+    /// An estimator sharing the planning graph in `graph`, building it on
+    /// first need.
+    pub fn new_shared(
+        domain: &Domain,
+        problem: &Problem,
+        kind: Kind,
+        graph: &mut Option<Rc<PlanningGraph>>,
+    ) -> Self {
+        let needed = kind != Kind::Oc;
+        if needed && graph.is_none() {
+            let params = Parameters::default();
+            let search = SearchContext::new(domain, problem, &params);
+            *graph = Some(search.planning_graph());
+        }
         Estimator {
             kind,
-            graph,
-            use_domains: std::env::var("POTOROO_LFDR_HDOM").map_or(true, |v| v != "0"),
+            graph: if needed { graph.clone() } else { None },
+            use_domains: matches!(kind, Kind::Add | Kind::Addr),
         }
     }
 
@@ -164,7 +183,7 @@ impl Estimator {
     pub fn estimate(&self, ctx: &Ctx, plan: &Plan) -> f32 {
         match self.kind {
             Kind::Oc => plan.num_opens as f32,
-            Kind::Add | Kind::Addr => {
+            Kind::Add | Kind::Padd | Kind::Addr => {
                 let reuse = self.kind == Kind::Addr;
                 let domains = if !self.use_domains {
                     None

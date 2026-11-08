@@ -407,7 +407,11 @@ fn print_groups() {
 
 fn solve_config(domain: &Domain, problem: &Problem, kind: super::heuristic::Kind) -> (super::Outcome, super::Stats) {
     let config = super::Config {
-        heuristic: kind,
+        lanes: vec![super::Lane {
+            name: "test".into(),
+            flaw_order: crate::heuristics::FlawSelectionOrder::parse("ZLIFO").unwrap(),
+            heuristic: kind,
+        }],
         node_limit: 200_000,
         ..super::Config::default()
     };
@@ -443,13 +447,8 @@ fn solve_diag() {
         &std::fs::read_to_string(domain_path).unwrap(),
         &std::fs::read_to_string(dir.join(format!("{instance}.pddl"))).unwrap(),
     );
-    let kind = match std::env::var("DIAG_H").as_deref() {
-        Ok("OC") => super::heuristic::Kind::Oc,
-        _ => super::heuristic::Kind::Add,
-    };
     let start = std::time::Instant::now();
     let config = super::Config {
-        heuristic: kind,
         node_limit: std::env::var("DIAG_NODES").ok().and_then(|n| n.parse().ok()).unwrap_or(1_000_000),
         ..super::Config::default()
     };

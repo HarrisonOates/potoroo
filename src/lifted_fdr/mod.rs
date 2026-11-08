@@ -17,5 +17,5 @@ pub mod task;
 #[cfg(test)]
 mod tests;
 
-pub use search::{solve, Config, Outcome, Solution, Stats};
+pub use search::{solve, Config, Lane, Outcome, Solution, Stats};
 pub use task::{LiftedTask, Unsupported};

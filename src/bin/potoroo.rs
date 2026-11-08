@@ -40,6 +40,8 @@ struct Cli {
     /// `params`.
     fdr_pocl: bool,
     lifted_fdr: bool,
+    /// `--lane=ORDER[@HEUR]` for `--lifted-fdr`, repeatable.
+    lanes: Vec<String>,
     verbosity: u32,
     files: Vec<String>,
     /// Effective flaw-order names, retained for readable telemetry.
@@ -573,21 +575,17 @@ fn run_lifted_fdr(
     problem: &Problem,
     deadline: Option<Instant>,
 ) -> Result<(RunOutcome, RunStats), String> {
-    use potoroo::lifted_fdr::{heuristic::Kind, Config, Outcome};
-    let name = cli.heuristic_name.to_ascii_uppercase();
-    let heuristic = if name.starts_with("OC") {
-        Kind::Oc
-    } else if name.starts_with("ADDR") {
-        Kind::Addr
-    } else {
-        Kind::Add
-    };
+    use potoroo::lifted_fdr::{Config, Lane, Outcome};
+    let lanes = cli
+        .lanes
+        .iter()
+        .map(|spec| Lane::parse(spec))
+        .collect::<Result<Vec<_>, _>>()?;
     let config = Config {
-        heuristic,
+        lanes,
         weight: cli.params.weight,
         node_limit: cli.params.search_limits.first().copied().unwrap_or(usize::MAX),
         time_limit: deadline.map(|d| d.saturating_duration_since(Instant::now())),
-        flaw_order: (!cli.flaw_order_names.is_empty()).then(|| cli.params.flaw_orders[0].clone()),
     };
     let start = Instant::now();
     let (outcome, stats) = potoroo::lifted_fdr::solve(domain, problem, &config).map_err(|e| e.to_string())?;
@@ -607,6 +605,9 @@ fn run_lifted_fdr(
             stats.dead,
             stats.max_steps
         );
+        if let Some(lane) = &stats.solved_by {
+            eprintln!("Lifted FDR lane: {lane}");
+        }
         let [h, select, bind, refine] = stats.phase;
         eprintln!(
             "Lifted FDR time: heuristic {:.2}s | flaw selection {:.2}s | binding choice {:.2}s | refinement {:.2}s",
@@ -957,6 +958,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut verbosity = 0u32;
     let mut fdr_pocl = false;
     let mut lifted_fdr = false;
+    let mut lanes = Vec::new();
     let mut files = Vec::new();
     let mut heuristic_name = String::from("ADD/LIFO");
     let mut algorithm_name = String::from("A");
@@ -1037,6 +1039,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             }
             "P" => fdr_pocl = true,
             "lifted-fdr" => lifted_fdr = true,
+            "lane" => lanes.push(required_value!()),
             "g" => params.ground_actions = true,
             "h" => {
                 let v = required_value!();
@@ -1174,6 +1177,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
         params,
         fdr_pocl,
         lifted_fdr,
+        lanes,
         verbosity,
         files,
         flaw_order_names,
@@ -1223,6 +1227,7 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "flaw-order" => "f",
         "fdr-pocl" => "P",
         "lifted-fdr" => "lifted-fdr",
+        "lane" => "lane",
         "ground-actions" => "g",
         "heuristic" => "h",
         "help" => "H",
@@ -1317,6 +1322,8 @@ fn print_help() {
          \x20 -f, --flaw-order=ORDER     flaw-selection order (default STATIC)\n\
          \x20     --fdr-pocl             ground POCL search over SAS+ variables\n\
          \x20     --lifted-fdr           lifted POCL search over schematic SAS+ variables\n\
+         \x20     --lane=ORDER[@HEUR]    a --lifted-fdr search lane (repeatable; HEUR is\n\
+         \x20                            ADD, PADD, ADDR or OC); lanes run round-robin\n\
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD/LIFO)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
