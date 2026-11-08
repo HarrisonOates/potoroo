@@ -150,3 +150,33 @@ Diagnosed with `POTOROO_TRACE=N`, which now also prints the selected flaw.
 
 The union is 7/10, against ground FDR's 8/10 (rovers). Blocksworld and
 sokoban are unsolved by both.
+
+## First screens: 420-task panel (p01–p10), 30 s / 2 GiB, 8 parallel
+
+Baselines from `investigation/pocl-heuristic/` at the same budget: ground FDR
+ZLIFO ADD/LIFO solves 88, FD A*/FF 118.
+
+| build | solved | change |
+|---|---|---|
+| `6e8025a` (4 lanes) | 66 | first screen; 14 errors (pathways disjunctions, organic static goals) |
+| `+` degree binding, static goals, DNF schemas | 80 | satellite 2 → 8, pathways 0 → 8 |
+| `054231a` (5 lanes, per-lane `+deg`, symmetry) | 78 | childsnack 6 → 9; airport, gripper, logistics and visitall each lose 1–2 |
+
+* All failures are timeouts (342 at `054231a`), none memouts: the opposite
+  of ground FDR. Each extra lane divides the budget, and per-node cost is
+  roughly 20–80× ground FDR's.
+* **Complementary to ground FDR.** Lifted or ground solves 101/420, against
+  FD's 118. Lifted-only tasks: zenotravel p04–p07 and p09, pathways p06–p08,
+  depots p02, nomystery p01, pegsol p08, pipesworld-notankage p01, tpp p03.
+* **Largest losses:** elevators 2 vs 6 (moves with unbound floors threaten
+  every `lift-at` link of their lift), logistics, rovers, airport.
+
+Per-domain levers found so far:
+
+* **Degree binding** (bind a class whose domain is no larger than the
+  separable threats it touches) is essential on satellite and fatal on
+  childsnack, whose sandwiches must stay unbound. It is therefore a lane
+  option.
+* **Value-symmetry breaking must only prune children.** Letting it shrink the
+  domain used for the binding decision made bindings look cheap and broke
+  childsnack.
