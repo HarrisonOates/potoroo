@@ -38,6 +38,18 @@ impl PartialEq for ObjSet {
 impl Eq for ObjSet {}
 
 impl ObjSet {
+    /// An empty set with room for objects `0..capacity` without reallocating.
+    pub fn new(capacity: usize) -> Self {
+        let words = capacity.div_ceil(64);
+        if words <= INLINE {
+            ObjSet::default()
+        } else {
+            ObjSet {
+                words: Words::Heap(vec![0; words].into_boxed_slice()),
+            }
+        }
+    }
+
     #[inline]
     fn slice(&self) -> &[u64] {
         match &self.words {

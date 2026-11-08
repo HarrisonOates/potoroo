@@ -313,6 +313,28 @@ impl LiftedTask {
         }
     }
 
+    /// Writes the terms of the atom a fact denotes into `out` and returns its
+    /// predicate: a part value's atom, or for `none` the variable's first
+    /// part over the instance (a binary variable's atom, whose negation the
+    /// value is).
+    pub fn atom_terms_into(&self, fact: &LFact, out: &mut Vec<Term>) -> Predicate {
+        out.clear();
+        match &fact.value {
+            LValue::Part { part, args } => {
+                let vp = &self.vars[fact.var as usize].parts[*part as usize];
+                out.extend(vp.slots.iter().map(|slot| match slot {
+                    Ok(i) => fact.inv[*i],
+                    Err(j) => args[*j],
+                }));
+                vp.predicate
+            }
+            LValue::None => {
+                out.extend_from_slice(&fact.inv);
+                self.vars[fact.var as usize].parts[0].predicate
+            }
+        }
+    }
+
     /// The atom a part value denotes, or `None` for the `none` value.
     pub fn atom_of(&self, fact: &LFact) -> Option<Atom> {
         let LValue::Part { part, args } = &fact.value else {

@@ -86,9 +86,22 @@ pub struct LBindings {
     steps: PVec<(u32, u32)>,
     class_of: PVec<ClassId>,
     classes: PVec<Rc<Class>>,
+    /// Classes changed since the last propagation: only constraints over
+    /// them need revisiting. Empty in queued plans.
+    dirty: Vec<ClassId>,
 }
 
 impl LBindings {
+    /// Takes the classes changed since the last call.
+    pub fn take_dirty(&mut self) -> Vec<ClassId> {
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// Marks a class as changed (a new constraint mentions it).
+    pub fn touch(&mut self, c: ClassId) {
+        self.dirty.push(c);
+    }
+
     /// Adds the next step's variables, each in its own class over `domains`
     /// (one per variable, in order).
     pub fn add_step(&mut self, var_base: u32, domains: impl IntoIterator<Item = ObjSet>) {
@@ -96,6 +109,7 @@ impl LBindings {
         self.steps.push((first_slot, var_base));
         for domain in domains {
             let id = self.classes.len() as ClassId;
+            self.dirty.push(id);
             let constant = domain.single();
             self.class_of.push(id);
             self.classes.push(Rc::new(Class {
@@ -236,6 +250,7 @@ impl LBindings {
     }
 
     fn class_mut(&mut self, c: ClassId) -> &mut Class {
+        self.dirty.push(c);
         Rc::make_mut(self.classes.get_mut(c as usize))
     }
 

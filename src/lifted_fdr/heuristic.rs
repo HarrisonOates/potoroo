@@ -62,6 +62,8 @@ pub struct Estimator {
     /// binding-aware matching needs no constraints.
     empty: Rc<crate::bindings::Bindings>,
     graph: Option<Rc<PlanningGraph>>,
+    /// A reusable atom buffer for evaluating conditions.
+    scratch: std::cell::Cell<Atom>,
 }
 
 impl Estimator {
@@ -84,6 +86,10 @@ impl Estimator {
             graph: if needed { graph.clone() } else { None },
             use_domains: matches!(kind, Kind::Add | Kind::Addr),
             empty: crate::bindings::Bindings::empty(),
+            scratch: std::cell::Cell::new(Atom {
+                predicate: crate::predicates::Predicate(0),
+                terms: Vec::new(),
+            }),
         }
     }
 
@@ -104,16 +110,29 @@ impl Estimator {
             return HeuristicValue::ZERO;
         };
         let fact = ctx.condition(plan, open.consumer(), open.cond);
-        let (mut atom, negated) = match &fact.value {
-            LValue::Part { .. } => (ctx.task.atom_of(fact).expect("part value"), false),
-            LValue::None => (
-                Atom {
-                    predicate: ctx.task.vars[fact.var as usize].parts[0].predicate,
-                    terms: fact.inv.clone(),
-                },
-                true,
-            ),
-        };
+        let negated = fact.value == LValue::None;
+        // Reuse one atom buffer across evaluations.
+        let mut atom = self.scratch.replace(Atom {
+            predicate: crate::predicates::Predicate(0),
+            terms: Vec::new(),
+        });
+        atom.predicate = ctx.task.atom_terms_into(fact, &mut atom.terms);
+        let value = self.atom_value(ctx, plan, open, use_domains, graph, negated, &mut atom);
+        self.scratch.set(atom);
+        value
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn atom_value(
+        &self,
+        ctx: &Ctx,
+        plan: &Plan,
+        open: super::plan::Open,
+        use_domains: bool,
+        graph: &PlanningGraph,
+        negated: bool,
+        atom: &mut Atom,
+    ) -> HeuristicValue {
         let b = &plan.bindings;
         // Positions per unbound class, and the class's representative term.
         let mut classes: Vec<(ClassId, Vec<usize>, Term)> = Vec::new();
@@ -138,7 +157,7 @@ impl Estimator {
             }
         };
         if !use_domains {
-            return value_of(&atom);
+            return value_of(atom);
         }
         let narrowed: Vec<(Vec<usize>, Vec<Object>)> = classes
             .iter()
@@ -150,7 +169,7 @@ impl Estimator {
             .collect();
         let product = narrowed.iter().try_fold(1usize, |acc, (_, d)| acc.checked_mul(d.len()));
         if narrowed.is_empty() || product.is_none_or(|p| p > ENUMERATION_LIMIT) {
-            return value_of(&atom);
+            return value_of(atom);
         }
         if product == Some(0) {
             return HeuristicValue::INFINITE;

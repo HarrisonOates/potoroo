@@ -310,6 +310,8 @@ pub struct Ctx<'a> {
     pub init_rows: HashMap<(u32, u16), Table>,
     /// Static relations by predicate.
     pub static_tables: HashMap<Predicate, Table>,
+    /// Number of objects (ids are contiguous from 0).
+    pub num_objects: usize,
     /// Objects of each type, as bitsets.
     type_sets: std::cell::RefCell<HashMap<Type, ObjSet>>,
     /// Interchangeable objects (Fox & Long), for breaking value symmetry in
@@ -356,6 +358,7 @@ impl<'a> Ctx<'a> {
             init_rows,
             static_tables,
             type_sets: Default::default(),
+            num_objects: types.constants.owned_objects().count() + types.objects.owned_objects().count(),
             symmetries: None,
             statics: StaticIndex::new(&task.static_atoms),
             writers,
@@ -614,6 +617,36 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, key: Choice, only: Option<
         if only.is_some_and(|o| o.variant() != choice.variant()) {
             continue;
         }
+        // A new initial-state link is a new table constraint: check it now
+        // when ground, else have propagation revisit its classes.
+        if link.producer() == INIT_ID {
+            let f = ctx.condition(&plan, link.consumer(), link.cond);
+            if let LValue::Part { part, args } = &f.value {
+                let terms: Vec<Resolved> = f
+                    .inv
+                    .iter()
+                    .chain(args)
+                    .map(|t| plan.bindings.resolve(*t, link.consumer()))
+                    .collect();
+                if terms.iter().all(|t| matches!(t, Resolved::Object(_))) {
+                    let row: Vec<Object> = terms
+                        .iter()
+                        .map(|t| match t {
+                            Resolved::Object(o) => *o,
+                            Resolved::Class(_) => unreachable!(),
+                        })
+                        .collect();
+                    if !ctx.init_rows[&(f.var, *part)].contains(&row) {
+                        continue;
+                    }
+                }
+                for t in terms {
+                    if let Resolved::Class(k) = t {
+                        plan.bindings.touch(k);
+                    }
+                }
+            }
+        }
         let Some(bindings) = propagate_statics(ctx, &plan) else {
             continue;
         };
@@ -643,6 +676,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
             continue;
         }
         let schema = &ctx.task.schemas[schema_index as usize];
+        // Static atoms without variables are decided now.
+        if schema
+            .statics
+            .iter()
+            .any(|a| a.terms.iter().all(|t| t.object()) && !ctx.statics.contains(a))
+        {
+            continue;
+        }
         let n = base.num_steps() + 1;
         cs.clear();
         if !unifier(&schema.assigns[a as usize].fact, n, &fact, c, &mut cs) {
@@ -960,10 +1001,13 @@ pub fn definite(ctx: &Ctx, plan: &Plan, threat: &Threat) -> bool {
 pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<LBindings> {
     let mut bindings = plan.bindings.clone();
     loop {
-        let narrowed = narrow(ctx, plan, &bindings)?;
-        if narrowed.is_empty() {
+        // Only constraints over classes changed since the last propagation
+        // can have lost support: the parent's domains are already narrowed.
+        let dirty: crate::fasthash::FastSet<ClassId> = bindings.take_dirty().into_iter().collect();
+        if dirty.is_empty() {
             break;
         }
+        let narrowed = narrow(ctx, plan, &bindings, &dirty)?;
         for (class, domain) in narrowed {
             if !bindings.restrict(class, &domain) {
                 return None;
@@ -987,21 +1031,33 @@ pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<LBindings> {
     Some(bindings)
 }
 
-/// One arc-consistency fixpoint under `b`: the classes whose domains shrank,
-/// with their new domains, or `None` when inconsistent.
-fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)>> {
-    let mut domains: crate::fasthash::FastMap<ClassId, ObjSet> = Default::default();
-    struct Constraint<'t> {
-        terms: Vec<Resolved>,
+/// One arc-consistency fixpoint under `b`, starting from the constraints
+/// over `dirty` classes: the classes whose domains shrank, with their new
+/// domains, or `None` when inconsistent. Constraints are only materialised
+/// when active or reached through a shrinking domain.
+fn narrow(
+    ctx: &Ctx,
+    plan: &Plan,
+    b: &LBindings,
+    dirty: &crate::fasthash::FastSet<ClassId>,
+) -> Option<Vec<(ClassId, ObjSet)>> {
+    use crate::fasthash::{FastMap, FastSet};
+    // Constraint specifications, borrowed: a static atom of a step or an
+    // initial-state link (its variable's instance and value arguments).
+    struct Spec<'t> {
+        inv: &'t [Term],
+        args: &'t [Term],
+        step: usize,
         table: &'t Table,
     }
-    let resolve = |terms: &[Term], step: usize| -> Vec<Resolved> { terms.iter().map(|t| b.resolve(*t, step)).collect() };
     let empty = Table::default();
-    let mut constraints: Vec<Constraint> = Vec::new();
+    let mut specs: Vec<Spec> = Vec::new();
     for step in 1..=plan.num_steps() {
         for atom in &ctx.schema_of(plan, step).statics {
-            constraints.push(Constraint {
-                terms: resolve(&atom.terms, step),
+            specs.push(Spec {
+                inv: &atom.terms,
+                args: &[],
+                step,
                 table: ctx.static_tables.get(&atom.predicate).unwrap_or(&empty),
             });
         }
@@ -1012,93 +1068,114 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
         }
         let f = ctx.condition(plan, link.consumer(), link.cond);
         if let LValue::Part { part, args } = &f.value {
-            let mut terms = f.inv.clone();
-            terms.extend(args.iter().copied());
-            constraints.push(Constraint {
-                terms: resolve(&terms, link.consumer()),
+            specs.push(Spec {
+                inv: &f.inv,
+                args,
+                step: link.consumer(),
                 table: &ctx.init_rows[&(f.var, *part)],
             });
         }
     }
-    // Ground constraints are membership tests; the rest seed the domains.
-    let mut by_class: crate::fasthash::FastMap<ClassId, Vec<usize>> = Default::default();
+    let terms_of = |spec: &Spec| -> Vec<Resolved> {
+        spec.inv.iter().chain(spec.args).map(|t| b.resolve(*t, spec.step)).collect()
+    };
+    let touches = |spec: &Spec, classes: &dyn Fn(ClassId) -> bool| {
+        spec.inv
+            .iter()
+            .chain(spec.args)
+            .any(|t| matches!(t, Term::Variable(v) if classes(b.class(*v, spec.step))))
+    };
     let object = |t: &Resolved| match t {
         Resolved::Object(o) => Some(*o),
         Resolved::Class(_) => None,
     };
-    for (index, c) in constraints.iter().enumerate() {
-        if c.terms.iter().all(|t| object(t).is_some()) {
-            let ground: Vec<Object> = c.terms.iter().filter_map(object).collect();
-            if !c.table.contains(&ground) {
+    // Materialised constraints by spec index, and the worklist.
+    let mut built: FastMap<usize, Vec<Resolved>> = FastMap::default();
+    let mut queued: FastSet<usize> = FastSet::default();
+    let mut worklist: Vec<usize> = Vec::new();
+    let mut domains: FastMap<ClassId, ObjSet> = FastMap::default();
+    for (index, spec) in specs.iter().enumerate() {
+        if !touches(spec, &|k| dirty.contains(&k)) {
+            continue;
+        }
+        let terms = terms_of(spec);
+        if terms.iter().all(|t| object(t).is_some()) {
+            let ground: Vec<Object> = terms.iter().filter_map(object).collect();
+            if !spec.table.contains(&ground) {
                 return None;
             }
             continue;
         }
-        for t in &c.terms {
+        built.insert(index, terms);
+        queued.insert(index);
+        worklist.push(index);
+    }
+    let mut support: Vec<ObjSet> = Vec::new();
+    let mut scratch: Vec<u32> = Vec::new();
+    let mut seen: Vec<(ClassId, Object)> = Vec::new();
+    while let Some(index) = worklist.pop() {
+        queued.remove(&index);
+        let table = specs[index].table;
+        let terms = built[&index].clone();
+        for t in &terms {
             if let Resolved::Class(k) = t {
-                by_class.entry(*k).or_default().push(index);
                 domains.entry(*k).or_insert_with(|| b.domain(*k).clone());
             }
         }
-    }
-    let mut queued = vec![false; constraints.len()];
-    let mut worklist: Vec<usize> = Vec::new();
-    for (index, c) in constraints.iter().enumerate() {
-        if c.terms.iter().any(|t| object(t).is_none()) {
-            queued[index] = true;
-            worklist.push(index);
-        }
-    }
-    let mut support: Vec<ObjSet> = Vec::new();
-    while let Some(index) = worklist.pop() {
-        queued[index] = false;
-        let c = &constraints[index];
         // Candidate rows: the shortest index list over bound positions or a
         // small domain's objects, else every row.
-        let mut candidates: Option<Vec<u32>> = None;
-        for (i, t) in c.terms.iter().enumerate() {
+        let mut bound: Option<&[u32]> = None;
+        for (i, t) in terms.iter().enumerate() {
             if let Resolved::Object(o) = t {
-                let list = c.table.with(i, *o);
-                if candidates.as_ref().is_none_or(|l| list.len() < l.len()) {
-                    candidates = Some(list.to_vec());
+                let list = table.with(i, *o);
+                if bound.is_none_or(|l| list.len() < l.len()) {
+                    bound = Some(list);
                 }
             }
         }
-        if candidates.is_none() {
+        let mut gathered = false;
+        if bound.is_none() {
             let mut best: Option<(usize, usize)> = None;
-            for (i, t) in c.terms.iter().enumerate() {
+            for (i, t) in terms.iter().enumerate() {
                 if let Resolved::Class(k) = t {
-                    let size: usize = domains[k].iter().map(|o| c.table.with(i, o).len()).sum();
+                    // Estimating costs a lookup per object: only for small
+                    // domains, where gathering beats scanning every row.
+                    if domains[k].len() > 64 {
+                        continue;
+                    }
+                    let size: usize = domains[k].iter().map(|o| table.with(i, o).len()).sum();
                     if best.is_none_or(|(_, s)| size < s) {
                         best = Some((i, size));
                     }
                 }
             }
             if let Some((i, size)) = best {
-                if size < c.table.rows.len() {
-                    let Resolved::Class(k) = c.terms[i] else { unreachable!() };
-                    let mut list: Vec<u32> =
-                        domains[&k].iter().flat_map(|o| c.table.with(i, o).iter().copied()).collect();
-                    list.sort_unstable();
-                    candidates = Some(list);
+                if size < table.rows.len() {
+                    let Resolved::Class(k) = terms[i] else { unreachable!() };
+                    scratch.clear();
+                    scratch.extend(domains[&k].iter().flat_map(|o| table.with(i, o).iter().copied()));
+                    scratch.sort_unstable();
+                    gathered = true;
                 }
             }
         }
-        let all: Vec<u32>;
-        let rows: &[u32] = match &candidates {
-            Some(list) => list,
-            None => {
-                all = (0..c.table.rows.len() as u32).collect();
-                &all
-            }
+        let rows: Box<dyn Iterator<Item = u32> + '_> = match (bound, gathered) {
+            (Some(list), _) => Box::new(list.iter().copied()),
+            (None, true) => Box::new(scratch.iter().copied()),
+            (None, false) => Box::new(0..table.rows.len() as u32),
         };
-        support.clear();
-        support.resize(c.terms.len(), ObjSet::default());
+        // Reuse the support sets: clear rather than reallocate.
+        while support.len() < terms.len() {
+            support.push(ObjSet::new(ctx.num_objects));
+        }
+        for set in support.iter_mut().take(terms.len()) {
+            set.clear();
+        }
         let mut any = false;
-        'rows: for &r in rows {
-            let row = &c.table.rows[r as usize];
-            let mut seen: Vec<(ClassId, Object)> = Vec::new();
-            for (i, t) in c.terms.iter().enumerate() {
+        'rows: for r in rows {
+            let row = &table.rows[r as usize];
+            seen.clear();
+            for (i, t) in terms.iter().enumerate() {
                 match t {
                     Resolved::Object(o) => {
                         if row[i] != *o {
@@ -1120,7 +1197,7 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
                 }
             }
             any = true;
-            for (i, t) in c.terms.iter().enumerate() {
+            for (i, t) in terms.iter().enumerate() {
                 if let Resolved::Class(_) = t {
                     support[i].insert(row[i]);
                 }
@@ -1129,19 +1206,24 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
         if !any {
             return None;
         }
-        for (i, t) in c.terms.iter().enumerate() {
-            if let Resolved::Class(k) = t {
-                let domain = domains.get_mut(k).unwrap();
-                if domain.intersect_with(&support[i]) {
-                    if domain.is_empty() {
-                        return None;
-                    }
-                    for &other in &by_class[k] {
-                        if other != index && !queued[other] {
-                            queued[other] = true;
-                            worklist.push(other);
-                        }
-                    }
+        for (i, t) in terms.iter().enumerate() {
+            let Resolved::Class(k) = *t else { continue };
+            let domain = domains.get_mut(&k).unwrap();
+            if !domain.intersect_with(&support[i]) {
+                continue;
+            }
+            if domain.is_empty() {
+                return None;
+            }
+            // Revisit every other constraint over this class.
+            for (other, spec) in specs.iter().enumerate() {
+                if other == index || queued.contains(&other) || !touches(spec, &|c| c == k) {
+                    continue;
+                }
+                let terms = built.entry(other).or_insert_with(|| terms_of(spec));
+                if terms.iter().any(|t| object(t).is_none()) {
+                    queued.insert(other);
+                    worklist.push(other);
                 }
             }
         }
@@ -1149,8 +1231,7 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
     if !distinct_feasible(b, &mut domains) {
         return None;
     }
-    let mut narrowed: Vec<(ClassId, ObjSet)> =
-        domains.into_iter().filter(|(k, d)| d != b.domain(*k)).collect();
+    let mut narrowed: Vec<(ClassId, ObjSet)> = domains.into_iter().filter(|(k, d)| d != b.domain(*k)).collect();
     narrowed.sort_by_key(|(k, _)| *k);
     Some(narrowed)
 }
