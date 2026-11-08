@@ -204,3 +204,30 @@ Per-domain levers found so far:
   instructions each, scanning the unindexed varset prefix. Further gains need
   either a cheaper class lookup or propagation that reuses the parent's
   resolution and domains.
+
+## Local class-based bindings (`2346c5a`)
+
+* **The change.** The shared VHPOP-style `Bindings` in lifted FDR plans is
+  replaced by `LBindings`, a persistent slot/class structure.
+  * Each step variable has a slot.
+  * Each class keeps its constant, its domain as a bitset, the classes it
+    must differ from, and its members.
+  * Resolution is two array reads.
+  * Binding a class forward-checks its distinct classes, and a class left
+    with one object is bound.
+  * Propagation writes narrowed domains back, so later propagation starts
+    from them, and binding flaws and the heuristic read domains directly.
+  * `src/bindings.rs` is back to its pre-branch state.
+* **Per node:** 2–3× faster (p03 at 30k nodes: elevators 0.96 → 0.48 s,
+  rovers 0.77 → 0.41 s, gripper 0.36 → 0.11 s). The search changes slightly
+  because domain maintenance is now eager.
+* **Panel, 30 s / 2 GiB:**
+  * **98/420**, ahead of ground FDR ZLIFO ADD (88). FD A*/FF: 118.
+  * Gained 17: airport p01, p02 and p04; childsnack p07; data-network p01;
+    depots p07; driverlog p05; gripper p10; nomystery p04, p06 and p09;
+    openstacks p02; pipesworld-tankage p03; storage p06; tpp p07;
+    zenotravel p02 and p08.
+  * Lost satellite p04 and p07.
+* **Lifted or ground FDR: 116/420**, against FD's 118.
+* **Memory now matters.** There are 33 memouts, up from 3, so the faster
+  search now reaches the 2 GiB limit.
