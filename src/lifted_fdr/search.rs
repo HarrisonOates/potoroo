@@ -142,16 +142,21 @@ enum Refined {
 enum Entry {
     Built(Rc<Plan>),
     Recipe {
-        parent: Rc<Plan>,
-        flaw: Refined,
+        base: Rc<Expansion>,
         choice: super::plan::Choice,
     },
+}
+
+/// What siblings share: their parent and the flaw it refined.
+struct Expansion {
+    parent: Rc<Plan>,
+    flaw: Refined,
 }
 
 struct Node {
     f: f32,
     h: f32,
-    id: usize,
+    id: u32,
     entry: Entry,
 }
 
@@ -205,7 +210,7 @@ struct Search<'a, 'c> {
 }
 
 impl Search<'_, '_> {
-    fn push(&self, lane: &mut Running, plan: Plan, recipe: Option<(&Rc<Plan>, Refined, super::plan::Choice)>, stats: &mut Stats) {
+    fn push(&self, lane: &mut Running, plan: Plan, recipe: Option<(&Rc<Expansion>, super::plan::Choice)>, stats: &mut Stats) {
         stats.generated += 1;
         if self.mac_budget > 0 && !bindings_feasible(self.ctx, &plan, self.mac_budget) {
             stats.dead += 1;
@@ -220,17 +225,20 @@ impl Search<'_, '_> {
         }
         let f = plan.cost as f32 + self.weight * h;
         let entry = match recipe {
-            Some((parent, flaw, choice)) if self.defer => Entry::Recipe {
-                parent: parent.clone(),
-                flaw,
+            Some((base, choice)) if self.defer => Entry::Recipe {
+                base: base.clone(),
                 choice,
             },
             _ => Entry::Built(Rc::new(plan)),
         };
+        // Grow a large queue by an eighth rather than doubling it.
+        if lane.queue.len() == lane.queue.capacity() && lane.queue.capacity() >= 1 << 16 {
+            lane.queue.reserve_exact(lane.queue.capacity() / 8);
+        }
         lane.queue.push(Node {
             f,
             h,
-            id: stats.generated,
+            id: stats.generated as u32,
             entry,
         });
     }
@@ -245,9 +253,9 @@ impl Search<'_, '_> {
         stats.expanded += 1;
         let plan = match &node.entry {
             Entry::Built(plan) => plan.clone(),
-            Entry::Recipe { parent, flaw, choice } => {
+            Entry::Recipe { base, choice } => {
                 let started = Instant::now();
-                let rebuilt = rebuild(ctx, parent, *flaw, *choice);
+                let rebuilt = rebuild(ctx, &base.parent, base.flaw, *choice);
                 stats.phase[3] += started.elapsed();
                 match rebuilt {
                     Some(plan) => Rc::new(plan),
@@ -285,8 +293,12 @@ impl Search<'_, '_> {
             },
         };
         stats.phase[3] += started.elapsed();
+        let base = Rc::new(Expansion {
+            parent: plan.clone(),
+            flaw: refined,
+        });
         for (choice, child) in children {
-            self.push(lane, child, Some((&plan, refined, choice)), stats);
+            self.push(lane, child, Some((&base, choice)), stats);
         }
         None
     }
@@ -728,5 +740,14 @@ fn holds(f: &Formula, s: &[Option<Object>], state: &HashSet<Atom>) -> bool {
         Formula::Conjunction(fs) => fs.iter().all(|f| holds(f, s, state)),
         Formula::Disjunction(fs) => fs.iter().any(|f| holds(f, s, state)),
         Formula::Exists { .. } | Formula::Forall { .. } => panic!("quantifier in a supported task"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn queue_entries_stay_small() {
+        // A queued child is a recipe: ranks, id, shared expansion, choice.
+        assert!(std::mem::size_of::<super::Node>() <= 40, "{}", std::mem::size_of::<super::Node>());
     }
 }
