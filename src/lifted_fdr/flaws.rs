@@ -36,7 +36,7 @@ pub fn select(ctx: &Ctx, plan: &Plan, order: &FlawSelectionOrder, estimator: &Es
     let threats: Vec<Threat> = chain::iter(&plan.threats).copied().collect();
     let mut threat_counts: Vec<Option<Option<usize>>> = vec![None; threats.len()];
     let opens: Vec<Open> = chain::iter(&plan.opens).copied().collect();
-    let local_consumer = opens.first().map(|o| o.consumer);
+    let local_consumer = opens.first().map(|o| o.consumer());
     for criterion in order.criteria() {
         let mut candidates = Vec::new();
         if criterion.non_separable || criterion.separable {
@@ -114,7 +114,7 @@ fn open_matches(
     local_consumer: Option<usize>,
 ) -> bool {
     criterion.open_cond
-        || (criterion.local_open_cond && Some(open.consumer) == local_consumer)
+        || (criterion.local_open_cond && Some(open.consumer()) == local_consumer)
         || (criterion.unsafe_open_cond && unsafe_open(ctx, plan, open))
 }
 

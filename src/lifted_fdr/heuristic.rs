@@ -103,7 +103,7 @@ impl Estimator {
         let Some(graph) = self.graph.as_ref() else {
             return HeuristicValue::ZERO;
         };
-        let fact = ctx.condition(plan, open.consumer, open.cond);
+        let fact = ctx.condition(plan, open.consumer(), open.cond);
         let (mut atom, negated) = match &fact.value {
             LValue::Part { .. } => (ctx.task.atom_of(fact).expect("part value"), false),
             LValue::None => (
@@ -118,7 +118,7 @@ impl Estimator {
         // Positions per unbound class, and the class's representative term.
         let mut classes: Vec<(ClassId, Vec<usize>, Term)> = Vec::new();
         for (i, t) in atom.terms.iter_mut().enumerate() {
-            match b.resolve(*t, open.consumer) {
+            match b.resolve(*t, open.consumer()) {
                 Resolved::Object(o) => *t = Term::Object(o),
                 Resolved::Class(k) => match classes.iter_mut().find(|(c, _, _)| *c == k) {
                     Some((_, positions, first)) => {
@@ -132,9 +132,9 @@ impl Estimator {
         let empty = &self.empty;
         let value_of = |atom: &Atom| {
             if negated {
-                graph.heuristic_value_negation(atom, open.consumer, Some((&ctx.types, empty)))
+                graph.heuristic_value_negation(atom, open.consumer(), Some((&ctx.types, empty)))
             } else {
-                graph.heuristic_value_atom(atom, open.consumer, Some((&ctx.types, empty)))
+                graph.heuristic_value_atom(atom, open.consumer(), Some((&ctx.types, empty)))
             }
         };
         if !use_domains {

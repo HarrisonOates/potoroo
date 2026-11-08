@@ -18,6 +18,7 @@ use std::rc::Rc;
 use crate::terms::{Object, Term, Variable};
 
 use super::objset::ObjSet;
+use super::pvec::PVec;
 
 /// An equality class of step variables.
 pub type ClassId = u32;
@@ -27,7 +28,11 @@ struct Class {
     constant: Option<Object>,
     domain: ObjSet,
     distinct: Vec<ClassId>,
-    members: Vec<u32>,
+    /// The class this one was merged into (union-find without path
+    /// compression; merges link the smaller class under the larger).
+    forward: Option<ClassId>,
+    /// Slots in the class, for union by size.
+    size: u32,
 }
 
 /// A resolved term: an object, or an unbound class.
@@ -44,9 +49,9 @@ pub type Constraint = (Term, usize, Term, usize, bool);
 pub struct LBindings {
     /// For real step `id`, its first slot (index `id - 1`) and the schema's
     /// first global variable.
-    steps: Rc<Vec<(u32, u32)>>,
-    class_of: Rc<Vec<ClassId>>,
-    classes: Rc<Vec<Rc<Class>>>,
+    steps: PVec<(u32, u32)>,
+    class_of: PVec<ClassId>,
+    classes: PVec<Rc<Class>>,
 }
 
 impl LBindings {
@@ -54,19 +59,17 @@ impl LBindings {
     /// (one per variable, in order).
     pub fn add_step(&mut self, var_base: u32, domains: impl IntoIterator<Item = ObjSet>) {
         let first_slot = self.class_of.len() as u32;
-        Rc::make_mut(&mut self.steps).push((first_slot, var_base));
-        let class_of = Rc::make_mut(&mut self.class_of);
-        let classes = Rc::make_mut(&mut self.classes);
+        self.steps.push((first_slot, var_base));
         for domain in domains {
-            let slot = class_of.len() as u32;
-            let id = classes.len() as ClassId;
+            let id = self.classes.len() as ClassId;
             let constant = domain.single();
-            class_of.push(id);
-            classes.push(Rc::new(Class {
+            self.class_of.push(id);
+            self.classes.push(Rc::new(Class {
                 constant,
                 domain,
                 distinct: Vec::new(),
-                members: vec![slot],
+                forward: None,
+                size: 1,
             }));
         }
     }
@@ -80,7 +83,11 @@ impl LBindings {
     /// The class of a step variable.
     #[inline]
     pub fn class(&self, v: Variable, step: usize) -> ClassId {
-        self.class_of[self.slot(v, step).expect("a variable of a plan step") as usize]
+        let mut c = self.class_of[self.slot(v, step).expect("a variable of a plan step") as usize];
+        while let Some(next) = self.classes[c as usize].forward {
+            c = next;
+        }
+        c
     }
 
     #[inline]
@@ -116,10 +123,10 @@ impl LBindings {
 
     /// Unbound classes in creation order.
     pub fn unbound_classes(&self) -> impl Iterator<Item = ClassId> + '_ {
-        self.classes.iter().enumerate().filter_map(|(i, c)| {
-            (c.constant.is_none() && !c.members.is_empty() && self.class_of[c.members[0] as usize] == i as ClassId)
-                .then_some(i as ClassId)
-        })
+        self.classes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| (c.constant.is_none() && c.forward.is_none()).then_some(i as ClassId))
     }
 
     /// Equality already entailed.
@@ -195,7 +202,7 @@ impl LBindings {
     }
 
     fn class_mut(&mut self, c: ClassId) -> &mut Class {
-        Rc::make_mut(&mut Rc::make_mut(&mut self.classes)[c as usize])
+        Rc::make_mut(self.classes.get_mut(c as usize))
     }
 
     /// Binds an unbound class, removing the object from its distinct classes.
@@ -244,7 +251,7 @@ impl LBindings {
             return false;
         }
         // Keep the larger class.
-        let (keep, gone) = if self.classes[x as usize].members.len() >= self.classes[y as usize].members.len() {
+        let (keep, gone) = if self.classes[x as usize].size >= self.classes[y as usize].size {
             (x, y)
         } else {
             (y, x)
@@ -253,12 +260,6 @@ impl LBindings {
         if let (Some(a), Some(b)) = (self.classes[keep as usize].constant, gone_class.constant) {
             if a != b {
                 return false;
-            }
-        }
-        {
-            let class_of = Rc::make_mut(&mut self.class_of);
-            for &slot in &gone_class.members {
-                class_of[slot as usize] = keep;
             }
         }
         for &d in &gone_class.distinct {
@@ -270,7 +271,7 @@ impl LBindings {
         }
         {
             let k = self.class_mut(keep);
-            k.members.extend_from_slice(&gone_class.members);
+            k.size += gone_class.size;
             k.domain.intersect_with(&gone_class.domain);
             for &d in &gone_class.distinct {
                 if !k.distinct.contains(&d) {
@@ -283,7 +284,7 @@ impl LBindings {
         }
         {
             let g = self.class_mut(gone);
-            g.members.clear();
+            g.forward = Some(keep);
             g.distinct.clear();
         }
         match self.classes[keep as usize].constant {

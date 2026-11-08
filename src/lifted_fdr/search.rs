@@ -271,18 +271,18 @@ impl Search<'_, '_> {
         let flaw = match (binding, selected) {
             (Some((class, objects)), _) => format!("bind class {} over {} objects", class, objects.len()),
             (None, super::flaws::Flaw::Open(o)) => {
-                let name = if o.consumer == super::plan::GOAL_ID {
+                let name = if o.consumer() == super::plan::GOAL_ID {
                     "goal".to_string()
                 } else {
-                    ctx.schema_of(plan, o.consumer).name.clone()
+                    ctx.schema_of(plan, o.consumer()).name.clone()
                 };
-                format!("open {} for {}@{}", describe(o.consumer, ctx.condition(plan, o.consumer, o.cond)), name, o.consumer)
+                format!("open {} for {}@{}", describe(o.consumer(), ctx.condition(plan, o.consumer(), o.cond)), name, o.consumer())
             }
             (None, super::flaws::Flaw::Threat(t)) => format!(
                 "threat step {} ({}) on {}",
-                t.step,
-                ctx.schema_of(plan, t.step).name,
-                describe(t.link.consumer, ctx.condition(plan, t.link.consumer, t.link.cond))
+                t.step(),
+                ctx.schema_of(plan, t.step()).name,
+                describe(t.link.consumer(), ctx.condition(plan, t.link.consumer(), t.link.cond))
             ),
             (None, super::flaws::Flaw::Dead) => "dead".to_string(),
         };

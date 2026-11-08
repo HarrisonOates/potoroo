@@ -31,33 +31,103 @@ pub use crate::plan::{GOAL_ID, INIT_ID};
 /// No producer assignment: the link is supported by the initial state.
 pub const FROM_INIT: u16 = u16::MAX;
 
+/// Step ids are stored as `u32` (the goal as `u32::MAX`): plans hold many
+/// links, open conditions and threats in persistent chains.
+#[inline]
+fn pack(step: usize) -> u32 {
+    if step == GOAL_ID {
+        u32::MAX
+    } else {
+        step as u32
+    }
+}
+
+#[inline]
+fn unpack(step: u32) -> usize {
+    if step == u32::MAX {
+        GOAL_ID
+    } else {
+        step as usize
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
-    pub producer: usize,
-    pub consumer: usize,
+    producer: u32,
+    consumer: u32,
     /// Condition index at the consumer (goal index for the goal step).
     pub cond: u16,
     /// Producer assignment index, or [`FROM_INIT`].
     pub assign: u16,
 }
 
+impl Link {
+    pub fn new(producer: usize, consumer: usize, cond: u16, assign: u16) -> Link {
+        Link {
+            producer: pack(producer),
+            consumer: pack(consumer),
+            cond,
+            assign,
+        }
+    }
+
+    #[inline]
+    pub fn producer(&self) -> usize {
+        unpack(self.producer)
+    }
+
+    #[inline]
+    pub fn consumer(&self) -> usize {
+        unpack(self.consumer)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Open {
-    pub consumer: usize,
+    consumer: u32,
     pub cond: u16,
+}
+
+impl Open {
+    pub fn new(consumer: usize, cond: u16) -> Open {
+        Open {
+            consumer: pack(consumer),
+            cond,
+        }
+    }
+
+    #[inline]
+    pub fn consumer(&self) -> usize {
+        unpack(self.consumer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Threat {
-    pub step: usize,
+    step: u32,
     pub assign: u16,
     pub link: Link,
+}
+
+impl Threat {
+    pub fn new(step: usize, assign: u16, link: Link) -> Threat {
+        Threat {
+            step: pack(step),
+            assign,
+            link,
+        }
+    }
+
+    #[inline]
+    pub fn step(&self) -> usize {
+        unpack(self.step)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Plan {
     /// Schema of real step `id` at index `id - 1`.
-    pub steps: Rc<Vec<u32>>,
+    pub steps: super::pvec::PVec<u32>,
     pub links: Option<Rc<Chain<Link>>>,
     pub opens: Option<Rc<Chain<Open>>>,
     pub threats: Option<Rc<Chain<Threat>>>,
@@ -314,10 +384,7 @@ impl Plan {
         let mut opens = None;
         for i in (0..ctx.task.goal.len()).rev() {
             opens = chain::cons(
-                Open {
-                    consumer: GOAL_ID,
-                    cond: i as u16,
-                },
+                Open::new(GOAL_ID, i as u16),
                 opens,
             );
         }
@@ -336,7 +403,7 @@ impl Plan {
             .collect();
         bindings = constrain(ctx, &bindings, &goal_constraints)?;
         Some(Plan {
-            steps: Rc::new(Vec::new()),
+            steps: Default::default(),
             links: None,
             num_opens: ctx.task.goal.len(),
             opens,
@@ -383,21 +450,21 @@ fn before(a: usize, b: usize) -> Ordering {
 /// Whether step `w`'s assignment may clobber `link` under the current
 /// orderings and bindings.
 pub fn threatens(ctx: &Ctx, plan: &Plan, w: usize, assign: u16, link: &Link) -> bool {
-    if w == link.producer || w == link.consumer {
+    if w == link.producer() || w == link.consumer() {
         return false;
     }
-    let f = ctx.condition(plan, link.consumer, link.cond);
+    let f = ctx.condition(plan, link.consumer(), link.cond);
     let g = ctx.assignment(plan, w, assign);
     if f.var != g.var {
         return false;
     }
-    if !(plan.orderings.possibly_after(w, StepTime::AtEnd, link.producer, StepTime::AtEnd)
-        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.consumer, StepTime::AtStart))
+    if !(plan.orderings.possibly_after(w, StepTime::AtEnd, link.producer(), StepTime::AtEnd)
+        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.consumer(), StepTime::AtStart))
     {
         return false;
     }
     let b = &plan.bindings;
-    let c = link.consumer;
+    let c = link.consumer();
     if !f
         .inv
         .iter()
@@ -417,16 +484,12 @@ pub fn threatens(ctx: &Ctx, plan: &Plan, w: usize, assign: u16, link: &Link) -> 
 
 /// Threats between a new link and every step.
 fn link_threats(ctx: &Ctx, plan: &mut Plan, link: Link) {
-    let var = ctx.condition(plan, link.consumer, link.cond).var;
+    let var = ctx.condition(plan, link.consumer(), link.cond).var;
     for w in 1..=plan.num_steps() {
         let schema = ctx.schema_of(plan, w);
         for (a, assign) in schema.assigns.iter().enumerate() {
             if assign.fact.var == var && threatens(ctx, plan, w, a as u16, &link) {
-                plan.add_threat(Threat {
-                    step: w,
-                    assign: a as u16,
-                    link,
-                });
+                plan.add_threat(Threat::new(w, a as u16, link));
             }
         }
     }
@@ -439,7 +502,7 @@ fn step_threats(ctx: &Ctx, plan: &mut Plan, w: usize) {
     for link in links {
         for a in 0..n as u16 {
             if threatens(ctx, plan, w, a, &link) {
-                plan.add_threat(Threat { step: w, assign: a, link });
+                plan.add_threat(Threat::new(w, a, link));
             }
         }
     }
@@ -474,10 +537,10 @@ pub fn all_statics_possible(ctx: &Ctx, plan: &Plan) -> bool {
 fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
     plan.links = chain::cons(link, plan.links.take());
     let mut variants = vec![plan];
-    if link.producer != INIT_ID && link.producer != GOAL_ID {
-        let fact = ctx.assignment(&variants[0], link.producer, link.assign).clone();
+    if link.producer() != INIT_ID && link.producer() != GOAL_ID {
+        let fact = ctx.assignment(&variants[0], link.producer(), link.assign).clone();
         if fact.value == LValue::None {
-            let schema = ctx.schema_of(&variants[0], link.producer);
+            let schema = ctx.schema_of(&variants[0], link.producer());
             for add in schema.assigns.iter().filter(|a| a.fact.var == fact.var && a.fact.value != LValue::None) {
                 // The add wins when its instance co-designates: require a
                 // differing position (disjoint branches).
@@ -485,9 +548,9 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
                 for plan in variants {
                     for i in 0..fact.inv.len() {
                         let mut cs: Vec<Constraint> = (0..i)
-                            .map(|j| (fact.inv[j], link.producer, add.fact.inv[j], link.producer, true))
+                            .map(|j| (fact.inv[j], link.producer(), add.fact.inv[j], link.producer(), true))
                             .collect();
-                        cs.push((fact.inv[i], link.producer, add.fact.inv[i], link.producer, false));
+                        cs.push((fact.inv[i], link.producer(), add.fact.inv[i], link.producer(), false));
                         if let Some(b) = constrain(ctx, &plan.bindings, &cs) {
                             let mut p = plan.clone();
                             p.bindings = b;
@@ -512,8 +575,8 @@ fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, out: &mut Vec<Plan>) {
 /// Children resolving an open condition: new steps, reused steps, init.
 pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
     let base = plan.without_open(open);
-    let fact = ctx.condition(plan, open.consumer, open.cond).clone();
-    let c = open.consumer;
+    let fact = ctx.condition(plan, open.consumer(), open.cond).clone();
+    let c = open.consumer();
     let mut out = Vec::new();
     let mut cs = Vec::new();
     // New steps.
@@ -539,18 +602,13 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             continue;
         };
         let mut child = base.clone();
-        let mut steps = (*base.steps).clone();
-        steps.push(schema_index);
-        child.steps = Rc::new(steps);
+        child.steps.push(schema_index);
         child.orderings = orderings;
         child.bindings = bindings;
         child.cost += schema.cost;
         for k in (0..schema.conditions.len()).rev() {
             child.opens = chain::cons(
-                Open {
-                    consumer: n,
-                    cond: k as u16,
-                },
+                Open::new(n, k as u16),
                 child.opens.take(),
             );
             child.num_opens += 1;
@@ -559,12 +617,7 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
         finish_link(
             ctx,
             child,
-            Link {
-                producer: n,
-                consumer: c,
-                cond: open.cond,
-                assign: a,
-            },
+            Link::new(n, c, open.cond, a),
             &mut out,
         );
     }
@@ -593,23 +646,13 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
             finish_link(
                 ctx,
                 child,
-                Link {
-                    producer: w,
-                    consumer: c,
-                    cond: open.cond,
-                    assign: a as u16,
-                },
+                Link::new(w, c, open.cond, a as u16),
                 &mut out,
             );
         }
     }
     // Initial state.
-    let link = Link {
-        producer: INIT_ID,
-        consumer: c,
-        cond: open.cond,
-        assign: FROM_INIT,
-    };
+    let link = Link::new(INIT_ID, c, open.cond, FROM_INIT);
     match &fact.value {
         LValue::Part { part, .. } => {
             // One child: the condition's tuple must be an initial fact, a
@@ -672,14 +715,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open) -> Vec<Plan> {
 pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
     let base = plan.without_threat(threat);
     let link = threat.link;
-    let w = threat.step;
+    let w = threat.step();
     if !threatens(ctx, &base, w, threat.assign, &link) {
         return vec![base];
     }
     let mut out = Vec::new();
-    let f = ctx.condition(&base, link.consumer, link.cond).clone();
+    let f = ctx.condition(&base, link.consumer(), link.cond).clone();
     let g = ctx.assignment(&base, w, threat.assign).clone();
-    let c = link.consumer;
+    let c = link.consumer();
     // Children are pushed least promising first: ties go to the newest.
     // Agreement: the same instance receives the protected value.
     let mut cs = Vec::new();
@@ -694,16 +737,16 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat) -> Vec<Plan> {
         }
     }
     // Demotion: before the producer.
-    if link.producer != INIT_ID {
-        if let Some(orderings) = base.orderings.refine(before(w, link.producer)) {
+    if link.producer() != INIT_ID {
+        if let Some(orderings) = base.orderings.refine(before(w, link.producer())) {
             let mut child = base.clone();
             child.orderings = orderings;
             out.push(child);
         }
     }
     // Promotion: after the consumer.
-    if link.consumer != GOAL_ID {
-        if let Some(orderings) = base.orderings.refine(before(link.consumer, w)) {
+    if link.consumer() != GOAL_ID {
+        if let Some(orderings) = base.orderings.refine(before(link.consumer(), w)) {
             let mut child = base.clone();
             child.orderings = orderings;
             out.push(child);
@@ -747,8 +790,8 @@ fn new_step_compatible(ctx: &Ctx, plan: &Plan, cs: &[Constraint], n: usize) -> b
 /// Supporters of an open condition whose unifier is consistent, counted up to
 /// `limit`: an upper bound on its refinements, for ZLIFO selection.
 pub fn count_refinements(ctx: &Ctx, plan: &Plan, open: Open, limit: usize) -> usize {
-    let fact = ctx.condition(plan, open.consumer, open.cond);
-    let c = open.consumer;
+    let fact = ctx.condition(plan, open.consumer(), open.cond);
+    let c = open.consumer();
     let mut count = 0;
     let mut cs = Vec::new();
     let consistent = |cs: &[Constraint]| constrain(ctx, &plan.bindings, cs).is_some();
@@ -795,8 +838,8 @@ pub fn count_refinements(ctx: &Ctx, plan: &Plan, open: Open, limit: usize) -> us
 /// unifiability would let one unbound step discount every condition it might
 /// support, though it supports only one instance.
 pub fn reusable(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
-    let fact = ctx.condition(plan, open.consumer, open.cond);
-    let c = open.consumer;
+    let fact = ctx.condition(plan, open.consumer(), open.cond);
+    let c = open.consumer();
     let b = &plan.bindings;
     let mut cs = Vec::new();
     for w in 1..plan.num_steps() + 1 {
@@ -820,8 +863,8 @@ pub fn reusable(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
 /// the bindings decide them (VHPOP's delayed separable threats).
 pub fn definite(ctx: &Ctx, plan: &Plan, threat: &Threat) -> bool {
     let link = &threat.link;
-    let w = threat.step;
-    let c = link.consumer;
+    let w = threat.step();
+    let c = link.consumer();
     let f = ctx.condition(plan, c, link.cond);
     let g = ctx.assignment(plan, w, threat.assign);
     let b = &plan.bindings;
@@ -897,15 +940,15 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
         }
     }
     for link in chain::iter(&plan.links) {
-        if link.producer != INIT_ID {
+        if link.producer() != INIT_ID {
             continue;
         }
-        let f = ctx.condition(plan, link.consumer, link.cond);
+        let f = ctx.condition(plan, link.consumer(), link.cond);
         if let LValue::Part { part, args } = &f.value {
             let mut terms = f.inv.clone();
             terms.extend(args.iter().copied());
             constraints.push(Constraint {
-                terms: resolve(&terms, link.consumer),
+                terms: resolve(&terms, link.consumer()),
                 table: &ctx.init_rows[&(f.var, *part)],
             });
         }
@@ -1049,8 +1092,8 @@ fn narrow(ctx: &Ctx, plan: &Plan, b: &LBindings) -> Option<Vec<(ClassId, ObjSet)
 /// Whether the only consistent supporter would be a new step (no reuse, no
 /// initial fact).
 pub fn only_new_step(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
-    let fact = ctx.condition(plan, open.consumer, open.cond);
-    let c = open.consumer;
+    let fact = ctx.condition(plan, open.consumer(), open.cond);
+    let c = open.consumer();
     let mut cs = Vec::new();
     for w in 1..plan.num_steps() + 1 {
         if w == c || !plan.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart) {
@@ -1086,14 +1129,14 @@ pub fn only_new_step(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
 /// that is no longer possible counts as `None` (it is simply dropped).
 pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<usize> {
     let link = &threat.link;
-    let w = threat.step;
+    let w = threat.step();
     if !threatens(ctx, plan, w, threat.assign, link) {
         return None;
     }
-    let c = link.consumer;
+    let c = link.consumer();
     let mut n = 0;
-    if link.producer != INIT_ID
-        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.producer, StepTime::AtStart)
+    if link.producer() != INIT_ID
+        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.producer(), StepTime::AtStart)
     {
         n += 1;
     }
@@ -1126,7 +1169,7 @@ pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<u
 /// Whether some step that may precede the consumer may write the condition's
 /// instance to another value (VHPOP's unsafe open condition).
 pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
-    let c = open.consumer;
+    let c = open.consumer();
     let f = ctx.condition(plan, c, open.cond);
     let b = &plan.bindings;
     (1..=plan.num_steps()).any(|w| {
@@ -1237,8 +1280,8 @@ pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<ClassId> {
             }
         }
     };
-    add(ctx.condition(plan, link.consumer, link.cond), link.consumer);
-    add(ctx.assignment(plan, threat.step, threat.assign), threat.step);
+    add(ctx.condition(plan, link.consumer(), link.cond), link.consumer());
+    add(ctx.assignment(plan, threat.step(), threat.assign), threat.step());
     out
 }
 
