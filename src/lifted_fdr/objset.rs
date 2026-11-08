@@ -11,7 +11,7 @@ const INLINE: usize = 2;
 #[derive(Debug, Clone)]
 enum Words {
     Inline([u64; INLINE]),
-    Heap(Vec<u64>),
+    Heap(Box<[u64]>),
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ impl ObjSet {
         }
         let mut words = self.slice().to_vec();
         words.resize(n, 0);
-        self.words = Words::Heap(words);
+        self.words = Words::Heap(words.into_boxed_slice());
     }
 
     #[inline]

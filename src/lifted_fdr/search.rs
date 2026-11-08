@@ -207,40 +207,42 @@ struct Search<'a, 'c> {
     trace: usize,
     /// Queue children as recipes (`POTOROO_LFDR_DEFER=0` stores them built).
     defer: bool,
+    /// Keep each expansion's first-ranked child built (`POTOROO_LFDR_DEFER=best`):
+    /// cheaper when that child is popped next, but in round-robin lanes it
+    /// often is not, and keeping it built costs memory.
+    keep_best: bool,
 }
 
 impl Search<'_, '_> {
-    fn push(&self, lane: &mut Running, plan: Plan, recipe: Option<(&Rc<Expansion>, super::plan::Choice)>, stats: &mut Stats) {
+    /// Ranks a generated plan: `(f, h, id)`, or `None` when it is dead.
+    fn evaluate(&self, lane: &Running, plan: &Plan, stats: &mut Stats) -> Option<(f32, f32, u32)> {
         stats.generated += 1;
-        if self.mac_budget > 0 && !bindings_feasible(self.ctx, &plan, self.mac_budget) {
+        if self.mac_budget > 0 && !bindings_feasible(self.ctx, plan, self.mac_budget) {
             stats.dead += 1;
-            return;
+            return None;
         }
         let started = Instant::now();
-        let h = lane.estimator.estimate(self.ctx, &plan);
+        let h = lane.estimator.estimate(self.ctx, plan);
         stats.phase[0] += started.elapsed();
         if !h.is_finite() {
             stats.dead += 1;
-            return;
+            return None;
         }
-        let f = plan.cost as f32 + self.weight * h;
-        let entry = match recipe {
-            Some((base, choice)) if self.defer => Entry::Recipe {
-                base: base.clone(),
-                choice,
-            },
-            _ => Entry::Built(Rc::new(plan)),
-        };
+        Some((plan.cost as f32 + self.weight * h, h, stats.generated as u32))
+    }
+
+    fn enqueue(lane: &mut Running, (f, h, id): (f32, f32, u32), entry: Entry) {
         // Grow a large queue by an eighth rather than doubling it.
         if lane.queue.len() == lane.queue.capacity() && lane.queue.capacity() >= 1 << 16 {
             lane.queue.reserve_exact(lane.queue.capacity() / 8);
         }
-        lane.queue.push(Node {
-            f,
-            h,
-            id: stats.generated as u32,
-            entry,
-        });
+        lane.queue.push(Node { f, h, id, entry });
+    }
+
+    fn push(&self, lane: &mut Running, plan: Plan, stats: &mut Stats) {
+        if let Some(rank) = self.evaluate(lane, &plan, stats) {
+            Self::enqueue(lane, rank, Entry::Built(Rc::new(plan)));
+        }
     }
 
     /// Expands the lane's best node: a solution, or `None`.
@@ -297,8 +299,29 @@ impl Search<'_, '_> {
             parent: plan.clone(),
             flaw: refined,
         });
-        for (choice, child) in children {
-            self.push(lane, child, Some((&base, choice)), stats);
+        let ranked: Vec<((f32, f32, u32), super::plan::Choice, Plan)> = children
+            .into_iter()
+            .filter_map(|(choice, child)| Some((self.evaluate(lane, &child, stats)?, choice, child)))
+            .collect();
+        // The child the queue would pop first among these may be popped next:
+        // optionally keep it built, and only the rest as recipes.
+        let first = ranked
+            .iter()
+            .enumerate()
+            .min_by(|(_, (a, _, _)), (_, (b, _, _))| {
+                a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(b.2.cmp(&a.2))
+            })
+            .map(|(i, _)| i);
+        for (i, (rank, choice, child)) in ranked.into_iter().enumerate() {
+            let entry = if self.defer && !(self.keep_best && Some(i) == first) {
+                Entry::Recipe {
+                    base: base.clone(),
+                    choice,
+                }
+            } else {
+                Entry::Built(Rc::new(child))
+            };
+            Self::enqueue(lane, rank, entry);
         }
         None
     }
@@ -398,6 +421,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         mac_budget: std::env::var("POTOROO_LFDR_MAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         trace: std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         defer: std::env::var("POTOROO_LFDR_DEFER").map_or(true, |v| v != "0"),
+        keep_best: std::env::var("POTOROO_LFDR_DEFER").is_ok_and(|v| v == "best"),
     };
     // One planning graph serves every lane.
     let mut graph = None;
@@ -414,7 +438,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         })
         .collect();
     for lane in &mut running {
-        search.push(lane, root.clone(), None, &mut stats);
+        search.push(lane, root.clone(), &mut stats);
     }
     let start = Instant::now();
     loop {

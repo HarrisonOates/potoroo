@@ -23,11 +23,45 @@ use super::pvec::PVec;
 /// An equality class of step variables.
 pub type ClassId = u32;
 
+/// A short, mostly empty list of class ids: no allocation when empty, one
+/// shared slice otherwise (classes are cloned whenever a plan changes them).
+#[derive(Debug, Clone, Default)]
+struct IdList(Option<Rc<[ClassId]>>);
+
+impl IdList {
+    fn as_slice(&self) -> &[ClassId] {
+        self.0.as_deref().unwrap_or(&[])
+    }
+
+    fn contains(&self, id: &ClassId) -> bool {
+        self.as_slice().contains(id)
+    }
+
+    fn set(&mut self, ids: Vec<ClassId>) {
+        self.0 = (!ids.is_empty()).then(|| ids.into());
+    }
+
+    fn push(&mut self, id: ClassId) {
+        let mut ids = self.as_slice().to_vec();
+        ids.push(id);
+        self.set(ids);
+    }
+
+    fn retain(&mut self, keep: impl Fn(&ClassId) -> bool) {
+        let ids: Vec<ClassId> = self.as_slice().iter().copied().filter(|i| keep(i)).collect();
+        self.set(ids);
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Class {
     constant: Option<Object>,
     domain: ObjSet,
-    distinct: Vec<ClassId>,
+    distinct: IdList,
     /// The class this one was merged into (union-find without path
     /// compression; merges link the smaller class under the larger).
     forward: Option<ClassId>,
@@ -67,7 +101,7 @@ impl LBindings {
             self.classes.push(Rc::new(Class {
                 constant,
                 domain,
-                distinct: Vec::new(),
+                distinct: IdList::default(),
                 forward: None,
                 size: 1,
             }));
@@ -118,7 +152,7 @@ impl LBindings {
     }
 
     pub fn distinct(&self, c: ClassId) -> &[ClassId] {
-        &self.classes[c as usize].distinct
+        self.classes[c as usize].distinct.as_slice()
     }
 
     /// Unbound classes in creation order.
@@ -216,7 +250,7 @@ impl LBindings {
         let class = self.class_mut(c);
         class.constant = Some(o);
         class.domain = std::iter::once(o).collect();
-        let distinct = class.distinct.clone();
+        let distinct = class.distinct.as_slice().to_vec();
         for d in distinct {
             if self.classes[d as usize].constant == Some(o) {
                 return false;
@@ -262,7 +296,7 @@ impl LBindings {
                 return false;
             }
         }
-        for &d in &gone_class.distinct {
+        for &d in gone_class.distinct.as_slice() {
             let dc = self.class_mut(d);
             dc.distinct.retain(|&e| e != gone);
             if !dc.distinct.contains(&keep) {
@@ -273,7 +307,7 @@ impl LBindings {
             let k = self.class_mut(keep);
             k.size += gone_class.size;
             k.domain.intersect_with(&gone_class.domain);
-            for &d in &gone_class.distinct {
+            for &d in gone_class.distinct.as_slice() {
                 if !k.distinct.contains(&d) {
                     k.distinct.push(d);
                 }
@@ -339,5 +373,13 @@ mod tests {
         assert_eq!(b.binding(Y, 2), Term::Object(Object(1)));
         assert!(b.add(&[(Y, 2, Term::Object(Object(1)), 1, false)]).is_none());
         assert!(two_steps().add(&[(X, 1, Y, 1, false), (X, 1, Y, 1, true)]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn classes_stay_small() {
+        assert!(std::mem::size_of::<super::Class>() <= 64, "{}", std::mem::size_of::<super::Class>());
     }
 }
