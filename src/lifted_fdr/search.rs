@@ -297,6 +297,9 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
     };
     let ctx = Ctx::new(task, types);
     let mut stats = Stats::default();
+    if task.unsolvable {
+        return (Outcome::NoSolution, stats);
+    }
     let Some(root) = Plan::initial(&ctx) else {
         return (Outcome::NoSolution, stats);
     };
@@ -448,6 +451,7 @@ fn threat_binding(
         return None;
     }
     let mut best: Option<(f32, crate::bindings::StepVariable, Vec<Object>)> = None;
+    let degree_rule = std::env::var("POTOROO_LFDR_DEG").map_or(true, |v| v != "0");
     for (class, domain) in super::plan::binding_candidates(ctx, plan) {
         let Some(threats) = touching.get(&class) else {
             continue;
@@ -467,13 +471,19 @@ fn threat_binding(
             best = Some((score, class, viable.into_iter().map(|(o, _)| o).collect()));
         }
     }
-    let (_, class, objects) = best?;
+    let (score, class, objects) = best?;
+    // A class whose surviving domain is no larger than the number of
+    // separable threats it touches settles at least as many threats as it
+    // creates children: bind it whatever the selected flaw.
+    if plan.num_opens == 0 || (degree_rule && score <= 1.0) {
+        return Some((class, objects));
+    }
     let repairs = match selected {
         Flaw::Threat(t) => super::plan::count_threat_options(ctx, plan, t).unwrap_or(0),
         Flaw::Open(o) => super::plan::count_refinements(ctx, plan, *o, objects.len() + 1),
         Flaw::Dead => return None,
     };
-    (plan.num_opens == 0 || objects.len() < repairs).then_some((class, objects))
+    (objects.len() < repairs).then_some((class, objects))
 }
 
 /// Grounds every step variable consistently with bindings and static

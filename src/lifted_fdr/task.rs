@@ -143,6 +143,8 @@ pub struct LiftedTask {
     /// renumbered into a disjoint range, so a variable's type does not depend
     /// on the step it is scoped to.
     pub var_types: Vec<Type>,
+    /// A static goal atom is false initially.
+    pub unsolvable: bool,
 }
 
 impl LiftedTask {
@@ -161,6 +163,7 @@ impl LiftedTask {
             static_atoms: HashSet::new(),
             covered: HashMap::new(),
             var_types: Vec::new(),
+            unsolvable: false,
         };
         task.choose_cover(domain, &invariants, &fluent, &negated);
         for (index, action) in domain.actions.iter().enumerate() {
@@ -445,7 +448,14 @@ impl LiftedTask {
             .map_err(|what| Unsupported(format!("{what} in the goal")))?;
         for (positive, atom) in literals {
             if domain.predicates.is_static(atom.predicate) || !self.covered.contains_key(&atom.predicate) {
-                return Err(Unsupported("static atom in the goal".into()));
+                // Static: decided by the initial state.
+                if !atom.terms.iter().all(|t| t.object()) {
+                    return Err(Unsupported("lifted static atom in the goal".into()));
+                }
+                if self.static_atoms.contains(&atom) != positive {
+                    self.unsolvable = true;
+                }
+                continue;
             }
             let fact = if positive {
                 self.fact_of(&atom)
