@@ -180,3 +180,27 @@ Per-domain levers found so far:
 * **Value-symmetry breaking must only prune children.** Letting it shrink the
   domain used for the binding decision made bindings look cheap and broke
   childsnack.
+
+## Per-node speed (callgrind; `perf` is unavailable on this machine)
+
+* **Before:** `propagate_domains` was over 60% of instructions, mostly SipHash
+  on `HashSet<Object>` domains and support sets, plus malloc.
+* **Changes:**
+  * Domains are dense object bitsets in Fx maps.
+  * Each class's initial domain comes from a cached per-type bitset minus
+    its non-codesignated constants.
+  * Term resolution is memoised per propagation.
+  * Only negated statics are re-checked afterwards; the positive ones had
+    been about 20% on their own.
+  * Heuristic enumeration substitutes bound terms first.
+* **Results:** same search, 1.4–2.3× faster (p03 at 30k nodes: elevators
+  1.77 → 0.92 s, logistics 2.16 → 0.94 s). The search is also deterministic
+  now.
+* **Panel at `0b44576`:** 83/420, up from 78. Gained driverlog p01, gripper
+  p09, logistics p03–p04, mprime p04, tetris p03 and visitall p01; lost
+  airport p01 and childsnack p07. Lifted or ground FDR: 103.
+* **What remains:** propagation is still about 58%, now dominated by
+  `Bindings::find_var_node`: about 200 lookups per propagation at about 500
+  instructions each, scanning the unindexed varset prefix. Further gains need
+  either a cheaper class lookup or propagation that reuses the parent's
+  resolution and domains.
