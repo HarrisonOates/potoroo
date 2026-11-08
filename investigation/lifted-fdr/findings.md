@@ -231,3 +231,25 @@ Per-domain levers found so far:
 * **Lifted or ground FDR: 116/420**, against FD's 118.
 * **Memory now matters.** There are 33 memouts, up from 3, so the faster
   search now reaches the 2 GiB limit.
+
+## Memory: compaction (`17dc876`) and the calibrated ratio
+
+* **Compaction, profiled with massif.**
+  * Plan steps and the binding tables are persistent chunked vectors
+    (16-entry chunks behind `Rc`).
+  * Classes link to the class they merged into instead of listing members.
+  * Small object sets are stored inline.
+  * Links, opens and threats use `u32` step ids.
+  * Same search, 18–21% less peak memory. What remains: class clones from
+    forward checking (36%) and threat-chain prefix copies on removal (23%).
+* **Calibrated ratio, 225 s / 1 GiB** (the cluster's 1,800 s / 8 GiB; 420
+  tasks, 6 parallel):
+  * Lifted FDR solves **105**, against ground FDR ZLIFO ADD 90 and the
+    `port3c` FDR portfolio 121. Lifted or `port3c`: **143**.
+  * Lifted is **memory-bound**: 295 memouts at a median of **29 s** of 225,
+    with 266 before 112 s. Time is mostly unused, so time-for-memory
+    trades (rebuilding queued children from recipes) pay at this ratio,
+    though at 30 s / 2 GiB they would not.
+  * Lifted wins nomystery 7–0, zenotravel 7–1, driverlog 4–1, tpp and
+    openstacks. `port3c` wins elevators 10–2, depots, rovers, satellite and
+    pathways.
