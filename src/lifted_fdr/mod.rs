@@ -10,6 +10,7 @@
 pub mod flaws;
 pub mod heuristic;
 pub mod invariants;
+pub mod objset;
 pub mod plan;
 pub mod search;
 pub mod task;

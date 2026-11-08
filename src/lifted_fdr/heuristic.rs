@@ -137,8 +137,7 @@ impl Estimator {
                     match classes.iter_mut().find(|(r, _, _)| *r == rep) {
                         Some((_, positions, _)) => positions.push(i),
                         None => {
-                            let mut objects: Vec<Object> = domain.iter().copied().collect();
-                            objects.sort();
+                            let objects: Vec<Object> = domain.iter().collect();
                             classes.push((rep, vec![i], objects));
                         }
                     }
@@ -154,7 +153,12 @@ impl Estimator {
         }
         let mut best = HeuristicValue::INFINITE;
         let mut index = vec![0usize; classes.len()];
+        // Substitute bound terms once, so candidates that end up ground take
+        // the graph's direct lookup instead of pattern resolution.
         let mut probe = atom.clone();
+        for t in probe.terms.iter_mut() {
+            *t = b.binding(*t, open.consumer);
+        }
         loop {
             for (k, (_, positions, objects)) in classes.iter().enumerate() {
                 for &p in positions {

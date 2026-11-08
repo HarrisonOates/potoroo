@@ -22,6 +22,7 @@ use crate::predicates::Predicate;
 use crate::terms::{Object, Term, Variable};
 use crate::types::Type;
 
+use super::objset::ObjSet;
 use super::task::{LFact, LValue, LiftedTask};
 
 pub use crate::plan::{GOAL_ID, INIT_ID};
@@ -70,7 +71,7 @@ pub struct Plan {
 }
 
 /// Narrowed domains per equality class.
-pub type Domains = HashMap<crate::bindings::StepVariable, HashSet<Object>>;
+pub type Domains = crate::fasthash::FastMap<crate::bindings::StepVariable, ObjSet>;
 
 /// A relation (static predicate or a variable's initial values) with a
 /// membership set and per-position row indexes.
@@ -198,6 +199,8 @@ pub struct Ctx<'a> {
     pub init_rows: HashMap<(u32, u16), Table>,
     /// Static relations by predicate.
     pub static_tables: HashMap<Predicate, Table>,
+    /// Objects of each type, as bitsets.
+    type_sets: std::cell::RefCell<HashMap<Type, ObjSet>>,
     /// Interchangeable objects (Fox & Long), for breaking value symmetry in
     /// binding flaws; `None` disables it.
     pub symmetries: Option<Rc<crate::symmetry::ObjectSymmetries>>,
@@ -244,6 +247,7 @@ impl<'a> Ctx<'a> {
             types,
             init_rows,
             static_tables,
+            type_sets: Default::default(),
             symmetries: None,
             statics: StaticIndex::new(&task.static_atoms),
             writers,
@@ -253,6 +257,25 @@ impl<'a> Ctx<'a> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
         }
+    }
+
+    /// The possible objects of an unbound class: its type's objects minus the
+    /// constants it may not codesignate with ([`Bindings::domain`], as a
+    /// bitset).
+    pub fn class_domain(&self, b: &Bindings, var: Variable, step: usize) -> ObjSet {
+        let ty = self.task.var_types[var.0 as usize];
+        let mut set = self
+            .type_sets
+            .borrow_mut()
+            .entry(ty)
+            .or_insert_with(|| self.types.compatible_objects(ty).into_iter().collect())
+            .clone();
+        for (v, s) in b.non_codesignated(var, step) {
+            if let Term::Object(o) = b.binding(Term::Variable(v), s) {
+                set.remove(o);
+            }
+        }
+        set
     }
 
     pub fn schema_of(&self, plan: &Plan, step: usize) -> &super::task::LSchema {
@@ -854,18 +877,26 @@ pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<Rc<Bindings>> {
 pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domains)> {
     use crate::bindings::StepVariable;
     let b = &plan.bindings;
-    let mut domains: Domains = HashMap::new();
+    let mut domains: Domains = Domains::default();
     // Table constraints over resolved terms.
     struct Constraint<'t> {
         terms: Vec<Result<Object, StepVariable>>,
         table: &'t Table,
     }
+    // Step variables recur across constraints: resolve each once.
+    let memo: std::cell::RefCell<crate::fasthash::FastMap<(Variable, usize), Result<Object, StepVariable>>> =
+        Default::default();
     let resolve = |terms: &[Term], step: usize| -> Vec<Result<Object, StepVariable>> {
         terms
             .iter()
-            .map(|t| match b.binding(*t, step) {
+            .map(|t| match *t {
                 Term::Object(o) => Ok(o),
-                Term::Variable(v) => Err(b.representative(v, step)),
+                Term::Variable(v) => *memo.borrow_mut().entry((v, step)).or_insert_with(|| {
+                    match b.binding(Term::Variable(v), step) {
+                        Term::Object(o) => Ok(o),
+                        Term::Variable(v) => Err(b.representative(v, step)),
+                    }
+                }),
             })
             .collect()
     };
@@ -894,7 +925,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         }
     }
     // Ground constraints are membership tests; the rest seed the domains.
-    let mut by_class: HashMap<StepVariable, Vec<usize>> = HashMap::new();
+    let mut by_class: crate::fasthash::FastMap<StepVariable, Vec<usize>> = Default::default();
     for (index, c) in constraints.iter().enumerate() {
         if c.terms.iter().all(|t| t.is_ok()) {
             let ground: Vec<Object> = c.terms.iter().map(|t| *t.as_ref().unwrap()).collect();
@@ -906,9 +937,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         for t in &c.terms {
             if let Err(rep) = t {
                 by_class.entry(*rep).or_default().push(index);
-                domains
-                    .entry(*rep)
-                    .or_insert_with(|| b.domain(&ctx.types, rep.0, rep.1).into_iter().collect());
+                domains.entry(*rep).or_insert_with(|| ctx.class_domain(b, rep.0, rep.1));
             }
         }
     }
@@ -938,7 +967,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
             let mut best: Option<(usize, usize)> = None;
             for (i, t) in c.terms.iter().enumerate() {
                 if let Err(rep) = t {
-                    let size: usize = domains[rep].iter().map(|o| c.table.with(i, *o).len()).sum();
+                    let size: usize = domains[rep].iter().map(|o| c.table.with(i, o).len()).sum();
                     if best.is_none_or(|(_, s)| size < s) {
                         best = Some((i, size));
                     }
@@ -948,7 +977,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
                 if size < c.table.rows.len() {
                     let Err(rep) = c.terms[i] else { unreachable!() };
                     let mut list: Vec<u32> =
-                        domains[&rep].iter().flat_map(|o| c.table.with(i, *o).iter().copied()).collect();
+                        domains[&rep].iter().flat_map(|o| c.table.with(i, o).iter().copied()).collect();
                     list.sort_unstable();
                     candidates = Some(list);
                 }
@@ -962,7 +991,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
                 &all
             }
         };
-        let mut support: Vec<HashSet<Object>> = vec![HashSet::new(); c.terms.len()];
+        let mut support: Vec<ObjSet> = vec![ObjSet::default(); c.terms.len()];
         let mut any = false;
         'rows: for &r in rows {
             let row = &c.table.rows[r as usize];
@@ -975,7 +1004,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
                         }
                     }
                     Err(rep) => {
-                        if !domains[rep].contains(&row[i]) {
+                        if !domains[rep].contains(row[i]) {
                             continue 'rows;
                         }
                         if let Some((_, o)) = seen.iter().find(|(r, _)| r == rep) {
@@ -1001,9 +1030,7 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
         for (i, t) in c.terms.iter().enumerate() {
             if let Err(rep) = t {
                 let domain = domains.get_mut(rep).unwrap();
-                let before = domain.len();
-                domain.retain(|o| support[i].contains(o));
-                if domain.len() != before {
+                if domain.intersect_with(&support[i]) {
                     for &other in &by_class[rep] {
                         if other != index && !queued[other] {
                             queued[other] = true;
@@ -1019,17 +1046,24 @@ pub fn propagate_domains(ctx: &Ctx, plan: &Plan) -> Option<(Rc<Bindings>, Domain
     }
     let mut new = Vec::new();
     for (&(v, step), domain) in &domains {
-        if domain.len() == 1 {
-            let o = *domain.iter().next().unwrap();
+        if let Some(o) = domain.single() {
             new.push(Binding::new(v, step, Term::Object(o), step, true));
         }
     }
     let bindings = if new.is_empty() { b.clone() } else { b.add(&ctx.types, &new, false)? };
-    let mut probe = plan.clone();
-    probe.bindings = bindings.clone();
-    // Negated statics, once decided.
-    if !(1..=probe.num_steps()).all(|s| step_statics_possible(ctx, &probe, s)) {
-        return None;
+    // Negated statics, once decided (positive ones were checked above).
+    for step in 1..=plan.num_steps() {
+        for atom in &ctx.schema_of(plan, step).negated_statics {
+            let terms: Vec<Term> = atom.terms.iter().map(|t| bindings.binding(*t, step)).collect();
+            if terms.iter().all(|t| t.object())
+                && ctx.statics.contains(&Atom {
+                    predicate: atom.predicate,
+                    terms,
+                })
+            {
+                return None;
+            }
+        }
     }
     Some((bindings, domains))
 }
@@ -1180,7 +1214,7 @@ pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
 fn distinct_feasible(
     ctx: &Ctx,
     plan: &Plan,
-    domains: &mut HashMap<crate::bindings::StepVariable, HashSet<Object>>,
+    domains: &mut Domains,
 ) -> bool {
     use crate::bindings::StepVariable;
     let b = &plan.bindings;
@@ -1214,11 +1248,8 @@ fn distinct_feasible(
     if neighbours.is_empty() {
         return true;
     }
-    let domain_of = |rep: StepVariable, domains: &mut HashMap<StepVariable, HashSet<Object>>| -> HashSet<Object> {
-        domains
-            .entry(rep)
-            .or_insert_with(|| b.domain(&ctx.types, rep.0, rep.1).into_iter().collect())
-            .clone()
+    let domain_of = |rep: StepVariable, domains: &mut Domains| -> ObjSet {
+        domains.entry(rep).or_insert_with(|| ctx.class_domain(b, rep.0, rep.1)).clone()
     };
     for (&start, adjacent) in &neighbours {
         let mut clique = vec![start];
@@ -1228,7 +1259,7 @@ fn distinct_feasible(
         for u in candidates {
             if clique.iter().all(|c| neighbours.get(&u).is_some_and(|n| n.contains(c))) {
                 clique.push(u);
-                union.extend(domain_of(u, domains));
+                union.union_with(&domain_of(u, domains));
                 if clique.len() > union.len() {
                     return false;
                 }
@@ -1259,8 +1290,8 @@ pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(crate::bindings::StepV
                 continue;
             }
             let mut domain: Vec<Object> = match domains.get(&rep) {
-                Some(d) => d.iter().copied().collect(),
-                None => b.domain(&ctx.types, var, step).into_iter().collect(),
+                Some(d) => d.iter().collect(),
+                None => ctx.class_domain(b, var, step).iter().collect(),
             };
             domain.sort();
             if domain.len() >= 2 {
