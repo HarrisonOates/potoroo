@@ -1,0 +1,19 @@
+{
+  "scope": "Selected library, CLI, additive, FDR and review regression suites; not a full repository test run",
+  "passed": 292,
+  "ignored": 1,
+  "new_effort_tests": 5,
+  "new_flaw_type_tests": 3,
+  "source_files": 108,
+  "frozen": {
+    "binary": "target/relax-investigation/ff-types-frozen/potoroo",
+    "binary_sha256": "851b9280a311e5b81434c6c231f1b5f3e9436f3c3b2502c0ad6ba758c6f68911",
+    "source_archive": "target/relax-investigation/ff-types-frozen/source.tar.gz",
+    "source_archive_sha256": "cd87492ca4ce78ee99a99bb3df483d6e3c441911e72daefe65f01a056adc3459"
+  },
+  "logs": {
+    "target/relax-investigation/ff-types-tests.log": "4d9e1d27ea2ed672704f40bdba010fee6cebe67c9725ae405af478893a65ab93",
+    "target/relax-investigation/ff-types-integration-tests.log": "ae0ad228f25af58fd6ad590507720589b950d42fef3ef8fdf9775c54c1f070f6",
+    "target/relax-investigation/ff-types-build.log": "383d240fb634bbd3705e3d6de7811ce2b9820e0a36c8e20d42e13d50a31e19fe"
+  }
+}

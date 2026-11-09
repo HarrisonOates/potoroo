@@ -59,12 +59,29 @@ pub struct Parameters {
     pub flaw_orders: Vec<FlawSelectionOrder>,
     /// Per-flaw-order generated-plan limits.
     pub search_limits: Vec<usize>,
+    /// Per-flaw-order ranking heuristics (FDR POCL only); `None` uses
+    /// `heuristic`. Lets interleaved queues rank by different heuristics.
+    pub order_heuristics: Vec<Option<Heuristic>>,
+    /// Per-flaw-order heuristic weights; `None` uses `weight`.
+    pub order_weights: Vec<Option<f32>>,
     /// Whether to plan with fully ground actions. Ground instantiation is
     /// performed up front; the binding interface is otherwise identical.
     pub ground_actions: bool,
     /// Whether to collect per-evaluation `h_eval_ms` timing.
     /// `h_evals` is counted regardless.
     pub time_h_evals: bool,
+    /// Native FDR A*/GBFS only: give FF-supported refinements an additional
+    /// queue, selected five times per ordinary-queue selection. All refinements
+    /// remain in the ordinary queue. Off by default.
+    pub preferred_operators: bool,
+    /// Native FDR A* only: partial expansion (Yoshizumi, Miura & Ishida,
+    /// AAAI 2000). An expansion queues only the children whose f-value equals
+    /// the plan's current one, and re-queues the plan at its next child
+    /// f-value. Same expansion order as A* up to ties; far fewer queue entries.
+    pub partial_expansion: bool,
+    /// With `partial_expansion`, plans with at most this many refinements are
+    /// expanded fully: regenerating a few children saves little memory.
+    pub partial_expansion_min: usize,
     /// Opt-in pruning rules from the POCL literature. All off by default; see
     /// [`PruneOptions`].
     pub prune: PruneOptions,
@@ -101,8 +118,13 @@ impl Default for Parameters {
                 FlawSelectionOrder::parse("STATIC").expect("STATIC is a valid flaw order")
             ],
             search_limits: vec![usize::MAX],
+            order_heuristics: Vec::new(),
+            order_weights: Vec::new(),
             ground_actions: false,
             time_h_evals: false,
+            preferred_operators: false,
+            partial_expansion: false,
+            partial_expansion_min: 0,
             prune: PruneOptions::default(),
             max_queued: None,
             memory_limit_mb: None,

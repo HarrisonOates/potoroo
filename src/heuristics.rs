@@ -27,11 +27,41 @@ pub(crate) enum HVal {
     Addr,
     AddrCost,
     AddrWork,
-    /// Relax / RePOP heuristic: size of a delete-relaxed plan for the open
+    /// Joint relaxed-plan heuristic: size of a delete-relaxed plan for the open
     /// conditions (FF-style joint extraction). `Relax` counts every relaxed-plan
     /// action; `RelaxR` reuses existing plan steps (counts only new actions).
     Relax,
     RelaxR,
+    /// RePOP §3 recurrence with serial planning-graph levels and free committed
+    /// actions. Native FDR, unconditional unit-cost tasks only.
+    Repop,
+    /// Joint parallel FF extraction, without/with order-compatible existing reuse.
+    Ff,
+    FfR,
+    /// Additive cost plus value-token deficits: committed steps that consume
+    /// a value they overwrite each need their own production of it. See
+    /// [`crate::token`]. FDR POCL search only.
+    Tadd,
+    /// `TADD` without the plan cost, for tie-breaking.
+    TaddH,
+    /// Per-variable token flow over domain transition graphs. See
+    /// [`crate::flow`]. FDR POCL search only.
+    Flow,
+    /// `FLOW` without the plan cost, for tie-breaking.
+    FlowH,
+    /// `FLOW` with transitions priced at their operator cost alone.
+    Flow0,
+    /// `FLOW` with other-variable preconditions priced at `h_max`.
+    FlowM,
+    /// Experimental combination of `TADD` and `FLOW` (mode from POTOROO_HYB).
+    Hyb,
+    HybH,
+    /// `TADD` with prevail conditions charged once per distinct fact.
+    Tadd2,
+    /// Sum one FF relaxed support plan per open-condition occurrence.
+    FfOc,
+    /// The same sum after filtering order-compatible existing support per occurrence.
+    FfOcR,
     /// Lifted landmark count: how many of the task's lifted landmarks no step
     /// of the partial plan achieves. Not a delete relaxation, and it needs no
     /// grounding. See [`crate::landmarks`].
@@ -197,6 +227,20 @@ impl Heuristic {
                     needs_pg = true;
                     HVal::RelaxR
                 }
+                "REPOP" => HVal::Repop,
+                "FF" => HVal::Ff,
+                "FFR" => HVal::FfR,
+                "FFOC" => HVal::FfOc,
+                "TADD" => HVal::Tadd,
+                "TADD_H" => HVal::TaddH,
+                "FLOW" => HVal::Flow,
+                "FLOW_H" => HVal::FlowH,
+                "FLOW0" => HVal::Flow0,
+                "FLOWM" => HVal::FlowM,
+                "HYB" => HVal::Hyb,
+                "TADD2" => HVal::Tadd2,
+                "HYB_H" => HVal::HybH,
+                "FFOCR" => HVal::FfOcR,
                 "LMCUT" | "LM-CUT" => HVal::LmCut,
                 "LMCUTR" | "LM-CUTR" => HVal::LmCutR,
                 "CLADD" | "CL_ADD" => HVal::ClAdd,
@@ -236,9 +280,29 @@ impl Heuristic {
     /// Whether this ranking contains a heuristic defined only for native FDR
     /// POCL nodes rather than the literal partial-plan representation.
     pub fn requires_fdr_pocl(&self) -> bool {
-        self.h
-            .iter()
-            .any(|term| matches!(term, HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf))
+        self.h.iter().any(|term| {
+            matches!(
+                term,
+                HVal::LmCut
+                    | HVal::LmCutR
+                    | HVal::ClAdd
+                    | HVal::ClFf
+                    | HVal::Repop
+                    | HVal::Ff
+                    | HVal::FfR
+                    | HVal::FfOc
+                    | HVal::FfOcR
+                    | HVal::Tadd
+                    | HVal::TaddH
+                    | HVal::Flow
+                    | HVal::FlowH
+                    | HVal::Flow0
+                    | HVal::FlowM
+                    | HVal::Hyb
+                    | HVal::HybH
+                    | HVal::Tadd2
+            )
+        })
     }
 
     /// Parsed ranking terms for alternate plan representations. Keeping the
@@ -484,8 +548,25 @@ impl Heuristic {
                     rank.push(g + weight * v);
                     grank.push(weight * v);
                 }
-                HVal::LmCut | HVal::LmCutR | HVal::ClAdd | HVal::ClFf => {
-                    unreachable!("native LMCUT/LMCUTR requires FDR POCL search")
+                HVal::LmCut
+                | HVal::LmCutR
+                | HVal::ClAdd
+                | HVal::ClFf
+                | HVal::Repop
+                | HVal::Ff
+                | HVal::FfR
+                | HVal::FfOc
+                | HVal::FfOcR
+                | HVal::Tadd
+                | HVal::TaddH
+                | HVal::Flow
+                | HVal::FlowH
+                | HVal::Flow0
+                | HVal::FlowM
+                | HVal::Hyb
+                | HVal::HybH
+                | HVal::Tadd2 => {
+                    unreachable!("native FDR heuristic requires FDR POCL search")
                 }
                 // Delegating heuristics carry no separable g component; both
                 // ranks use the same value, computed once.
@@ -507,7 +588,7 @@ impl Heuristic {
                 HVal::Compile(backend) => {
                     let v = compile_rank(plan, search_ctx, weight, backend);
                     rank.push(v);
-                    grank.push(v);
+                    grank.push(v - g);
                 }
             }
         }
@@ -546,8 +627,9 @@ impl Heuristic {
 /// An unreachable compiled goal (FD reports infinite) prunes the plan. An FD
 /// error disables this backend for the search and falls back to h = 0: failure
 /// to evaluate a heuristic says nothing about solvability. Note: this
-/// spawns an FD subprocess per evaluation — the dominant cost, as the paper
-/// notes; identical compiled problems are memoized in `crate::external`.
+/// uses a persistent FD evaluator for ground SAS tasks (or a subprocess for
+/// lifted PDDL). The compiled estimate includes committed action costs, so
+/// subtract g before weighting the remaining estimate (Bercher et al. §3).
 fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuristic) -> f32 {
     if ctx.failed_compile_backends.borrow().contains(&backend) {
         return plan.cost() as f32;
@@ -562,7 +644,10 @@ fn compile_rank(plan: &Plan, ctx: &SearchContext, weight: f32, backend: FdHeuris
         external::run_fd_heuristic(&domain_pddl, &problem_pddl, backend)
     };
     match result {
-        Ok(HResult::Finite(h)) => plan.cost() as f32 + weight * h,
+        Ok(HResult::Finite(h)) => {
+            let g = plan.cost() as f32;
+            g + weight * (h - g).max(0.0)
+        }
         Ok(HResult::Infinite) => f32::INFINITY,
         Err(e) => {
             ctx.failed_compile_backends.borrow_mut().insert(backend);

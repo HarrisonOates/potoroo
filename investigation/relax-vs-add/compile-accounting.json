@@ -1,0 +1,46 @@
+{
+  "rows": [
+    {
+      "g": 0,
+      "compiled_ff": 2,
+      "current_rank": 2,
+      "paper_remaining": 2,
+      "paper_rank": 2,
+      "compiled_lmcut": 2,
+      "lmcut_remaining": 2
+    },
+    {
+      "g": 1,
+      "compiled_ff": 3,
+      "current_rank": 4,
+      "paper_remaining": 2,
+      "paper_rank": 3,
+      "compiled_lmcut": 2,
+      "lmcut_remaining": 1
+    },
+    {
+      "g": 2,
+      "compiled_ff": 4,
+      "current_rank": 6,
+      "paper_remaining": 2,
+      "paper_rank": 4,
+      "compiled_lmcut": 2,
+      "lmcut_remaining": 0
+    }
+  ],
+  "command": "POTOROO_DOWNWARD=/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward cargo test --test compile_diagnostic -- --ignored --nocapture",
+  "paper": "https://www.uni-ulm.de/fileadmin/website_uni_ulm/iui.inst.090/Publikationen/2013/Bercher13POCLHeuristics.pdf",
+  "artifact_hashes": {
+    "tests/compile_diagnostic.rs": "8d2c7b76ae7252751d6b07500544e0e38fe3980f46558b28a1abeaba686f2266",
+    "target/relax-investigation/compile-accounting.log": "c40d887525c7db895efe8565249da315e81564fc5fd68354c99bda39ffd2cae9",
+    "target/relax-investigation/compile-accounting/step-0.sas": "376515fcda7ed9e58db2cf19221fdc64c6b9eb09310d5056b5f058d27940b6e6",
+    "target/relax-investigation/compile-accounting/step-1.sas": "716da17db53fbfa2da0990825c1e155f14aaffb061c71dff238a09563f25c1e8",
+    "target/relax-investigation/compile-accounting/step-2.sas": "41ad8693cd03b099d806ed156987bd1e98b0ff5cd09cba11c4f9e674097c08c7",
+    "src/compile.rs": "ba44dde7f18f59665d249bd6045c876b2545b1d3554fb72cd0b5d1be249aea68",
+    "src/sas.rs": "a8e8c0a95643359688d578e8ac794851bfda07448663c29b90c56b059da7bf57",
+    "src/heuristics.rs": "737720b93c6e0c186d6646ff7c003db1b5226ceba479dd40412d002aee5165ae",
+    "src/cl_relax.rs": "045f3e36c0ca05ef2e1a9379823136ef68aaea3fb8997e7aa4c9da663e028164",
+    "downward/builds/release/bin/downward": "97409711a90d08c162e263f1fddf7df49bd1604e7c4ab4d120b359d8a29305f9"
+  },
+  "scope": "unit-cost two-action sanity witness; not a benchmark matrix; existing compilation cost accounting remains unmodified"
+}

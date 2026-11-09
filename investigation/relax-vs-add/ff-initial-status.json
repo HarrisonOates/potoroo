@@ -1,0 +1,11 @@
+{
+  "status": "superseded",
+  "reason": "Later action effects could erase support required by earlier selected actions, yielding an invalid relaxed plan.",
+  "counterexample": "a0: ->p; a1: ->q; a2:p->q,r; a3:q->p,s; goals r,s. Incorrect [a2,a3]; valid [a0,a2,a3].",
+  "affected_results": [
+    "ff.csv",
+    "ff-vhpop-domains.csv"
+  ],
+  "preserved_source_and_binary": "ff-frozen.json",
+  "review_trace": ".aris/traces/result-to-claim/2026-11-07_run03"
+}

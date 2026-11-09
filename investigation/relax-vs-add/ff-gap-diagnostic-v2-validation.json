@@ -1,0 +1,13 @@
+{
+  "frozen": {
+    "source_archive": "target/relax-investigation/ff-gap-diagnostic-v2-frozen/source.tar.gz",
+    "source_archive_sha256": "bf590f2b22a9e0a2670e6423fd4e908c1dfe4b0be5548c2056a9f266e6229e9e",
+    "binary": "target/relax-investigation/ff-gap-diagnostic-v2-frozen/potoroo",
+    "binary_sha256": "f0ded3ad0d81654a7e27948f78fe573869b145f52e647284e07f1775ae486da2"
+  },
+  "tests": "245 library passed, one ignored; 14 CLI passed",
+  "logs": {
+    "target/relax-investigation/ff-gap-diagnostic-v2-tests.log": "cc80a4fb151bdb544c9fa65264a86c24aa2ca013a4716e069a3a65b50ec94803",
+    "target/relax-investigation/ff-gap-diagnostic-v2-build.log": "f78db255619a63593890bec62d15315ae78694ff8aa55bbe2740466556f485fb"
+  }
+}

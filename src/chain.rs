@@ -91,6 +91,12 @@ pub struct Iter<'a, T> {
     cur: Option<&'a Chain<T>>,
 }
 
+impl<T> Clone for Iter<'_, T> {
+    fn clone(&self) -> Self {
+        Iter { cur: self.cur }
+    }
+}
+
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 

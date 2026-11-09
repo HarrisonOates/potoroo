@@ -1,0 +1,17 @@
+{
+  "test_results": [
+    "test result: ok. 234 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 14.15s",
+    "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  ],
+  "release_build": "passed",
+  "binary_sha256": "6efc8e48e7cc806e8217bd0625be30756b8605bc6c147868821c1dc872fd3a94",
+  "logs": {
+    "target/relax-investigation/preferred-tests.log": "370098dab84167b92f84ddf4db7828453cc7a4c28e0b5e989797ff42ac746fd7",
+    "target/relax-investigation/preferred-build.log": "023fc2b5055696104ac41319aa34434db5dbe04aa27f612655f445b5ca38b81b",
+    "target/relax-investigation/preferred-final-tests.log": "eb1ef4fbb2c1399acc7e71a0a4eb043a126438182ff3d3234fd123a9ea223aaf"
+  },
+  "final_preferred_tests": "3 library and 1 CLI passed",
+  "diff_check": "passed",
+  "rustfmt_check": "passed",
+  "frozen_source_and_release_binary_match_current": true
+}

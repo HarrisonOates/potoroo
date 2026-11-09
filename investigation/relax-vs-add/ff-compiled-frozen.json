@@ -1,0 +1,6 @@
+{
+  "source_archive": "target/relax-investigation/ff-compiled-frozen/source.tar.gz",
+  "source_archive_sha256": "6a7bf7c0cb6373c404836a84f6c657abe780f10955fd103cf3db5b1a37f2463f",
+  "binary": "target/relax-investigation/ff-compiled-frozen/potoroo",
+  "binary_sha256": "8639d16350689a1a507e997e64e46ad03360084bc27c332f3e7ef3948bea8a40"
+}

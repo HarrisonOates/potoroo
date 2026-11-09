@@ -13,8 +13,6 @@ use thiserror::Error;
 use crate::fdr::{Fact, Task};
 use crate::params::ActionCost;
 
-const UNREACHED: u32 = u32::MAX;
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum BuildError {
     #[error(
@@ -97,6 +95,7 @@ impl RelaxedTask {
     }
 
     /// Evaluates LM-cut. `None` denotes a relaxed-unreachable goal.
+    /// Finite numeric costs saturate at u32::MAX without losing reachability.
     pub(crate) fn evaluate(&self, initial: &[usize], goals: &[usize]) -> Option<u32> {
         if goals.is_empty() {
             return Some(0);
@@ -121,10 +120,7 @@ impl RelaxedTask {
             let mut goal_supporter = None;
             let mut goal_cost = 0u32;
             for &goal in goals {
-                let cost = hmax.fact_costs[goal];
-                if cost == UNREACHED {
-                    return None;
-                }
+                let cost = hmax.fact_costs[goal]?;
                 if goal_supporter.is_none() || cost > goal_cost {
                     goal_supporter = Some(goal);
                     goal_cost = cost;
@@ -222,7 +218,8 @@ impl RelaxedTask {
     }
 
     fn hmax(&self, initial: &[usize], residual_costs: &[u32]) -> HMaxValues {
-        let mut fact_costs = vec![UNREACHED; self.num_facts];
+        // Preserve finite reachability even if path costs saturate.
+        let mut fact_costs = vec![None; self.num_facts];
         let mut unsatisfied = self
             .actions
             .iter()
@@ -235,10 +232,10 @@ impl RelaxedTask {
         let enqueue =
             |fact: usize,
              cost: u32,
-             fact_costs: &mut [u32],
+             fact_costs: &mut [Option<u32>],
              queue: &mut BinaryHeap<(Reverse<u32>, Reverse<usize>)>| {
-                if cost < fact_costs[fact] {
-                    fact_costs[fact] = cost;
+                if fact_costs[fact].is_none_or(|old| cost < old) {
+                    fact_costs[fact] = Some(cost);
                     queue.push((Reverse(cost), Reverse(fact)));
                 }
             };
@@ -255,7 +252,7 @@ impl RelaxedTask {
         }
 
         while let Some((Reverse(popped_cost), Reverse(fact))) = queue.pop() {
-            if popped_cost != fact_costs[fact] {
+            if Some(popped_cost) != fact_costs[fact] {
                 continue;
             }
             for &action_id in &self.precondition_of[fact] {
@@ -282,7 +279,7 @@ impl RelaxedTask {
 }
 
 struct HMaxValues {
-    fact_costs: Vec<u32>,
+    fact_costs: Vec<Option<u32>>,
     supporters: Vec<Option<usize>>,
     reached: Vec<bool>,
 }

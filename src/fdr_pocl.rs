@@ -39,6 +39,18 @@ use crate::plan::{GOAL_ID, INIT_ID};
 use crate::rank::{Rank, RankTerm};
 use crate::search::{SearchContext, SearchProgress};
 
+#[cfg(test)]
+#[path = "fdr_pocl/relax_diagnostic.rs"]
+mod relax_diagnostic;
+
+#[cfg(test)]
+mod effort_tests;
+mod flaw_type_diagnostic;
+#[cfg(test)]
+#[path = "fdr_pocl/forced_threat_tests.rs"]
+mod forced_threat_tests;
+mod search_diagnostic;
+
 /// A committed real step. Init and goal are represented by [`INIT_ID`] and
 /// [`GOAL_ID`] and are not stored in this vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +173,17 @@ pub struct PartialPlan {
 }
 
 impl PartialPlan {
+    #[cfg(test)]
+    pub(crate) fn test_assembled(
+        steps: Vec<Step>,
+        links: Vec<CausalLink>,
+        orderings: Rc<BinaryOrderings>,
+        cost: usize,
+    ) -> Self {
+        let next = steps.len() + 1;
+        Self::assemble(steps, links, vec![], orderings, vec![], cost, next)
+    }
+
     pub fn initial(task: &Task) -> Self {
         let mut plan = PartialPlan {
             steps: None,
@@ -754,11 +777,17 @@ impl Solution {
 pub struct SearchStats {
     pub nodes_generated: usize,
     pub nodes_visited: usize,
+    /// Children admitted to the additional preferred queue.
+    pub preferred_generated: usize,
+    /// Unexpanded plans selected from that queue (including terminal plans).
+    pub preferred_selected: usize,
     pub h_evals: usize,
     pub h_eval_ms: u128,
     pub pruned: usize,
     /// Forced support refinements performed without allocating a queue entry.
     pub supporter_forced: usize,
+    /// Forced threat refinements performed without allocating a queue entry.
+    pub threat_forced: usize,
     pub h2: crate::h2::Stats,
     pub max_steps: usize,
     pub max_open_conditions: usize,
@@ -851,12 +880,19 @@ pub fn solve_with_context(
 /// has never been able to evaluate.
 pub fn supports_heuristic(heuristic: &Heuristic) -> Result<(), Error> {
     for term in heuristic.terms() {
-        if matches!(
-            term,
-            HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_)
-        ) {
+        if let HVal::Compile(backend) = term {
+            if !matches!(
+                backend,
+                crate::external::FdHeuristic::Ff | crate::external::FdHeuristic::LmCut
+            ) {
+                return Err(Error::Unsupported(
+                    "native FDR COMPILE supports FF or LMCUT".into(),
+                ));
+            }
+        }
+        if matches!(term, HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_)) {
             return Err(Error::Unsupported(
-                "SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
+                "SAMPLE_FF and LPLAN heuristics operate on the literal plan representation"
                     .to_string(),
             ));
         }
@@ -954,6 +990,17 @@ struct Planner<'a> {
     effect_requirements: Vec<Vec<Vec<Fact>>>,
     derived_supports: HashMap<Fact, Vec<Vec<Fact>>>,
     base_relaxed: RelaxedValues,
+    /// Value-token deficit tables for `TADD`; see [`crate::token`].
+    tokens: crate::token::TokenTable,
+    /// Domain-transition token flow tables for `FLOW`; see [`crate::flow`].
+    flow: crate::flow::FlowTable,
+    /// The same flow with transitions priced at their operator cost alone,
+    /// built on first use.
+    flow0: OnceCell<crate::flow::FlowTable>,
+    flowm: OnceCell<crate::flow::FlowTable>,
+    hyb_mode: u8,
+    repop: OnceCell<Result<crate::repop::Graph, crate::memory::StopReason>>,
+    ff: OnceCell<Result<crate::ff::Graph, crate::memory::StopReason>>,
     lmcut: Result<FdrLmCut, LmCutBuildError>,
     action_cost: ActionCost,
     /// Shared mutex table for e-deletion, installed on the initial plan.
@@ -1034,6 +1081,23 @@ impl<'a> Planner<'a> {
         let base_relaxed =
             build_base_relaxed_values(task, &effect_requirements, &derived_supports, action_cost);
         let lmcut = FdrLmCut::new(task, action_cost);
+        let operator_costs = task
+            .operators
+            .iter()
+            .map(|operator| action_cost.resolve(operator.cost) as f32)
+            .collect::<Vec<_>>();
+        let tokens = crate::token::TokenTable::new(
+            task,
+            &base_relaxed.cost,
+            &effect_requirements,
+            &operator_costs,
+        );
+        let flow = crate::flow::FlowTable::new(
+            task,
+            &base_relaxed.cost,
+            &effect_requirements,
+            &operator_costs,
+        );
         for (operator_index, operator) in task.operators.iter().enumerate() {
             for (effect_index, effect) in operator.effects.iter().enumerate() {
                 variable_has_effect[effect.variable] = true;
@@ -1059,6 +1123,16 @@ impl<'a> Planner<'a> {
             landmarks,
             derived_supports,
             base_relaxed,
+            tokens,
+            flow,
+            flow0: OnceCell::new(),
+            flowm: OnceCell::new(),
+            hyb_mode: std::env::var("POTOROO_HYB")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3),
+            repop: OnceCell::new(),
+            ff: OnceCell::new(),
             lmcut,
             action_cost,
             edelete: None,
@@ -1109,6 +1183,17 @@ impl<'a> Planner<'a> {
                 "finite-domain POCL supports PDDL task costs or explicit unit costs".to_string(),
             ));
         }
+        if params.preferred_operators {
+            if !matches!(
+                params.search_algorithm,
+                SearchAlgorithm::A | SearchAlgorithm::Gbfs
+            ) {
+                return Err(Error::Unsupported(
+                    "preferred operators require native FDR A or GBFS search".into(),
+                ));
+            }
+            crate::ff::validate(self.task, params.action_cost).map_err(Error::Unsupported)?;
+        }
         for term in params.heuristic.terms() {
             match term {
                 HVal::Lifo
@@ -1128,15 +1213,44 @@ impl<'a> Planner<'a> {
                 | HVal::RelaxR
                 | HVal::ClAdd
                 | HVal::ClFf
+                | HVal::Tadd
+                | HVal::TaddH
+                | HVal::Flow
+                | HVal::FlowH
+                | HVal::Flow0
+                | HVal::FlowM
+                | HVal::Hyb
+                | HVal::HybH
+                | HVal::Tadd2
                 | HVal::Landmarks { .. } => {}
+                HVal::Ff | HVal::FfR | HVal::FfOc | HVal::FfOcR => {
+                    crate::ff::validate(self.task, params.action_cost)
+                        .map_err(Error::Unsupported)?;
+                }
+                HVal::Compile(backend) => {
+                    if !matches!(
+                        backend,
+                        crate::external::FdHeuristic::Ff | crate::external::FdHeuristic::LmCut
+                    ) {
+                        return Err(Error::Unsupported(
+                            "native FDR COMPILE supports FF or LMCUT".into(),
+                        ));
+                    }
+                    crate::fdr_compile::validate(self.task, params.action_cost)
+                        .map_err(Error::Unsupported)?;
+                }
+                HVal::Repop => {
+                    crate::repop::validate(self.task, params.action_cost)
+                        .map_err(Error::Unsupported)?;
+                }
                 HVal::LmCut | HVal::LmCutR => {
                     if let Err(error) = &self.lmcut {
                         return Err(Error::Unsupported(error.to_string()));
                     }
                 }
-                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_) => {
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) => {
                     return Err(Error::Unsupported(
-                        "SAMPLE_FF, LPLAN, and COMPILE heuristics operate on the literal plan representation"
+                        "SAMPLE_FF and LPLAN heuristics operate on the literal plan representation"
                             .to_string(),
                     ));
                 }
@@ -1239,6 +1353,48 @@ impl<'a> Planner<'a> {
         params: &Parameters,
         progress: Option<&mut dyn FnMut(SearchProgress)>,
     ) -> (Outcome, SearchStats) {
+        // An interleaved queue whose own heuristic cannot handle this task
+        // would rank every plan infinite and end the whole search; drop it
+        // while another queue remains.
+        let filtered;
+        let params = if params.order_heuristics.iter().any(Option::is_some) {
+            let keep: Vec<usize> = (0..params.flaw_orders.len())
+                .filter(
+                    |&index| match params.order_heuristics.get(index).cloned().flatten() {
+                        Some(heuristic) => self
+                            .validate_params(&Parameters {
+                                heuristic,
+                                ..params.clone()
+                            })
+                            .is_ok(),
+                        None => true,
+                    },
+                )
+                .collect();
+            if keep.is_empty() || keep.len() == params.flaw_orders.len() {
+                params
+            } else {
+                filtered = Parameters {
+                    flaw_orders: keep
+                        .iter()
+                        .map(|&i| params.flaw_orders[i].clone())
+                        .collect(),
+                    search_limits: keep.iter().map(|&i| params.search_limits[i]).collect(),
+                    order_heuristics: keep
+                        .iter()
+                        .map(|&i| params.order_heuristics.get(i).cloned().flatten())
+                        .collect(),
+                    order_weights: keep
+                        .iter()
+                        .map(|&i| params.order_weights.get(i).copied().flatten())
+                        .collect(),
+                    ..params.clone()
+                };
+                &filtered
+            }
+        } else {
+            params
+        };
         // Lazy search pops children to score them before deciding to expand.
         // Reconstructing at that first pop loses the storage benefit, so keep
         // its original plan pointers and smaller queue entries.
@@ -1247,7 +1403,7 @@ impl<'a> Planner<'a> {
             SearchAlgorithm::LazyGbfs | SearchAlgorithm::LazyGbfsDual
         ) {
             self.solve_with_queue::<Rc<PartialPlan>>(params, progress)
-        } else if params.search_algorithm == SearchAlgorithm::Alt {
+        } else if params.search_algorithm == SearchAlgorithm::Alt || params.preferred_operators {
             // Alternating queues must share materialization and expansion state.
             self.solve_with_queue::<QueuedState>(params, progress)
         } else {
@@ -1261,6 +1417,25 @@ impl<'a> Planner<'a> {
         mut progress: Option<&mut dyn FnMut(SearchProgress)>,
     ) -> (Outcome, SearchStats) {
         let search_started = Instant::now();
+        // Each flaw order's queue ranks by its own heuristic when one is given.
+        let order_params: Vec<Parameters> = (0..params.flaw_orders.len())
+            .map(|index| Parameters {
+                heuristic: params
+                    .order_heuristics
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| params.heuristic.clone()),
+                weight: params
+                    .order_weights
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(params.weight),
+                ..params.clone()
+            })
+            .collect();
+        let mut diagnostic = search_diagnostic::Diagnostic::from_env(self.task);
         let mut progress_memory = crate::memory::ProgressMemory::default();
         let n_orders = params.flaw_orders.len();
         let inf = RankTerm::INFINITY;
@@ -1286,6 +1461,30 @@ impl<'a> Planner<'a> {
             stats.stopped = Some(reason);
             return (Outcome::LimitReached, stats);
         }
+        if params.heuristic.terms().contains(&HVal::Repop) {
+            if let Err(reason) = self
+                .repop
+                .get_or_init(|| crate::repop::Graph::build(self.task, params))
+            {
+                stats.stopped = Some(*reason);
+                return (Outcome::LimitReached, stats);
+            }
+        }
+        if params.preferred_operators
+            || params
+                .heuristic
+                .terms()
+                .iter()
+                .any(|t| matches!(t, HVal::Ff | HVal::FfR | HVal::FfOc | HVal::FfOcR))
+        {
+            if let Err(reason) = self
+                .ff
+                .get_or_init(|| crate::ff::Graph::build(self.task, params))
+            {
+                stats.stopped = Some(*reason);
+                return (Outcome::LimitReached, stats);
+            }
+        }
         let cutset_mutexes = self.cutset_mutexes.as_deref();
         if let Some(mutexes) = &cutset_mutexes {
             // The goal step's pre-cutset is the task goals, and no link can span
@@ -1300,11 +1499,12 @@ impl<'a> Planner<'a> {
         let initial = Rc::new(initial_plan);
         let mut queues: Vec<BinaryHeap<QueuedPlan<P>>> =
             (0..n_orders).map(|_| BinaryHeap::new()).collect();
-        let mut secondary_queues: Vec<BinaryHeap<QueuedPlan<P>>> = if is_dual || is_alt {
-            (0..n_orders).map(|_| BinaryHeap::new()).collect()
-        } else {
-            Vec::new()
-        };
+        let mut secondary_queues: Vec<BinaryHeap<QueuedPlan<P>>> =
+            if is_dual || is_alt || params.preferred_operators {
+                (0..n_orders).map(|_| BinaryHeap::new()).collect()
+            } else {
+                Vec::new()
+            };
         let mut generated_per_order = vec![0usize; n_orders];
         let mut bound = crate::memory::OpenListBound::new(params);
         let mut stop = crate::memory::SearchStop::new(params);
@@ -1319,9 +1519,12 @@ impl<'a> Planner<'a> {
         macro_rules! stop_expired {
             () => {
                 match stop.as_mut() {
-                    Some(stop) => {
-                        stop.expired(stats.nodes_visited.saturating_add(stats.supporter_forced))
-                    }
+                    Some(stop) => stop.expired(
+                        stats
+                            .nodes_visited
+                            .saturating_add(stats.supporter_forced)
+                            .saturating_add(stats.threat_forced),
+                    ),
                     None => None,
                 }
             };
@@ -1329,11 +1532,26 @@ impl<'a> Planner<'a> {
         let mut current_order = 0usize;
         let mut orders_left = n_orders;
         let mut next_switch = 1_000usize;
+        // Queues with their own heuristics take turns by time, not by
+        // generated plans: their evaluations can differ in cost by an order
+        // of magnitude, and a count-based turn would starve the cheap one.
+        let time_share = params.order_heuristics.iter().any(Option::is_some) && n_orders > 1;
+        let mut order_time = vec![std::time::Duration::ZERO; n_orders];
+        let mut time_switch = std::time::Duration::from_millis(50);
+        let mut turn_started = Instant::now();
+
         let mut limit_reached = false;
         let mut best_h = inf;
         let mut boost_budget = 0usize;
         let mut expand_count = 0usize;
         let mut current_rank0 = RankTerm::ZERO;
+        let pea =
+            params.partial_expansion && alg == SearchAlgorithm::A && !params.preferred_operators;
+        let mut pea_lower: FastMap<usize, f32> = FastMap::default();
+        let mut trace: usize = std::env::var("POTOROO_TRACE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
 
         generated_per_order[0] = 1;
         stats.nodes_generated = 1;
@@ -1349,6 +1567,9 @@ impl<'a> Planner<'a> {
         loop {
             let mut next_f_limit = inf;
             while let Some(plan) = current_plan.clone() {
+                if params.preferred_operators {
+                    plan.expanded.set(true);
+                }
                 if plan.complete(self.task) {
                     // A pending disjunction always keeps its threat in the
                     // threat list, so a complete plan can never carry one.
@@ -1368,12 +1589,12 @@ impl<'a> Planner<'a> {
                     }
                     (current_plan, current_rank0) = self.pop_next(
                         &mut queues[current_order],
-                        if is_dual || is_alt {
+                        if is_dual || is_alt || params.preferred_operators {
                             Some(&mut secondary_queues[current_order])
                         } else {
                             None
                         },
-                        params,
+                        &order_params[current_order],
                         is_lazy,
                         is_gbfs,
                         is_dual,
@@ -1410,11 +1631,75 @@ impl<'a> Planner<'a> {
                     boost_budget = boost_budget.saturating_sub(1);
                 }
 
-                let children = self.refinements(&plan, &params.flaw_orders[current_order]);
+                // POCL has no single current state. Prefer immediate action
+                // insertions selected by the parent's relaxed plan, plus links
+                // to existing steps and ordering refinements. This is guidance,
+                // never a restriction on which successors remain available.
+                let preferred = params.preferred_operators.then(|| {
+                    let reuse = params
+                        .heuristic
+                        .terms()
+                        .iter()
+                        .any(|t| matches!(t, HVal::FfR | HVal::FfOcR));
+                    self.ff_plan(&plan, params, reuse)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect::<FastSet<_>>()
+                });
+                let selected = self.select_flaw(&plan, &params.flaw_orders[current_order]);
+                let children = self.refine_selected(&plan, &selected);
+                if trace > 0 {
+                    trace -= 1;
+                    let (rank, _) = self.rank_both(&plan, &order_params[current_order], &mut stats);
+                    let flaw = match &selected {
+                        SelectedFlaw::Open(open) => {
+                            let var = &self.task.variables[open.condition.variable];
+                            format!(
+                                "open {}@{}",
+                                var.values[open.condition.value], open.consumer
+                            )
+                        }
+                        SelectedFlaw::Threat(threat) => {
+                            format!("threat step {} link {}", threat.step, threat.link)
+                        }
+                        SelectedFlaw::Disjunction(index) => format!("disjunction {index}"),
+                    };
+                    eprintln!(
+                        "TRACE id={} links={} f={:?} g={} open={} threats={} children={} {}",
+                        plan.id,
+                        plan.num_links(),
+                        rank.primary(plan.id),
+                        plan.cost(),
+                        plan.num_open_conditions(),
+                        plan.threats.len(),
+                        children.len(),
+                        flaw
+                    );
+                }
+                if let Some(diagnostic) = &mut diagnostic {
+                    diagnostic.observe(self, &plan, &selected, &children);
+                }
                 let mut new_step_bases = FastMap::default();
                 let order_index = current_order;
+                // Partial expansion: queue children with f in (lo, hi], where
+                // hi is the f this plan was popped at and lo the previous one.
+                let pea_window = pea.then(|| {
+                    let lo = pea_lower.remove(&plan.id).unwrap_or(f32::NEG_INFINITY);
+                    let hi = match current_rank0 {
+                        RankTerm::Score(value) if children.len() > params.partial_expansion_min => {
+                            value
+                        }
+                        _ => f32::INFINITY,
+                    };
+                    (lo, hi)
+                });
+                let mut pea_next = f32::INFINITY;
                 for mut child in children {
+                    let is_preferred = preferred
+                        .as_ref()
+                        .is_some_and(|actions| Self::preferred_refinement(&plan, &child, actions));
                     let forced_before = stats.supporter_forced;
+                    let threats_before = stats.threat_forced;
                     if params.prune.supporters {
                         if let Some(reason) = stop_expired!() {
                             stopped = Some(reason);
@@ -1430,6 +1715,33 @@ impl<'a> Planner<'a> {
                         // A refinement still consumes the node budget when its
                         // queue entry is elided. Otherwise a small node limit
                         // could hide thousands of recursive action insertions.
+                        stats.nodes_generated += forced;
+                        generated_per_order[order_index] += forced;
+                        if let Some(reason) = stop_expired!() {
+                            stopped = Some(reason);
+                            break;
+                        }
+                        let Some(propagated) = propagated else {
+                            stats.pruned += 1;
+                            continue;
+                        };
+                        child = propagated;
+                    }
+                    // New-step candidates keep their compact deferred recipe.
+                    // Compress ordering work only after selecting a threat (or
+                    // splitting a posted threat disjunction).
+                    if params.prune.threats && !matches!(selected, SelectedFlaw::Open(_)) {
+                        if let Some(reason) = stop_expired!() {
+                            stopped = Some(reason);
+                            break;
+                        }
+                        let remaining = params.search_limits[order_index]
+                            .saturating_sub(generated_per_order[order_index])
+                            .saturating_sub(1);
+                        let before = stats.threat_forced;
+                        let propagated =
+                            self.propagate_threats(child, params, remaining, &mut stats);
+                        let forced = stats.threat_forced - before;
                         stats.nodes_generated += forced;
                         generated_per_order[order_index] += forced;
                         if let Some(reason) = stop_expired!() {
@@ -1475,16 +1787,33 @@ impl<'a> Planner<'a> {
                             true,
                         )
                     } else if is_gbfs {
-                        (self.rank_both(&child, params, &mut stats).1, false)
+                        (
+                            self.rank_both(&child, &order_params[order_index], &mut stats)
+                                .1,
+                            false,
+                        )
                     } else if is_alt {
-                        let (a_rank, g_rank) = self.rank_both(&child, params, &mut stats);
+                        let (a_rank, g_rank) =
+                            self.rank_both(&child, &order_params[order_index], &mut stats);
                         alt_gbfs_rank = Some(g_rank);
                         (a_rank, false)
                     } else {
-                        (self.rank_both(&child, params, &mut stats).0, false)
+                        (
+                            self.rank_both(&child, &order_params[order_index], &mut stats)
+                                .0,
+                            false,
+                        )
                     };
 
                     let primary = rank.primary(child.id);
+                    if let (Some((lo, hi)), RankTerm::Score(f)) = (pea_window, primary) {
+                        if f.is_finite() && (f <= lo || f > hi) {
+                            if f > hi {
+                                pea_next = pea_next.min(f);
+                            }
+                            continue;
+                        }
+                    }
                     if primary.is_finite()
                         && generated_per_order[order_index] < params.search_limits[order_index]
                     {
@@ -1496,7 +1825,8 @@ impl<'a> Planner<'a> {
                             child,
                             &plan,
                             &mut new_step_bases,
-                            stats.supporter_forced == forced_before,
+                            stats.supporter_forced == forced_before
+                                && stats.threat_forced == threats_before,
                         );
                         if is_dual {
                             reserve_queue_entry(&mut secondary_queues[order_index]);
@@ -1515,6 +1845,15 @@ impl<'a> Planner<'a> {
                                 is_lazy: false,
                             });
                         }
+                        if is_preferred {
+                            reserve_queue_entry(&mut secondary_queues[order_index]);
+                            secondary_queues[order_index].push(QueuedPlan {
+                                plan: child.clone(),
+                                rank,
+                                is_lazy: false,
+                            });
+                            stats.preferred_generated += 1;
+                        }
                         reserve_queue_entry(&mut queues[order_index]);
                         queues[order_index].push(QueuedPlan {
                             plan: child,
@@ -1528,6 +1867,19 @@ impl<'a> Planner<'a> {
 
                 if stopped.is_some() {
                     break;
+                }
+                if let Some((_, hi)) = pea_window {
+                    if pea_next.is_finite() {
+                        let (own, _) =
+                            self.rank_both(&plan, &order_params[order_index], &mut stats);
+                        pea_lower.insert(plan.id, hi);
+                        reserve_queue_entry(&mut queues[order_index]);
+                        queues[order_index].push(QueuedPlan {
+                            plan: P::ready(plan.clone()),
+                            rank: own.with_primary_score(pea_next),
+                            is_lazy: false,
+                        });
+                    }
                 }
                 let queued = queues.iter().map(BinaryHeap::len).sum();
                 stats.max_queued = stats.max_queued.max(queued);
@@ -1558,12 +1910,20 @@ impl<'a> Planner<'a> {
 
                 let order_limit =
                     generated_per_order[current_order] >= params.search_limits[current_order];
-                if order_limit || generated_per_order[current_order] >= next_switch {
+                let turn_over = if time_share {
+                    let now = Instant::now();
+                    order_time[current_order] += now - turn_started;
+                    turn_started = now;
+                    order_time[current_order] >= time_switch
+                } else {
+                    generated_per_order[current_order] >= next_switch
+                };
+                if order_limit || turn_over {
                     if order_limit {
                         limit_reached = true;
                         orders_left = orders_left.saturating_sub(1);
                         queues[current_order].clear();
-                        if is_dual || is_alt {
+                        if is_dual || is_alt || params.preferred_operators {
                             secondary_queues[current_order].clear();
                         }
                     }
@@ -1573,6 +1933,7 @@ impl<'a> Planner<'a> {
                             if current_order >= n_orders {
                                 current_order = 0;
                                 next_switch = next_switch.saturating_mul(2);
+                                time_switch = time_switch.saturating_mul(2);
                             }
                             if generated_per_order[current_order]
                                 < params.search_limits[current_order]
@@ -1594,12 +1955,12 @@ impl<'a> Planner<'a> {
                 } else {
                     (current_plan, current_rank0) = self.pop_next(
                         &mut queues[current_order],
-                        if is_dual || is_alt {
+                        if is_dual || is_alt || params.preferred_operators {
                             Some(&mut secondary_queues[current_order])
                         } else {
                             None
                         },
-                        params,
+                        &order_params[current_order],
                         is_lazy,
                         is_gbfs,
                         is_dual,
@@ -2027,15 +2388,20 @@ impl<'a> Planner<'a> {
         children
     }
 
+    #[cfg(test)]
     fn refinements(
         &self,
         plan: &PartialPlan,
         order: &crate::heuristics::FlawSelectionOrder,
     ) -> Vec<PartialPlan> {
-        let refinements = match self.select_flaw(plan, order) {
-            SelectedFlaw::Threat(threat) => self.resolve_threat(plan, &threat),
-            SelectedFlaw::Open(open) => self.resolve_open(plan, open),
-            SelectedFlaw::Disjunction(index) => self.split_disjunction(plan, index),
+        self.refine_selected(plan, &self.select_flaw(plan, order))
+    }
+
+    fn refine_selected(&self, plan: &PartialPlan, selected: &SelectedFlaw) -> Vec<PartialPlan> {
+        let refinements = match selected {
+            SelectedFlaw::Threat(threat) => self.resolve_threat(plan, threat),
+            SelectedFlaw::Open(open) => self.resolve_open(plan, open.clone()),
+            SelectedFlaw::Disjunction(index) => self.split_disjunction(plan, *index),
         };
 
         #[cfg(test)]
@@ -2436,6 +2802,49 @@ impl<'a> Planner<'a> {
         Some(plan)
     }
 
+    /// Propagate only classical threats with at most one ordering repair and
+    /// no confrontation alternative. Each repair is entailed by the obligation
+    /// to protect the existing link. Ambiguous and covered threats stay pending.
+    /// Batches are bounded, and omitted queue entries still consume node budget.
+    fn propagate_threats(
+        &self,
+        mut plan: PartialPlan,
+        params: &Parameters,
+        remaining: usize,
+        stats: &mut SearchStats,
+    ) -> Option<PartialPlan> {
+        for _ in 0..remaining.min(16) {
+            if params
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                break;
+            }
+            let mut links = plan.links();
+            let mut remaining_links = plan.num_links;
+            let mut link = None;
+            let forced = plan.threats.iter().rev().find_map(|threat| {
+                while remaining_links > threat.link {
+                    link = links.next();
+                    remaining_links -= 1;
+                }
+                let link = link.expect("threat refers to an existing causal link");
+                (!plan.threat_covered(threat)
+                    && self.threat_ordering_count(&plan, threat, link) <= 1
+                    && self.confrontations(&plan, threat).is_empty())
+                .then_some(*threat)
+            });
+            let Some(threat) = forced else { break };
+            let mut refinements = self.resolve_threat(&plan, &threat);
+            debug_assert!(refinements.len() <= 1);
+            plan = refinements.pop()?;
+            stats.threat_forced += 1;
+            #[cfg(test)]
+            assert_eq!(plan.threats(self.task), plan.rediscover_threats(self.task));
+        }
+        Some(plan)
+    }
+
     fn has_reuse(&self, plan: &PartialPlan, open: &OpenCondition) -> bool {
         if self.task.initial[open.condition.variable] == open.condition.value {
             return true;
@@ -2475,6 +2884,55 @@ impl<'a> Planner<'a> {
         result
     }
 
+    /// Classify the immediate refinement before any forced propagation.
+    fn preferred_refinement(
+        parent: &PartialPlan,
+        child: &PartialPlan,
+        actions: &FastSet<usize>,
+    ) -> bool {
+        child.num_steps() == parent.num_steps()
+            || child
+                .steps()
+                .next()
+                .is_some_and(|step| actions.contains(&step.operator))
+    }
+
+    fn ff_estimate(&self, plan: &PartialPlan, params: &Parameters, reuse: bool) -> Option<f32> {
+        self.ff_plan(plan, params, reuse)
+            .map(|actions| actions.len() as f32)
+    }
+
+    /// Existing support is free only for this consumer and only when the
+    /// producer could precede it. FF's validation excludes conditional effects.
+    fn has_ff_reuse(&self, plan: &PartialPlan, open: &OpenCondition) -> bool {
+        plan.steps().any(|step| {
+            plan.orderings.possibly_before(
+                step.id,
+                StepTime::AtEnd,
+                open.consumer,
+                StepTime::AtStart,
+            ) && self.task.operators[step.operator]
+                .effects
+                .iter()
+                .any(|e| e.assignment() == open.condition)
+        })
+    }
+
+    /// Filter existing support per open occurrence BEFORE deduplicating facts:
+    /// one eligible consumer must not make a differently ordered consumer free.
+    fn ff_plan(&self, plan: &PartialPlan, params: &Parameters, reuse: bool) -> Option<Vec<usize>> {
+        let graph = self
+            .ff
+            .get_or_init(|| crate::ff::Graph::build(self.task, params))
+            .as_ref()
+            .ok()?;
+        let goals = plan
+            .open_conditions()
+            .filter(|open| !reuse || !self.has_ff_reuse(plan, open))
+            .map(|open| open.condition);
+        graph.extract(goals)
+    }
+
     fn compute_rank_both(&self, plan: &PartialPlan, params: &Parameters) -> (Rank, Rank) {
         let g = plan.cost() as f32;
         let opens = plan.num_open_conditions();
@@ -2485,10 +2943,15 @@ impl<'a> Planner<'a> {
         let mut addr = None;
         let mut relax = None;
         let mut relaxr = None;
+        let mut repop = None;
+        let mut ff = None;
+        let mut ffr = None;
         let mut lmcut = None;
         let mut lmcutr = None;
         let mut compiled = None;
         let mut landmarks = None;
+        let mut tadd = None;
+        let mut flow = None;
 
         for term in params.heuristic.terms() {
             match term {
@@ -2542,6 +3005,146 @@ impl<'a> Planner<'a> {
                     rank.push(if h.is_finite() { g + h } else { h });
                     grank.push(h);
                 }
+                HVal::Compile(backend) => {
+                    let task = crate::fdr_compile::build(self.task, plan, params.action_cost);
+                    let h = crate::fdr_compile::remaining(&task, plan.cost(), *backend)
+                        .unwrap_or(f32::INFINITY);
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(g + h);
+                    grank.push(h);
+                }
+                HVal::Tadd | HVal::TaddH => {
+                    let h = *tadd.get_or_insert_with(|| {
+                        self.open_estimate(plan, false).cost + self.token_deficit(plan)
+                    });
+                    if matches!(term, HVal::TaddH) {
+                        rank.push(h);
+                        grank.push(h);
+                        continue;
+                    }
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Tadd2 => {
+                    let h = self.tadd2(plan);
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Hyb | HVal::HybH => {
+                    let t = *tadd.get_or_insert_with(|| {
+                        self.open_estimate(plan, false).cost + self.token_deficit(plan)
+                    });
+                    let f = *flow.get_or_insert_with(|| self.flow_estimate(plan));
+                    let h = if !t.is_finite() || !f.is_finite() {
+                        f32::INFINITY
+                    } else {
+                        match self.hyb_mode {
+                            0 => t.max(f),
+                            1 => t + f,
+                            2 => 0.5 * (t + f),
+                            3 => t + 0.5 * f,
+                            // FLOW as a dead-end filter only.
+                            _ => t,
+                        }
+                    };
+                    if matches!(term, HVal::HybH) {
+                        rank.push(h);
+                        grank.push(h);
+                        continue;
+                    }
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Flow0 | HVal::FlowM => {
+                    let cell = if matches!(term, HVal::FlowM) {
+                        &self.flowm
+                    } else {
+                        &self.flow0
+                    };
+                    let table = cell.get_or_init(|| {
+                        let zero = if matches!(term, HVal::FlowM) {
+                            self.hmax_values()
+                        } else {
+                            self.task
+                                .variables
+                                .iter()
+                                .map(|variable| vec![0.0; variable.values.len()])
+                                .collect::<Vec<_>>()
+                        };
+                        let costs = self
+                            .task
+                            .operators
+                            .iter()
+                            .map(|operator| self.action_cost.resolve(operator.cost) as f32)
+                            .collect::<Vec<_>>();
+                        let mut table = crate::flow::FlowTable::new(
+                            self.task,
+                            &zero,
+                            &self.effect_requirements,
+                            &costs,
+                        );
+                        // Prevail and derived needs keep their additive costs.
+                        table.set_additive(&self.base_relaxed.cost);
+                        table
+                    });
+                    let h = self.flow_estimate_with(table, plan);
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Flow | HVal::FlowH => {
+                    let h = *flow.get_or_insert_with(|| self.flow_estimate(plan));
+                    if matches!(term, HVal::FlowH) {
+                        rank.push(h);
+                        grank.push(h);
+                        continue;
+                    }
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::FfOc | HVal::FfOcR => {
+                    let reuse = matches!(term, HVal::FfOcR);
+                    let graph = self
+                        .ff
+                        .get_or_init(|| crate::ff::Graph::build(self.task, params));
+                    let h = graph.as_ref().map_or(f32::INFINITY, |graph| {
+                        plan.open_conditions()
+                            .filter(|open| !reuse || !self.has_ff_reuse(plan, open))
+                            .map(|o| graph.single_cost(o.condition))
+                            .sum::<f32>()
+                    });
+                    let h = if h.is_finite() { params.weight * h } else { h };
+                    rank.push(g + h);
+                    grank.push(h);
+                }
+                HVal::Ff | HVal::FfR => {
+                    let reuse = matches!(term, HVal::FfR);
+                    let cache = if reuse { &mut ffr } else { &mut ff };
+                    let estimate =
+                        *cache.get_or_insert_with(|| self.ff_estimate(plan, params, reuse));
+                    let h = estimate.map_or(f32::INFINITY, |v| params.weight * v);
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
+                HVal::Repop => {
+                    let estimate = *repop.get_or_insert_with(|| {
+                        self.repop
+                            .get_or_init(|| crate::repop::Graph::build(self.task, params))
+                            .as_ref()
+                            .ok()?
+                            .estimate(
+                                plan.open_conditions().map(|o| o.condition),
+                                plan.steps().map(|s| s.operator),
+                            )
+                    });
+                    let h = estimate.map_or(f32::INFINITY, |v| params.weight * v);
+                    rank.push(if h.is_finite() { g + h } else { h });
+                    grank.push(h);
+                }
                 HVal::LmCut | HVal::LmCutR => {
                     let reuse = matches!(term, HVal::LmCutR);
                     let estimate = if reuse {
@@ -2573,7 +3176,7 @@ impl<'a> Planner<'a> {
                     rank.push(g + h);
                     grank.push(h);
                 }
-                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) | HVal::Compile(_) => {
+                HVal::SampleFf(_) | HVal::Lplan(_) | HVal::Lpsas(_) => {
                     unreachable!("unsupported FDR heuristic was rejected before search")
                 }
             }
@@ -2677,6 +3280,94 @@ impl<'a> Planner<'a> {
             .map(|value| value as f32)
     }
 
+    fn tadd2(&self, plan: &PartialPlan) -> f32 {
+        let operator_of = |id: usize| {
+            plan.step(id)
+                .map(|step| step.operator)
+                .expect("an open condition's consumer is a committed step")
+        };
+        let opens = self.tokens.open_cost(
+            plan.steps(),
+            |step| step.operator,
+            |step, effect| !plan.effect_cannot_fire(self.task, step, effect),
+            plan.open_conditions().map(|open| {
+                let consumer = (open.consumer != GOAL_ID).then(|| operator_of(open.consumer));
+                (open.condition, consumer)
+            }),
+        );
+        opens + self.token_deficit(plan)
+    }
+
+    /// `h_max` from the initial state over operator effects (derived facts
+    /// are taken at their additive cost).
+    fn hmax_values(&self) -> Vec<Vec<f32>> {
+        let mut values: Vec<Vec<f32>> = self
+            .task
+            .variables
+            .iter()
+            .map(|variable| vec![f32::INFINITY; variable.values.len()])
+            .collect();
+        for (variable, &value) in self.task.initial.iter().enumerate() {
+            values[variable][value] = 0.0;
+        }
+        for (variable, row) in values.iter_mut().enumerate() {
+            if self.task.is_derived_variable(variable) {
+                row.clone_from(&self.base_relaxed.cost[variable]);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (o, operator) in self.task.operators.iter().enumerate() {
+                let cost = self.action_cost.resolve(operator.cost) as f32;
+                for (e, effect) in operator.effects.iter().enumerate() {
+                    let pre = self.effect_requirements[o][e]
+                        .iter()
+                        .map(|fact| values[fact.variable][fact.value])
+                        .fold(0.0f32, f32::max);
+                    let next = cost + pre;
+                    if next < values[effect.variable][effect.post] {
+                        values[effect.variable][effect.post] = next;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        values
+    }
+
+    fn flow_estimate(&self, plan: &PartialPlan) -> f32 {
+        self.flow_estimate_with(&self.flow, plan)
+    }
+
+    fn flow_estimate_with(&self, table: &crate::flow::FlowTable, plan: &PartialPlan) -> f32 {
+        let operator_of = |id: usize| {
+            plan.step(id)
+                .map(|step| step.operator)
+                .expect("an open condition's consumer is a committed step")
+        };
+        table.estimate(
+            plan.steps(),
+            |step| step.operator,
+            |step, effect| !plan.effect_cannot_fire(self.task, step, effect),
+            plan.open_conditions().map(|open| {
+                let consumer = (open.consumer != GOAL_ID).then(|| operator_of(open.consumer));
+                (open.condition, consumer)
+            }),
+        )
+    }
+
+    fn token_deficit(&self, plan: &PartialPlan) -> f32 {
+        self.tokens.deficit(
+            plan.steps(),
+            |step| step.operator,
+            |step, effect| !plan.effect_cannot_fire(self.task, step, effect),
+            plan.open_conditions().map(|open| open.condition),
+        )
+    }
+
     fn open_estimate(&self, plan: &PartialPlan, reuse: bool) -> AddEstimate {
         let values = self.relaxed_values(plan, reuse);
         let mut estimate = AddEstimate::default();
@@ -2684,7 +3375,7 @@ impl<'a> Planner<'a> {
             let cost = values.cost[open.condition.variable][open.condition.value];
             let work = values.work[open.condition.variable][open.condition.value];
             estimate.cost += cost;
-            estimate.work = estimate.work.saturating_add(work);
+            estimate.work = sum_effort(estimate.work, work);
         }
         estimate
     }
@@ -2709,8 +3400,9 @@ impl<'a> Planner<'a> {
                     values.cost[effect.variable][effect.post] = 0.0;
                     changed = true;
                 }
-                if values.work[effect.variable][effect.post] != 0 {
-                    values.work[effect.variable][effect.post] = 0;
+                // Reuse saves an action, but still requires a supporting link.
+                if values.work[effect.variable][effect.post] != 1 {
+                    values.work[effect.variable][effect.post] = 1;
                     changed = true;
                 }
             }
@@ -2819,6 +3511,10 @@ impl<'a> Planner<'a> {
             *expand_count += 1;
             (*expand_count).is_multiple_of(2)
         };
+        let prefer_secondary = params.preferred_operators && {
+            *expand_count += 1;
+            !(*expand_count).is_multiple_of(6)
+        };
         loop {
             if params
                 .deadline
@@ -2826,7 +3522,8 @@ impl<'a> Planner<'a> {
             {
                 return (None, RankTerm::ZERO);
             }
-            let use_secondary = alt_use_secondary
+            let use_secondary = prefer_secondary
+                || alt_use_secondary
                 || (is_dual && *boost_budget == 0 && {
                     *expand_count += 1;
                     (*expand_count).is_multiple_of(3)
@@ -2835,19 +3532,26 @@ impl<'a> Planner<'a> {
                 secondary
                     .as_deref_mut()
                     .and_then(BinaryHeap::pop)
-                    .or_else(|| primary.pop())
-            } else if is_alt {
-                primary
-                    .pop()
-                    .or_else(|| secondary.as_deref_mut().and_then(BinaryHeap::pop))
+                    .map(|queued| (queued, true))
+                    .or_else(|| primary.pop().map(|queued| (queued, false)))
+            } else if is_alt || params.preferred_operators {
+                primary.pop().map(|queued| (queued, false)).or_else(|| {
+                    secondary
+                        .as_deref_mut()
+                        .and_then(BinaryHeap::pop)
+                        .map(|queued| (queued, true))
+                })
             } else {
-                primary.pop()
+                primary.pop().map(|queued| (queued, false))
             };
-            let Some(queued) = queued else {
+            let Some((queued, from_secondary)) = queued else {
                 return (None, RankTerm::ZERO);
             };
-            if (is_dual || is_alt) && queued.plan.expanded() {
+            if (is_dual || is_alt || params.preferred_operators) && queued.plan.expanded() {
                 continue;
+            }
+            if params.preferred_operators && from_secondary {
+                stats.preferred_selected += 1;
             }
             if !is_lazy || !queued.is_lazy {
                 let primary = queued.rank.primary(queued.plan.id());
@@ -3094,6 +3798,15 @@ struct RelaxedValues {
     achiever: Vec<Vec<Option<Achiever>>>,
 }
 
+/// Keep the unreachable sentinel distinct from a large but finite effort.
+fn sum_effort(left: i32, right: i32) -> i32 {
+    if left == i32::MAX || right == i32::MAX {
+        i32::MAX
+    } else {
+        left.saturating_add(right).min(i32::MAX - 1)
+    }
+}
+
 fn build_base_relaxed_values(
     task: &Task,
     effect_requirements: &[Vec<Vec<Fact>>],
@@ -3122,7 +3835,8 @@ fn build_base_relaxed_values(
             continue;
         }
         values.cost[variable][value] = 0.0;
-        values.work[variable][value] = 0;
+        // VHPOP estimated effort counts the refinement that links INIT.
+        values.work[variable][value] = 1;
     }
     saturate_relaxed_values(
         task,
@@ -3149,17 +3863,25 @@ fn saturate_relaxed_values(
                 let mut work = 1i32;
                 for fact in &effect_requirements[operator_index][effect_index] {
                     cost += values.cost[fact.variable][fact.value];
-                    work = work.saturating_add(values.work[fact.variable][fact.value]);
+                    work = sum_effort(work, values.work[fact.variable][fact.value]);
+                }
+                if !cost.is_finite() {
+                    continue;
                 }
                 if cost < values.cost[effect.variable][effect.post] {
                     values.cost[effect.variable][effect.post] = cost;
+                    values.work[effect.variable][effect.post] = work;
                     values.achiever[effect.variable][effect.post] = Some(Achiever {
                         operator: operator_index,
                         effect: effect_index,
                     });
                     changed = true;
-                }
-                if work < values.work[effect.variable][effect.post] {
+                } else if cost == values.cost[effect.variable][effect.post]
+                    && work < values.work[effect.variable][effect.post]
+                {
+                    // Effort follows a cheapest-cost supporter, with minimum
+                    // effort on cost ties. Preserve the existing achiever tie
+                    // policy used by RELAX, which reads costs but not work.
                     values.work[effect.variable][effect.post] = work;
                     changed = true;
                 }
@@ -3168,16 +3890,22 @@ fn saturate_relaxed_values(
         for (&fact, supports) in derived_supports {
             for support in supports {
                 let mut cost = 0.0f32;
-                let mut work = 0i32;
+                // Expanding a derived open condition is also one refinement.
+                let mut work = 1i32;
                 for condition in support {
                     cost += values.cost[condition.variable][condition.value];
-                    work = work.saturating_add(values.work[condition.variable][condition.value]);
+                    work = sum_effort(work, values.work[condition.variable][condition.value]);
+                }
+                if !cost.is_finite() {
+                    continue;
                 }
                 if cost < values.cost[fact.variable][fact.value] {
                     values.cost[fact.variable][fact.value] = cost;
+                    values.work[fact.variable][fact.value] = work;
                     changed = true;
-                }
-                if work < values.work[fact.variable][fact.value] {
+                } else if cost == values.cost[fact.variable][fact.value]
+                    && work < values.work[fact.variable][fact.value]
+                {
                     values.work[fact.variable][fact.value] = work;
                     changed = true;
                 }
@@ -3549,6 +4277,150 @@ mod tests {
         let capacity = small.capacity();
         reserve_queue_entry(&mut small);
         assert_eq!(small.capacity(), capacity);
+    }
+
+    #[test]
+    fn preferred_queue_keeps_regular_turns_and_skips_shared_duplicates() {
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        let params = Parameters {
+            preferred_operators: true,
+            ..Parameters::default()
+        };
+        let mut primary = BinaryHeap::new();
+        let mut secondary = BinaryHeap::new();
+        for id in 0..21 {
+            let mut plan = PartialPlan::initial(&task);
+            plan.id = id;
+            let plan = QueuedState::ready(Rc::new(plan));
+            if (1..=10).contains(&id) {
+                secondary.push(QueuedPlan {
+                    plan: plan.clone(),
+                    rank: Rank::fifo(id),
+                    is_lazy: false,
+                });
+            }
+            primary.push(QueuedPlan {
+                plan,
+                rank: Rank::fifo(id),
+                is_lazy: false,
+            });
+        }
+        let mut stats = SearchStats::default();
+        let mut count = 0;
+        let mut ids = vec![];
+        loop {
+            let (plan, _) = planner.pop_next(
+                &mut primary,
+                Some(&mut secondary),
+                &params,
+                false,
+                false,
+                false,
+                false,
+                &mut 0,
+                &mut count,
+                &mut stats,
+            );
+            let Some(plan) = plan else { break };
+            assert!(!ids.contains(&plan.id), "duplicate expansion");
+            ids.push(plan.id);
+            plan.expanded.set(true);
+        }
+        assert_eq!(&ids[..12], &[1, 2, 3, 4, 5, 0, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(ids.len(), 21);
+        assert_eq!(stats.preferred_selected, 10);
+    }
+
+    #[test]
+    fn preferred_search_can_use_an_action_omitted_by_relaxation() {
+        let mut task = shared_effect_task();
+        task.initial = vec![1, 0];
+        task.operators = vec![
+            Operator {
+                name: "bad-destroys-other-goal".into(),
+                cost: 1,
+                prevail: vec![],
+                effects: vec![
+                    Effect {
+                        conditions: vec![],
+                        variable: 0,
+                        pre: Some(1),
+                        post: 0,
+                    },
+                    Effect {
+                        conditions: vec![],
+                        variable: 1,
+                        pre: Some(0),
+                        post: 1,
+                    },
+                ],
+            },
+            Operator {
+                name: "good".into(),
+                cost: 1,
+                prevail: vec![Fact::new(0, 1)],
+                effects: vec![Effect {
+                    conditions: vec![],
+                    variable: 1,
+                    pre: Some(0),
+                    post: 1,
+                }],
+            },
+        ];
+        let planner = Planner::new(&task);
+        let root = PartialPlan::initial(&task);
+        for algorithm in [SearchAlgorithm::A, SearchAlgorithm::Gbfs] {
+            for h in ["ADD/LIFO", "FF/LIFO", "FFR/LIFO", "FFOCR/LIFO"] {
+                let params = Parameters {
+                    preferred_operators: true,
+                    search_algorithm: algorithm,
+                    heuristic: Heuristic::parse(h).unwrap(),
+                    search_limits: vec![1_000],
+                    flaw_orders: vec![FlawSelectionOrder::parse("ZLIFO").unwrap()],
+                    ..Parameters::default()
+                };
+                assert_eq!(planner.ff_plan(&root, &params, false), Some(vec![0]));
+                let actions = FastSet::from_iter([0]);
+                let children = planner.refinements(&root, &params.flaw_orders[0]);
+                for child in children.iter().filter(|c| c.num_steps() > 0) {
+                    assert_eq!(
+                        Planner::preferred_refinement(&root, child, &actions),
+                        child.steps().next().unwrap().operator == 0
+                    );
+                }
+                let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("{algorithm:?} {h}")
+                };
+                assert_eq!(solution.operators, vec![1]);
+                assert!(stats.preferred_generated > 0);
+                let (full, full_stats) = planner.solve_with_queue::<Rc<PartialPlan>>(&params, None);
+                assert!(matches!(full, Outcome::Solved(_)));
+                assert_eq!(stats.nodes_generated, full_stats.nodes_generated);
+                assert_eq!(stats.nodes_visited, full_stats.nodes_visited);
+            }
+        }
+    }
+
+    #[test]
+    fn preferred_validates_ff_task_even_when_ranking_with_add() {
+        let params = Parameters {
+            preferred_operators: true,
+            ..Parameters::default()
+        };
+        assert!(solve_with_params(&conditional_task(), &params)
+            .unwrap_err()
+            .to_string()
+            .contains("conditional effects"));
+        let params = Parameters {
+            search_algorithm: SearchAlgorithm::LazyGbfs,
+            ..params
+        };
+        assert!(solve_with_params(&travel_task(), &params)
+            .unwrap_err()
+            .to_string()
+            .contains("A or GBFS"));
     }
 
     #[test]
@@ -4792,7 +5664,19 @@ mod tests {
         assert_eq!(planner.relaxed_plan_size(&plan, false), Some(1.0));
         assert_eq!(planner.lmcut_estimate(&plan, false), Some(1.0));
 
-        for heuristic in ["RELAX", "RELAXR", "LMCUT", "LMCUTR"] {
+        for heuristic in [
+            "RELAX",
+            "RELAXR",
+            "REPOP",
+            "FF",
+            "FFR",
+            "FFOC",
+            "FFOCR",
+            "COMPILE_FF",
+            "COMPILE_LMCUT",
+            "LMCUT",
+            "LMCUTR",
+        ] {
             let params = Parameters {
                 search_algorithm: SearchAlgorithm::Gbfs,
                 heuristic: Heuristic::parse(heuristic).unwrap(),
@@ -4808,6 +5692,105 @@ mod tests {
     }
 
     #[test]
+    fn ffoc_retains_open_occurrences_and_uses_g_only_in_astar() {
+        let task = shared_effect_task();
+        let planner = Planner::new(&task);
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(0, 1),
+        });
+        plan.cost = 7;
+        let params = Parameters {
+            heuristic: Heuristic::parse("FFOC").unwrap(),
+            weight: 5.0,
+            ..Parameters::default()
+        };
+        let (rank, greedy) = planner.compute_rank_both(&plan, &params);
+        // Three demands, even though one relaxed action can cover all facts.
+        assert_eq!(rank[0], 7.0 + 5.0 * 3.0);
+        assert_eq!(greedy[0], 5.0 * 3.0);
+        assert_eq!(planner.ff_estimate(&plan, &params, false), Some(1.0));
+    }
+
+    #[test]
+    fn ffocr_filters_reuse_per_consumer_but_preserves_remaining_demands() {
+        let mut task = shared_effect_task();
+        task.operators.push(Operator {
+            name: "consume-left".into(),
+            prevail: vec![Fact::new(0, 1)],
+            effects: vec![],
+            cost: 1,
+        });
+        let planner = Planner::new(&task);
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 0 });
+        for id in [2, 3] {
+            plan.push_step(Step { id, operator: 1 });
+            plan.push_open(OpenCondition {
+                consumer: id,
+                condition: Fact::new(0, 1),
+            });
+        }
+        plan.cost = 3;
+        let params = Parameters {
+            heuristic: Heuristic::parse("FFOCR").unwrap(),
+            weight: 5.0,
+            ..Parameters::default()
+        };
+        // Both goal facts and both consumer occurrences may reuse step 1.
+        assert_eq!(planner.compute_rank_both(&plan, &params).0[0], 3.0);
+        for (index, consumer) in [2, 3].into_iter().enumerate() {
+            plan.orderings = plan
+                .orderings
+                .refine_with_step(
+                    Ordering::new(consumer, StepTime::AtEnd, 1, StepTime::AtStart),
+                    3,
+                )
+                .unwrap();
+            let (rank, greedy) = planner.compute_rank_both(&plan, &params);
+            let remaining_demands = (index + 1) as f32;
+            assert_eq!(rank[0], 3.0 + 5.0 * remaining_demands);
+            assert_eq!(greedy[0], 5.0 * remaining_demands);
+        }
+        // The two earlier consumers need two separately charged support plans,
+        // even though joint extraction merges their identical fact.
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(1.0));
+        let ordinary = Parameters {
+            heuristic: Heuristic::parse("FFOC").unwrap(),
+            ..params.clone()
+        };
+        assert_eq!(planner.compute_rank_both(&plan, &ordinary).0[0], 23.0);
+    }
+
+    #[test]
+    fn ffocr_keeps_outstanding_preconditions_and_rejects_unsupported_tasks() {
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 1 });
+        plan.cost = 1;
+        for condition in task.operators[1].preconditions() {
+            plan.push_open(OpenCondition {
+                consumer: 1,
+                condition,
+            });
+        }
+        let params = Parameters {
+            heuristic: Heuristic::parse("FFOCR").unwrap(),
+            ..Parameters::default()
+        };
+        // Reusing the step for the goal does not pay for reaching its origin.
+        assert_eq!(planner.compute_rank_both(&plan, &params).0[0], 2.0);
+        let error = solve_with_params(&conditional_task(), &params).unwrap_err();
+        assert!(error.to_string().contains("unconditional effects"));
+        let mut costly = task.clone();
+        costly.operators[0].cost = 2;
+        let error = solve_with_params(&costly, &params).unwrap_err();
+        assert!(error.to_string().contains("unit-action counts"));
+    }
+
+    #[test]
     fn lmcutr_reuses_committed_step_effects() {
         let task = travel_task();
         let planner = Planner::new(&task);
@@ -4816,6 +5799,61 @@ mod tests {
 
         assert_eq!(planner.lmcut_estimate(&plan, false), Some(2.0));
         assert_eq!(planner.lmcut_estimate(&plan, true), Some(1.0));
+    }
+
+    #[test]
+    fn ffr_checks_each_consumers_order_before_fact_deduplication() {
+        let mut task = shared_effect_task();
+        task.operators.push(Operator {
+            name: "consume-left".into(),
+            prevail: vec![Fact::new(0, 1)],
+            effects: vec![],
+            cost: 1,
+        });
+        let planner = Planner::new(&task);
+        let params = Parameters::default();
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 0 });
+        assert_eq!(planner.ff_estimate(&plan, &params, false), Some(1.0));
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(0.0));
+
+        // Goal occurrences can reuse step 1, but a step cannot support itself.
+        plan.push_open(OpenCondition {
+            consumer: 1,
+            condition: Fact::new(0, 1),
+        });
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(1.0));
+
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 0 });
+        plan.push_step(Step { id: 2, operator: 1 });
+        plan.push_open(OpenCondition {
+            consumer: 2,
+            condition: Fact::new(0, 1),
+        });
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(0.0));
+        plan.orderings = plan
+            .orderings
+            .refine_with_step(Ordering::new(2, StepTime::AtEnd, 1, StepTime::AtStart), 2)
+            .unwrap();
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(1.0));
+    }
+
+    #[test]
+    fn ffr_keeps_committed_steps_outstanding_preconditions() {
+        let task = travel_task();
+        let planner = Planner::new(&task);
+        let params = Parameters::default();
+        let mut plan = PartialPlan::initial(&task);
+        plan.push_step(Step { id: 1, operator: 1 });
+        for condition in task.operators[1].preconditions() {
+            plan.push_open(OpenCondition {
+                consumer: 1,
+                condition,
+            });
+        }
+        assert_eq!(planner.ff_estimate(&plan, &params, false), Some(2.0));
+        assert_eq!(planner.ff_estimate(&plan, &params, true), Some(1.0));
     }
 
     #[test]
@@ -4828,6 +5866,70 @@ mod tests {
         };
         let error = solve_with_params(&task, &params).unwrap_err();
         assert!(error.to_string().contains("conditional effects"));
+    }
+
+    #[test]
+    fn token_and_flow_heuristics_solve_small_tasks() {
+        for task in [travel_task(), shared_effect_task(), breaker_task()] {
+            for heuristic in ["TADD/LIFO", "FLOW/LIFO", "HYB/LIFO", "TADD/TADD_H/LIFO"] {
+                let params = Parameters {
+                    heuristic: Heuristic::parse(heuristic).unwrap(),
+                    search_limits: vec![10_000],
+                    ..Parameters::default()
+                };
+                let (outcome, _) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("{heuristic} did not solve the task");
+                };
+                assert!(linearize_and_validate(&solution.plan, &task).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_orders_can_rank_by_different_heuristics() {
+        let task = travel_task();
+        let zlifo = FlawSelectionOrder::parse("ZLIFO").unwrap();
+        let params = Parameters {
+            heuristic: Heuristic::parse("ADD/LIFO").unwrap(),
+            flaw_orders: vec![zlifo.clone(), zlifo],
+            order_heuristics: vec![
+                Some(Heuristic::parse("TADD/LIFO").unwrap()),
+                Some(Heuristic::parse("FLOW/LIFO").unwrap()),
+            ],
+            search_limits: vec![1_000, 1_000],
+            ..Parameters::default()
+        };
+        let (outcome, _) = solve_with_params(&task, &params).unwrap();
+        let Outcome::Solved(solution) = outcome else {
+            panic!("the interleaved search did not solve the task");
+        };
+        assert_eq!(solution.operators, vec![0, 1]);
+    }
+
+    #[test]
+    fn partial_expansion_keeps_optimal_costs_and_queues_less() {
+        // LM-cut is admissible here; the breaker task's conditional effects
+        // are outside native LM-cut.
+        for task in [travel_task(), shared_effect_task()] {
+            let run = |pea: bool| {
+                let params = Parameters {
+                    heuristic: Heuristic::parse("LMCUT/LIFO").unwrap(),
+                    partial_expansion: pea,
+                    search_limits: vec![100_000],
+                    ..Parameters::default()
+                };
+                let (outcome, stats) = solve_with_params(&task, &params).unwrap();
+                let Outcome::Solved(solution) = outcome else {
+                    panic!("search did not solve the task (pea = {pea})");
+                };
+                (solution.plan.cost(), stats.nodes_generated)
+            };
+            let (cost, generated) = run(false);
+            let (pea_cost, pea_generated) = run(true);
+            assert_eq!(cost, pea_cost);
+            assert!(pea_generated <= generated);
+        }
     }
 
     #[test]

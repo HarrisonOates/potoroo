@@ -1,0 +1,6 @@
+{
+  "source_archive": "target/relax-investigation/ff-gap-diagnostic-frozen/source.tar.gz",
+  "source_archive_sha256": "a747fd8b1d85f822d662e1a35880bc3b65b74f7b7962fb5e4b05cf2859ec033b",
+  "binary": "target/relax-investigation/ff-gap-diagnostic-frozen/potoroo",
+  "binary_sha256": "944fe2644e4e9b1408ee9f11f198a8b1e9c390842cf5c2601fff5d68ca26908a"
+}
