@@ -167,15 +167,42 @@ impl Tokens {
                 }
             }
         }
-        // Edges, then Kuhn's augmenting paths.
+        // Edges (supplies indexed by variable and value part), then Kuhn's
+        // augmenting paths.
+        // Bucketed by variable, value part and first instance object (`None`
+        // when unbound or absent): a demand bound there scans its bucket and
+        // the unbound one; an unbound demand scans every bucket of its value.
+        type Bucket = (u32, u16, Option<crate::terms::Object>);
+        let first = |k: &Key| match k.inv.first() {
+            Some(Resolved::Object(o)) => Some(*o),
+            _ => None,
+        };
+        let mut by_value: crate::fasthash::FastMap<Bucket, Vec<usize>> = Default::default();
+        let mut by_part: crate::fasthash::FastMap<(u32, u16), Vec<usize>> = Default::default();
+        for (j, (k, _)) in supplies.iter().enumerate() {
+            by_value.entry((k.var, k.part, first(k))).or_default().push(j);
+            by_part.entry((k.var, k.part)).or_default().push(j);
+        }
+        let empty: Vec<usize> = Vec::new();
         let edges: Vec<Vec<usize>> = demands
             .iter()
             .map(|(d, consumer)| {
-                supplies
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (k, producer))| {
+                let candidates: Box<dyn Iterator<Item = usize>> = match first(d) {
+                    Some(o) => Box::new(
+                        by_value
+                            .get(&(d.var, d.part, Some(o)))
+                            .unwrap_or(&empty)
+                            .iter()
+                            .chain(by_value.get(&(d.var, d.part, None)).unwrap_or(&empty))
+                            .copied(),
+                    ),
+                    None => Box::new(by_part.get(&(d.var, d.part)).unwrap_or(&empty).iter().copied()),
+                };
+                candidates
+                    .filter(|&j| {
+                        let (k, producer) = &supplies[j];
                         *producer != *consumer
+                            && may_unify(b, d, k)
                             && (*producer == super::plan::INIT_ID
                                 || plan.orderings.possibly_before(
                                     *producer,
@@ -183,9 +210,7 @@ impl Tokens {
                                     *consumer,
                                     crate::orderings::StepTime::AtStart,
                                 ))
-                            && may_unify(b, d, k)
                     })
-                    .map(|(j, _)| j)
                     .collect()
             })
             .collect();
