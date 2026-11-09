@@ -444,8 +444,11 @@ included in its 10 s.
 
 ## Cutset minimality and frontier dominance (Nov 2026)
 
-**Cutset-prune** (Kambhampati, IJCAI 1995, Strategy 2) is in
-`src/lifted_fdr/minimality.rs` (`POTOROO_LFDR_CUTSET=1`, off by default). It
+Both instruments below were removed after measurement; the code is in
+commits `5fc5caa` and `cdb807a`.
+
+**Cutset-prune** (Kambhampati, IJCAI 1995, Strategy 2) was tried as
+`src/lifted_fdr/minimality.rs` (`POTOROO_LFDR_CUTSET=1`). It
 uses the paper's cutsets (np = out-links ∪ necessarily-spanning links of `s′`,
 pp = out-links ∪ possibly-spanning links of `s″`; `(s′, s″]` is the removed
 segment), with lifted conditions compared by necessary codesignation. The
@@ -461,7 +464,7 @@ classes, so `move(?a3,?a2) … move(?a2,?a1)` is not a loop until `?a3 = ?a1`
 is forced.
 
 **Frontier dominance** (`src/lifted_fdr/frontier.rs`,
-`POTOROO_LFDR_FRONTIER=count|1`, off by default) is a closed-list
+`POTOROO_LFDR_FRONTIER=count|1`) is a closed-list
 counterpart. It splits a plan into a frontier `F` and a settled part `U`:
 - `F` is every open condition's consumer, the steps before them, and any step
   not after all of these.
