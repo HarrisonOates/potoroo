@@ -232,6 +232,9 @@ struct Search<'a, 'c> {
     /// as one-child refinements).
     drop_stale: bool,
     force_rounds: usize,
+    /// Drop children whose new threats include one with no resolution
+    /// (`POTOROO_LFDR_NEWDEAD=0` disables).
+    dead_new_threats: bool,
     /// Plans with `h` at most this get a bounded joint check of their
     /// bindings (`POTOROO_LFDR_FEAS=H[:BUDGET]`).
     feasibility_h: f32,
@@ -436,6 +439,11 @@ impl Search<'_, '_> {
         let ranked: Vec<((f32, f32, u32), super::plan::Choice, Plan)> = children
             .into_iter()
             .filter_map(|(choice, child)| {
+                if self.dead_new_threats && super::plan::new_threat_dead(ctx, &child, &plan, 64) {
+                    stats.generated += 1;
+                    stats.dead += 1;
+                    return None;
+                }
                 let same = matches!(
                     choice,
                     super::plan::Choice::Demote | super::plan::Choice::Promote | super::plan::Choice::Drop
@@ -612,6 +620,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         keep_best: std::env::var("POTOROO_LFDR_DEFER").is_ok_and(|v| v == "best"),
         progress: std::env::var_os("POTOROO_LFDR_PROGRESS").is_some(),
         drop_stale: std::env::var("POTOROO_LFDR_STALE").map_or(true, |v| v != "0"),
+        dead_new_threats: std::env::var("POTOROO_LFDR_NEWDEAD").map_or(true, |v| v != "0"),
         force_rounds: std::env::var("POTOROO_LFDR_FORCE").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
         feasibility_h: feas.0,
         feasibility_budget: feas.1,

@@ -1016,6 +1016,30 @@ pub fn without_stale_threats(ctx: &Ctx, plan: Rc<Plan>) -> Rc<Plan> {
     Rc::new(pruned)
 }
 
+/// Whether some threat that `child` added over `parent` has no resolution.
+/// New threats are consed onto the front of the parent's list, so the walk
+/// stops where the lists meet (or after `limit` threats).
+pub fn new_threat_dead(ctx: &Ctx, child: &Plan, parent: &Plan, limit: usize) -> bool {
+    let stop: Vec<*const chain::Chain<Threat>> = parent
+        .threats
+        .iter()
+        .flat_map(|h| [Rc::as_ptr(h)].into_iter().chain(h.tail.as_ref().map(Rc::as_ptr)))
+        .collect();
+    let mut node = child.threats.as_deref();
+    let mut seen = 0;
+    while let Some(n) = node {
+        if stop.contains(&(n as *const _)) || seen == limit {
+            break;
+        }
+        if count_threat_options(ctx, child, &n.head) == Some(0) {
+            return true;
+        }
+        seen += 1;
+        node = n.tail.as_deref();
+    }
+    false
+}
+
 /// Resolves, in place, every threat with at most one resolution left: none
 /// kills the plan (`None`), one is applied, and stale threats are dropped.
 /// Repeats while that changes something, at most `rounds` times. Each such
