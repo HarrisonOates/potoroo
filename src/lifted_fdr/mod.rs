@@ -16,6 +16,7 @@ pub mod plan;
 pub mod pvec;
 pub mod search;
 pub mod task;
+pub mod token;
 
 #[cfg(test)]
 mod tests;

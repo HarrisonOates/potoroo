@@ -36,6 +36,8 @@ pub enum Kind {
     Add,
     /// ADD where a condition an existing step already supplies costs nothing.
     Addr,
+    /// ADD plus value-token deficits (the ground planner's `TADD`).
+    Tadd,
 }
 
 
@@ -49,7 +51,8 @@ impl Kind {
             "ADD" => Ok(Kind::Add),
             "PADD" => Ok(Kind::Padd),
             "ADDR" => Ok(Kind::Addr),
-            _ => Err(format!("unknown lifted FDR heuristic `{name}` (OC, ADD, PADD, ADDR)")),
+            "TADD" => Ok(Kind::Tadd),
+            _ => Err(format!("unknown lifted FDR heuristic `{name}` (OC, ADD, PADD, ADDR, TADD)")),
         }
     }
 }
@@ -64,6 +67,8 @@ pub struct Estimator {
     graph: Option<Rc<PlanningGraph>>,
     /// A reusable atom buffer for evaluating conditions.
     scratch: std::cell::Cell<Atom>,
+    /// Token tables for `TADD`, built on first use.
+    tokens: std::cell::OnceCell<super::token::Tokens>,
 }
 
 impl Estimator {
@@ -84,12 +89,13 @@ impl Estimator {
         Estimator {
             kind,
             graph: if needed { graph.clone() } else { None },
-            use_domains: matches!(kind, Kind::Add | Kind::Addr),
+            use_domains: matches!(kind, Kind::Add | Kind::Addr | Kind::Tadd),
             empty: crate::bindings::Bindings::empty(),
             scratch: std::cell::Cell::new(Atom {
                 predicate: crate::predicates::Predicate(0),
                 terms: Vec::new(),
             }),
+            tokens: std::cell::OnceCell::new(),
         }
     }
 
@@ -205,14 +211,19 @@ impl Estimator {
     pub fn estimate(&self, ctx: &Ctx, plan: &Plan) -> f32 {
         match self.kind {
             Kind::Oc => plan.num_opens as f32,
-            Kind::Add | Kind::Padd | Kind::Addr => {
+            Kind::Add | Kind::Padd | Kind::Addr | Kind::Tadd => {
                 let reuse = self.kind == Kind::Addr;
+                let tokens = self.kind == Kind::Tadd;
+                let mut charged: Vec<(usize, u16)> = Vec::new();
                 let mut total = 0.0;
                 for open in crate::chain::iter(&plan.opens) {
                     let value = self.open_value_in(ctx, plan, *open, self.use_domains);
                     let cost = value.add_cost();
                     if cost == 0.0 {
                         continue;
+                    }
+                    if tokens {
+                        charged.push((open.consumer(), open.cond));
                     }
                     let reused = reuse && reusable(ctx, plan, *open);
                     if !cost.is_finite() || cost >= i32::MAX as f32 {
@@ -225,6 +236,12 @@ impl Estimator {
                         continue;
                     }
                     total += cost;
+                }
+                if tokens {
+                    total += self
+                        .tokens
+                        .get_or_init(|| super::token::Tokens::new(ctx.task))
+                        .deficit(ctx, plan, &charged);
                 }
                 total
             }
