@@ -152,16 +152,14 @@ struct Expansion {
     parent: Rc<Plan>,
     flaw: Refined,
     /// A grounding of the parent's bindings, tried first for its children.
-    witness: Option<Rc<Witness>>,
+    witness: Option<Witness>,
 }
 
-/// An object per class id (bound classes and merged ones included): a
-/// solution of a plan's binding constraints.
-pub type Witness = Vec<Option<Object>>;
+pub use super::plan::Witness;
 
 /// The outcome of a bounded joint check of a plan's binding constraints.
 pub enum Feasibility {
-    Witness(Rc<Witness>),
+    Witness(Witness),
     /// The budget ran out: assumed feasible.
     Unknown,
     Infeasible,
@@ -250,7 +248,7 @@ impl Search<'_, '_> {
         &self,
         lane: &Running,
         plan: &Plan,
-        hint: Option<&Rc<Witness>>,
+        hint: Option<&Witness>,
         same_bindings: bool,
         stats: &mut Stats,
     ) -> Option<(f32, f32, u32)> {
@@ -895,20 +893,24 @@ fn ground_within(ctx: &Ctx, plan: &Plan, bindings: &mut super::binds::LBindings,
 /// trying `hint` (a solution for the parent) first: its values are bound at
 /// once and checked by one propagation, and only the classes it does not
 /// settle are searched.
-pub fn find_witness(ctx: &Ctx, plan: &Plan, hint: Option<&Rc<Witness>>, budget: usize) -> Feasibility {
+pub fn find_witness(ctx: &Ctx, plan: &Plan, hint: Option<&Witness>, budget: usize) -> Feasibility {
     let extract = |b: &super::binds::LBindings| -> Feasibility {
-        Feasibility::Witness(Rc::new((0..b.num_classes() as u32).map(|c| b.value(c)).collect()))
+        let mut w = Witness::default();
+        for c in plan.bindings.unbound_classes() {
+            w.set(c, b.value(c));
+        }
+        Feasibility::Witness(w)
     };
     // The parent's solution, repaired where this plan departs from it; then
     // a fresh search by table lookups; then search with propagation, which
     // can prove infeasibility within the budget.
     if let Some(hint) = hint {
         if let Some(w) = super::plan::extend_witness(ctx, plan, hint, 256) {
-            return Feasibility::Witness(Rc::new(w));
+            return Feasibility::Witness(w);
         }
     }
-    if let Some(w) = super::plan::extend_witness(ctx, plan, &[], 2048) {
-        return Feasibility::Witness(Rc::new(w));
+    if let Some(w) = super::plan::extend_witness(ctx, plan, &Witness::default(), 2048) {
+        return Feasibility::Witness(w);
     }
     let mut bindings = plan.bindings.clone();
     let mut budget = budget;

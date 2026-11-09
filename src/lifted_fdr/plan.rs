@@ -317,8 +317,6 @@ pub struct Ctx<'a> {
     /// Interchangeable objects (Fox & Long), for breaking value symmetry in
     /// binding flaws; `None` disables it.
     pub symmetries: Option<Rc<crate::symmetry::ObjectSymmetries>>,
-    /// Order separated and agreeing threats between the link's ends.
-    pub systematic_threats: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -362,7 +360,6 @@ impl<'a> Ctx<'a> {
             type_sets: Default::default(),
             num_objects: types.constants.owned_objects().count() + types.objects.owned_objects().count(),
             symmetries: None,
-            systematic_threats: std::env::var_os("POTOROO_LFDR_SYSTHREAT").is_some(),
             statics: StaticIndex::new(&task.static_atoms),
             writers,
             init_by_var,
@@ -823,26 +820,25 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
 /// domain first, within `budget` assignments; every static atom, negated
 /// static and initial-state link is checked as a table lookup once its
 /// classes have values. The bindings are not changed.
-pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &[Option<Object>], budget: usize) -> Option<Vec<Option<Object>>> {
+pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &Witness, budget: usize) -> Option<Witness> {
     let b = &plan.bindings;
-    let mut w: Vec<Option<Object>> = (0..b.num_classes() as ClassId)
-        .map(|c| b.value(c).or_else(|| witness.get(c as usize).copied().flatten()))
-        .collect();
+    // Bound classes need no entry: their constant is read first.
+    let mut w = witness.clone();
     // Classes to search: unbound with no valid inherited value.
     let unbound: Vec<ClassId> = b.unbound_classes().collect();
     let mut missing: Vec<ClassId> = Vec::new();
     for &c in &unbound {
-        let ok = w[c as usize].is_some_and(|o| b.domain(c).contains(o));
+        let ok = w.get(c).is_some_and(|o| b.domain(c).contains(o));
         if !ok {
-            w[c as usize] = None;
+            w.set(c, None);
             missing.push(c);
         }
     }
     // Distinct pairs between inherited values that now collide.
     for &c in &unbound {
-        if let Some(o) = w[c as usize] {
+        if let Some(o) = w.get(c) {
             if b.distinct(c).iter().any(|&d| d != c && rep_value(b, &w, d) == Some(o)) && !missing.contains(&c) {
-                w[c as usize] = None;
+                w.set(c, None);
                 missing.push(c);
             }
         }
@@ -887,7 +883,7 @@ pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &[Option<Object>], budget
         }
     }
     let mut row: Vec<Object> = Vec::new();
-    let mut holds = |spec: &Spec, w: &[Option<Object>]| -> Option<bool> {
+    let mut holds = |spec: &Spec, w: &Witness| -> Option<bool> {
         row.clear();
         for t in spec.inv.iter().chain(spec.args) {
             row.push(match b.resolve(*t, spec.step) {
@@ -935,9 +931,9 @@ pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &[Option<Object>], budget
         missing: &[ClassId],
         at: &[Vec<usize>],
         b: &LBindings,
-        w: &mut Vec<Option<Object>>,
+        w: &mut Witness,
         budget: &mut usize,
-        check: &mut dyn FnMut(usize, &[Option<Object>]) -> bool,
+        check: &mut dyn FnMut(usize, &Witness) -> bool,
     ) -> bool {
         if i == missing.len() {
             return true;
@@ -951,15 +947,15 @@ pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &[Option<Object>], budget
             if b.distinct(c).iter().any(|&d| rep_value(b, w, d) == Some(o)) {
                 continue;
             }
-            w[c as usize] = Some(o);
+            w.set(c, Some(o));
             if at[i].iter().all(|&s| check(s, w)) && search(i + 1, missing, at, b, w, budget, check) {
                 return true;
             }
         }
-        w[c as usize] = None;
+        w.set(c, None);
         false
     }
-    let mut check = |s: usize, w: &[Option<Object>]| holds(&specs[s], w) == Some(true);
+    let mut check = |s: usize, w: &Witness| holds(&specs[s], w) == Some(true);
     search(0, &missing, &at, b, &mut w, &mut budget, &mut check).then_some(w)
 }
 
@@ -970,9 +966,36 @@ fn rep_class(b: &LBindings, c: ClassId) -> ClassId {
 
 /// The value of a class: its constant, else the witness's value for its
 /// representative.
-fn rep_value(b: &LBindings, w: &[Option<Object>], c: ClassId) -> Option<Object> {
+fn rep_value(b: &LBindings, w: &Witness, c: ClassId) -> Option<Object> {
     let r = b.representative(c);
-    b.value(r).or_else(|| w.get(r as usize).copied().flatten())
+    b.value(r).or_else(|| w.get(r))
+}
+
+/// A solution of a plan's binding constraints: an object per unbound class
+/// id (bound classes read their constant). Persistent, so a child's
+/// solution shares every unchanged chunk with its parent's.
+#[derive(Debug, Clone, Default)]
+pub struct Witness(super::pvec::PVec<u32>);
+
+impl Witness {
+    const NONE: u32 = u32::MAX;
+
+    pub fn get(&self, c: ClassId) -> Option<Object> {
+        self.0.get(c as usize).copied().filter(|&v| v != Self::NONE).map(Object)
+    }
+
+    pub fn set(&mut self, c: ClassId, o: Option<Object>) {
+        let v = o.map_or(Self::NONE, |o| o.0);
+        while self.0.len() <= c as usize {
+            if v == Self::NONE {
+                return;
+            }
+            self.0.push(Self::NONE);
+        }
+        if self.0[c as usize] != v {
+            *self.0.get_mut(c as usize) = v;
+        }
+    }
 }
 
 /// The plan without threats that no longer threaten; the same plan when
@@ -1048,12 +1071,11 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat, only: Option<Choice
     let mut cs = Vec::new();
     if wanted(Choice::Agree) && unifier(&g, w, &f, c, &mut cs) && !matches!(f.value, LValue::None) {
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
-            if let Some(mut child) = between(ctx, &base, w, &link) {
+            let mut child = base.clone();
+            child.bindings = bindings;
+            if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                if let Some(bindings) = propagate_statics(ctx, &child) {
-                    child.bindings = bindings;
-                    out.push((Choice::Agree, child));
-                }
+                out.push((Choice::Agree, child));
             }
         }
     }
@@ -1081,36 +1103,15 @@ pub fn refine_threat(ctx: &Ctx, plan: &Plan, threat: Threat, only: Option<Choice
         let mut cs: Vec<Constraint> = (0..i).map(|j| (g.inv[j], w, f.inv[j], c, true)).collect();
         cs.push((g.inv[i], w, f.inv[i], c, false));
         if let Some(bindings) = constrain(ctx, &base.bindings, &cs) {
-            if let Some(mut child) = between(ctx, &base, w, &link) {
+            let mut child = base.clone();
+            child.bindings = bindings;
+            if let Some(bindings) = propagate_statics(ctx, &child) {
                 child.bindings = bindings;
-                if let Some(bindings) = propagate_statics(ctx, &child) {
-                    child.bindings = bindings;
-                    out.push((Choice::Separate(i as u8), child));
-                }
+                out.push((Choice::Separate(i as u8), child));
             }
         }
     }
     out
-}
-
-/// The plan for a separation or agreement child. With systematic threat
-/// resolution (`POTOROO_LFDR_SYSTHREAT`), `w` is also ordered between the
-/// link's ends, so the children partition the completions: demotion puts `w`
-/// before the producer, promotion after the consumer, and the rest between.
-/// `None` when that ordering is inconsistent.
-fn between(ctx: &Ctx, base: &Plan, w: usize, link: &Link) -> Option<Plan> {
-    let mut child = base.clone();
-    if ctx.systematic_threats {
-        let mut orderings = base.orderings.clone();
-        if link.producer() != INIT_ID {
-            orderings = orderings.refine(before(link.producer(), w))?;
-        }
-        if link.consumer() != GOAL_ID {
-            orderings = orderings.refine(before(w, link.consumer()))?;
-        }
-        child.orderings = orderings;
-    }
-    Some(child)
 }
 
 /// Whether a unifier between a not-yet-added step `n` and the plan is
