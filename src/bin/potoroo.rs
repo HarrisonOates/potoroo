@@ -608,6 +608,9 @@ fn run_lifted_fdr(
         if let Some(lane) = &stats.solved_by {
             eprintln!("Lifted FDR lane: {lane}");
         }
+        if stats.non_minimal > 0 {
+            eprintln!("Lifted FDR non-minimal plans discarded: {}", stats.non_minimal);
+        }
         let [h, select, bind, refine, force, feasible] = stats.phase;
         eprintln!(
             "Lifted FDR time: heuristic {:.2}s | flaw selection {:.2}s | binding choice {:.2}s | refinement {:.2}s | forced threats {:.2}s | feasibility {:.2}s",

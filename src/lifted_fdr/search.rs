@@ -87,6 +87,8 @@ pub struct Stats {
     pub generated: usize,
     pub expanded: usize,
     pub dead: usize,
+    /// Plans discarded as non-minimal (`POTOROO_LFDR_CUTSET=1`).
+    pub non_minimal: usize,
     pub max_steps: usize,
     /// The lane that found the plan.
     pub solved_by: Option<String>,
@@ -238,6 +240,9 @@ struct Search<'a, 'c> {
     /// Check plans when popped for expansion (default) rather than every
     /// child when generated (`POTOROO_LFDR_FEASPOP=0`).
     feasibility_at_pop: bool,
+    /// Discard non-minimal plans when expanded (Kambhampati's cutset-prune;
+    /// `POTOROO_LFDR_CUTSET=1`, off by default).
+    cutset: bool,
     /// Expansions whose plan is printed in full (`POTOROO_LFDR_DUMP`).
     dump: Vec<usize>,
 }
@@ -369,6 +374,11 @@ impl Search<'_, '_> {
                 return Some(solution);
             }
             stats.dead += 1;
+            return None;
+        }
+        if self.cutset && super::minimality::prunable(ctx, &plan) {
+            stats.dead += 1;
+            stats.non_minimal += 1;
             return None;
         }
         // The plan's binding solution, for its children to start from; with
@@ -621,6 +631,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         feasibility_h: feas.0,
         feasibility_budget: feas.1,
         feasibility_at_pop: std::env::var("POTOROO_LFDR_FEASPOP").map_or(true, |v| v != "0"),
+        cutset: std::env::var("POTOROO_LFDR_CUTSET").is_ok_and(|v| v == "1"),
         dump: std::env::var("POTOROO_LFDR_DUMP")
             .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
             .unwrap_or_default(),
