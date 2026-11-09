@@ -84,9 +84,10 @@ impl Default for Config {
 
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
-    /// Time in heuristic evaluation, flaw selection, binding choice and
-    /// refinement (with propagation), for profiling.
-    pub phase: [Duration; 4],
+    /// Time in heuristic evaluation, flaw selection, binding choice,
+    /// refinement (with propagation), forced threats and binding
+    /// feasibility, for profiling.
+    pub phase: [Duration; 6],
     pub generated: usize,
     pub expanded: usize,
     pub dead: usize,
@@ -341,13 +342,18 @@ impl Search<'_, '_> {
         };
         // Threats that orderings or bindings have since resolved are dropped
         // here in one pass, rather than each costing a search node.
-        let plan = if self.drop_stale { super::plan::without_stale_threats(ctx, plan) } else { plan };
+        // (Forcing drops stale threats too.)
+        let plan = if self.drop_stale && self.force_rounds == 0 {
+            super::plan::without_stale_threats(ctx, plan)
+        } else {
+            plan
+        };
         // Forced threats are resolved in place (`POTOROO_LFDR_FORCE=N` rounds,
         // 0 to keep them as search nodes).
         let plan = if self.force_rounds > 0 {
             let started = Instant::now();
             let forced = super::plan::force_threats(ctx, plan, self.force_rounds);
-            stats.phase[3] += started.elapsed();
+            stats.phase[4] += started.elapsed();
             match forced {
                 Some(plan) => plan,
                 None => {
@@ -368,6 +374,7 @@ impl Search<'_, '_> {
         }
         // The plan's binding solution, for its children to start from; with
         // `feasibility_at_pop` a plan without one is dead.
+        let started = Instant::now();
         let witness = if self.feasibility_h >= 0.0 && node.h <= self.feasibility_h {
             if same_bindings && parent_witness.is_some() {
                 parent_witness
@@ -387,6 +394,7 @@ impl Search<'_, '_> {
         } else {
             None
         };
+        stats.phase[5] += started.elapsed();
         let started = Instant::now();
         let selected = super::flaws::select(ctx, &plan, &lane.lane.flaw_order, &lane.estimator);
         stats.phase[1] += started.elapsed();

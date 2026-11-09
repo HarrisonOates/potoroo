@@ -51,7 +51,7 @@ fn unpack(step: u32) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Link {
     producer: u32,
     consumer: u32,
@@ -102,7 +102,7 @@ impl Open {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Threat {
     step: u32,
     pub assign: u16,
@@ -1019,35 +1019,77 @@ pub fn without_stale_threats(ctx: &Ctx, plan: Rc<Plan>) -> Rc<Plan> {
 /// Resolves, in place, every threat with at most one resolution left: none
 /// kills the plan (`None`), one is applied, and stale threats are dropped.
 /// Repeats while that changes something, at most `rounds` times. Each such
-/// threat would otherwise be a search node with a single child.
+/// threat would otherwise be a search node with a single child. Forced
+/// orderings are applied directly and the threat list is rebuilt once per
+/// round; other forced resolutions go through [`refine_threat`].
 pub fn force_threats(ctx: &Ctx, plan: Rc<Plan>, rounds: usize) -> Option<Rc<Plan>> {
     let mut plan = plan;
     for _ in 0..rounds {
-        let mut changed = false;
+        let mut current: Option<Plan> = None;
+        let mut removed: Vec<Threat> = Vec::new();
         let threats: Vec<Threat> = chain::iter(&plan.threats).copied().collect();
         for t in threats {
-            if !chain::iter(&plan.threats).any(|u| *u == t) {
+            let p: &Plan = current.as_ref().unwrap_or(&plan);
+            let link = &t.link;
+            let w = t.step();
+            if !threatens(ctx, p, w, t.assign, link) {
+                removed.push(t);
                 continue;
             }
-            match count_threat_options(ctx, &plan, &t) {
-                Some(0) => return None,
-                None | Some(1) => {
-                    let mut children = refine_threat(ctx, &plan, t, None);
-                    match children.len() {
-                        0 => return None,
-                        1 => {
-                            plan = Rc::new(children.pop().unwrap().1);
-                            changed = true;
+            let Some(n) = count_threat_options(ctx, p, &t) else {
+                removed.push(t);
+                continue;
+            };
+            match n {
+                0 => return None,
+                1 => {
+                    let demote = link.producer() != INIT_ID
+                        && p.orderings.possibly_before(w, StepTime::AtEnd, link.producer(), StepTime::AtStart);
+                    let promote = link.consumer() != GOAL_ID
+                        && p.orderings.possibly_before(link.consumer(), StepTime::AtEnd, w, StepTime::AtStart);
+                    let ordering = if demote {
+                        Some(before(w, link.producer()))
+                    } else if promote {
+                        Some(before(link.consumer(), w))
+                    } else {
+                        None
+                    };
+                    match ordering {
+                        Some(o) => {
+                            let orderings = p.orderings.refine(o)?;
+                            let mut next = current.take().unwrap_or_else(|| (*plan).clone());
+                            next.orderings = orderings;
+                            current = Some(next);
+                            removed.push(t);
                         }
-                        _ => {}
+                        None => {
+                            // Separation or agreement: refine (it removes `t`).
+                            let mut children = refine_threat(ctx, p, t, None);
+                            match children.len() {
+                                0 => return None,
+                                1 => current = Some(children.pop().unwrap().1),
+                                _ => {}
+                            }
+                        }
                     }
                 }
-                Some(_) => {}
+                _ => {}
             }
         }
-        if !changed {
+        if current.is_none() && removed.is_empty() {
             break;
         }
+        let mut next = current.unwrap_or_else(|| (*plan).clone());
+        if !removed.is_empty() {
+            let gone: std::collections::HashSet<Threat> = removed.into_iter().collect();
+            let kept: Vec<Threat> = chain::iter(&next.threats).filter(|t| !gone.contains(t)).copied().collect();
+            next.num_threats = kept.len();
+            next.threats = None;
+            for t in kept.into_iter().rev() {
+                next.threats = chain::cons(t, next.threats.take());
+            }
+        }
+        plan = Rc::new(next);
     }
     Some(plan)
 }
@@ -1510,8 +1552,9 @@ pub fn only_new_step(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
 }
 
 /// Resolutions of a threat that are consistent on their own: demotion,
-/// promotion, separation (once), agreement. Static propagation is not
-/// run, so this bounds the children of [`refine_threat`] from above. A threat
+/// promotion, separation (once), agreement. Bindings are tested pairwise
+/// and static propagation is not run, so this bounds the children of
+/// [`refine_threat`] from above. A threat
 /// that is no longer possible counts as `None` (it is simply dropped).
 pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<usize> {
     let link = &threat.link;
@@ -1531,22 +1574,23 @@ pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<u
     }
     let f = ctx.condition(plan, c, link.cond);
     let g = ctx.assignment(plan, w, threat.assign);
-    let mut cs: Vec<Constraint> = Vec::new();
+    let b = &plan.bindings;
     // Separation counts once, as VHPOP's disjunctive separation goal does.
-    for i in 0..f.inv.len() {
-        cs.clear();
-        cs.extend((0..i).map(|j| (g.inv[j], w, f.inv[j], c, true)));
-        cs.push((g.inv[i], w, f.inv[i], c, false));
-        if constrain(ctx, &plan.bindings, &cs).is_some() {
-            n += 1;
-            break;
-        }
+    // Pairwise tests, without building the bindings: an upper bound.
+    let separable = (0..f.inv.len()).any(|i| {
+        (0..i).all(|j| b.terms_can_equal(g.inv[j], w, f.inv[j], c)) && !b.terms_equal(g.inv[i], w, f.inv[i], c)
+    });
+    if separable {
+        n += 1;
     }
-    cs.clear();
-    if !matches!(f.value, LValue::None)
-        && unifier(g, w, f, c, &mut cs)
-        && constrain(ctx, &plan.bindings, &cs).is_some()
-    {
+    let agrees = match (&f.value, &g.value) {
+        (LValue::Part { part: p, args: a }, LValue::Part { part: q, args: x }) if p == q => {
+            f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
+                && a.iter().zip(x).all(|(y, v)| b.terms_can_equal(*v, w, *y, c))
+        }
+        _ => false,
+    };
+    if agrees {
         n += 1;
     }
     Some(n)
