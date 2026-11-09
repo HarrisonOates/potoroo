@@ -151,6 +151,20 @@ enum Entry {
 struct Expansion {
     parent: Rc<Plan>,
     flaw: Refined,
+    /// A grounding of the parent's bindings, tried first for its children.
+    witness: Option<Rc<Witness>>,
+}
+
+/// An object per class id (bound classes and merged ones included): a
+/// solution of a plan's binding constraints.
+pub type Witness = Vec<Option<Object>>;
+
+/// The outcome of a bounded joint check of a plan's binding constraints.
+pub enum Feasibility {
+    Witness(Rc<Witness>),
+    /// The budget ran out: assumed feasible.
+    Unknown,
+    Infeasible,
 }
 
 struct Node {
@@ -194,6 +208,8 @@ struct Running<'a> {
     estimator: Estimator,
     queue: BinaryHeap<Node>,
     exhausted: bool,
+    /// Lowest h popped so far, for `POTOROO_LFDR_PROGRESS`.
+    best_f: std::cell::Cell<f32>,
 }
 
 /// Shared search state and knobs.
@@ -211,11 +227,33 @@ struct Search<'a, 'c> {
     /// cheaper when that child is popped next, but in round-robin lanes it
     /// often is not, and keeping it built costs memory.
     keep_best: bool,
+    /// Report each lane's f layers (`POTOROO_LFDR_PROGRESS`).
+    progress: bool,
+    /// Drop resolved threats at expansion (`POTOROO_LFDR_STALE=0` keeps them
+    /// as one-child refinements).
+    drop_stale: bool,
+    force_rounds: usize,
+    /// Plans with `h` at most this get a bounded joint check of their
+    /// bindings (`POTOROO_LFDR_FEAS=H[:BUDGET]`).
+    feasibility_h: f32,
+    feasibility_budget: usize,
+    /// Check plans when popped for expansion (default) rather than every
+    /// child when generated (`POTOROO_LFDR_FEASPOP=0`).
+    feasibility_at_pop: bool,
+    /// Expansions whose plan is printed in full (`POTOROO_LFDR_DUMP`).
+    dump: Vec<usize>,
 }
 
 impl Search<'_, '_> {
     /// Ranks a generated plan: `(f, h, id)`, or `None` when it is dead.
-    fn evaluate(&self, lane: &Running, plan: &Plan, stats: &mut Stats) -> Option<(f32, f32, u32)> {
+    fn evaluate(
+        &self,
+        lane: &Running,
+        plan: &Plan,
+        hint: Option<&Rc<Witness>>,
+        same_bindings: bool,
+        stats: &mut Stats,
+    ) -> Option<(f32, f32, u32)> {
         stats.generated += 1;
         if self.mac_budget > 0 && !bindings_feasible(self.ctx, plan, self.mac_budget) {
             stats.dead += 1;
@@ -225,6 +263,17 @@ impl Search<'_, '_> {
         let h = lane.estimator.estimate(self.ctx, plan);
         stats.phase[0] += started.elapsed();
         if !h.is_finite() {
+            stats.dead += 1;
+            return None;
+        }
+        if h <= self.feasibility_h
+            && !self.feasibility_at_pop
+            && !(same_bindings && hint.is_some())
+            && matches!(
+                find_witness(self.ctx, plan, hint, self.feasibility_budget),
+                Feasibility::Infeasible
+            )
+        {
             stats.dead += 1;
             return None;
         }
@@ -240,7 +289,7 @@ impl Search<'_, '_> {
     }
 
     fn push(&self, lane: &mut Running, plan: Plan, stats: &mut Stats) {
-        if let Some(rank) = self.evaluate(lane, &plan, stats) {
+        if let Some(rank) = self.evaluate(lane, &plan, None, false, stats) {
             Self::enqueue(lane, rank, Entry::Built(Rc::new(plan)));
         }
     }
@@ -253,6 +302,30 @@ impl Search<'_, '_> {
         };
         let ctx = self.ctx;
         stats.expanded += 1;
+        if self.progress && node.h < lane.best_f.get() {
+            lane.best_f.set(node.h);
+            eprintln!(
+                "progress [{}] f={} h={} expanded={} generated={} queued={}",
+                lane.lane.name,
+                node.f,
+                node.h,
+                stats.expanded,
+                stats.generated,
+                lane.queue.len()
+            );
+        }
+        // A child that only added an ordering keeps its parent's bindings,
+        // and so its solution.
+        let (parent_witness, same_bindings) = match &node.entry {
+            Entry::Recipe { base, choice } => (
+                base.witness.clone(),
+                matches!(
+                    choice,
+                    super::plan::Choice::Demote | super::plan::Choice::Promote | super::plan::Choice::Drop
+                ),
+            ),
+            Entry::Built(_) => (None, false),
+        };
         let plan = match &node.entry {
             Entry::Built(plan) => plan.clone(),
             Entry::Recipe { base, choice } => {
@@ -268,6 +341,25 @@ impl Search<'_, '_> {
                 }
             }
         };
+        // Threats that orderings or bindings have since resolved are dropped
+        // here in one pass, rather than each costing a search node.
+        let plan = if self.drop_stale { super::plan::without_stale_threats(ctx, plan) } else { plan };
+        // Forced threats are resolved in place (`POTOROO_LFDR_FORCE=N` rounds,
+        // 0 to keep them as search nodes).
+        let plan = if self.force_rounds > 0 {
+            let started = Instant::now();
+            let forced = super::plan::force_threats(ctx, plan, self.force_rounds);
+            stats.phase[3] += started.elapsed();
+            match forced {
+                Some(plan) => plan,
+                None => {
+                    stats.dead += 1;
+                    return None;
+                }
+            }
+        } else {
+            plan
+        };
         stats.max_steps = stats.max_steps.max(plan.num_steps());
         if plan.complete() {
             if let Some(solution) = complete(ctx, self.domain, self.problem, &plan) {
@@ -276,6 +368,27 @@ impl Search<'_, '_> {
             stats.dead += 1;
             return None;
         }
+        // The plan's binding solution, for its children to start from; with
+        // `feasibility_at_pop` a plan without one is dead.
+        let witness = if self.feasibility_h >= 0.0 && node.h <= self.feasibility_h {
+            if same_bindings && parent_witness.is_some() {
+                parent_witness
+            } else {
+                match find_witness(ctx, &plan, parent_witness.as_ref(), self.feasibility_budget) {
+                    Feasibility::Witness(w) => Some(w),
+                    Feasibility::Unknown => None,
+                    Feasibility::Infeasible => {
+                        if self.feasibility_at_pop {
+                            stats.dead += 1;
+                            return None;
+                        }
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let started = Instant::now();
         let selected = super::flaws::select(ctx, &plan, &lane.lane.flaw_order, &lane.estimator);
         stats.phase[1] += started.elapsed();
@@ -284,6 +397,20 @@ impl Search<'_, '_> {
         stats.phase[2] += started.elapsed();
         if stats.expanded <= self.trace {
             self.trace_node(lane, &node, &plan, &selected, &binding);
+            if self.dump.contains(&stats.expanded) {
+                self.dump_plan(&plan);
+                if let super::flaws::Flaw::Threat(t) = &selected {
+                    let b = &plan.bindings;
+                    let g = ctx.assignment(&plan, t.step(), t.assign);
+                    let f = ctx.condition(&plan, t.link.consumer(), t.link.cond);
+                    eprintln!(
+                        "  threat: writer inv {:?} vs link inv {:?}; definite={}",
+                        g.inv.iter().map(|x| b.resolve(*x, t.step())).collect::<Vec<_>>(),
+                        f.inv.iter().map(|x| b.resolve(*x, t.link.consumer())).collect::<Vec<_>>(),
+                        super::plan::definite(ctx, &plan, t)
+                    );
+                }
+            }
         }
         let started = Instant::now();
         let (refined, children) = match binding {
@@ -298,10 +425,21 @@ impl Search<'_, '_> {
         let base = Rc::new(Expansion {
             parent: plan.clone(),
             flaw: refined,
+            witness,
         });
         let ranked: Vec<((f32, f32, u32), super::plan::Choice, Plan)> = children
             .into_iter()
-            .filter_map(|(choice, child)| Some((self.evaluate(lane, &child, stats)?, choice, child)))
+            .filter_map(|(choice, child)| {
+                let same = matches!(
+                    choice,
+                    super::plan::Choice::Demote | super::plan::Choice::Promote | super::plan::Choice::Drop
+                );
+                let rank = self.evaluate(lane, &child, base.witness.as_ref(), same, stats);
+                if stats.expanded <= self.trace {
+                    eprintln!("  child {:?}: {}", choice, rank.map_or("dead".to_string(), |r| format!("f={} h={}", r.0, r.1)));
+                }
+                Some((rank?, choice, child))
+            })
             .collect();
         // The child the queue would pop first among these may be popped next:
         // optionally keep it built, and only the rest as recipes.
@@ -324,6 +462,39 @@ impl Search<'_, '_> {
             Self::enqueue(lane, rank, entry);
         }
         None
+    }
+
+    /// Prints a plan's steps with resolved arguments, its links and the
+    /// steps' order (`POTOROO_LFDR_DUMP=N,M` with `POTOROO_TRACE`).
+    fn dump_plan(&self, plan: &Plan) {
+        let ctx = self.ctx;
+        let name = |t: Term| match t {
+            Term::Object(o) => self.problem.objects.object_name(Some(&self.domain.constants), o).to_string(),
+            Term::Variable(v) => format!("?{}", v.0),
+        };
+        for s in 1..=plan.num_steps() {
+            let schema = ctx.schema_of(plan, s);
+            let args: Vec<String> = schema
+                .parameters
+                .iter()
+                .map(|v| {
+                    let t = Term::Variable(*v);
+                    match plan.bindings.resolve(t, s) {
+                        super::binds::Resolved::Object(o) => name(Term::Object(o)),
+                        super::binds::Resolved::Class(k) => {
+                            format!("c{}{{{}}}", k, plan.bindings.domain(k).len())
+                        }
+                    }
+                })
+                .collect();
+            let after: Vec<usize> = (1..=plan.num_steps())
+                .filter(|&p| p != s && !plan.orderings.possibly_before(s, StepTime::AtEnd, p, StepTime::AtStart))
+                .collect();
+            eprintln!("  step {s}: {}({}) after {:?}", schema.name, args.join(" "), after);
+        }
+        for link in chain::iter(&plan.links) {
+            eprintln!("  link {} -> {} cond {}", link.producer(), link.consumer(), link.cond);
+        }
     }
 
     fn trace_node(
@@ -412,6 +583,17 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
     } else {
         &config.lanes
     };
+    // Joint binding feasibility: on by default for every plan expanded;
+    // `POTOROO_LFDR_FEAS=off` disables it, `=H[:BUDGET]` limits it to plans
+    // with `h <= H`.
+    let feas: (f32, usize) = match std::env::var("POTOROO_LFDR_FEAS").as_deref() {
+        Ok("off") => (-1.0, 0),
+        Ok(v) => {
+            let (h, budget) = v.split_once(':').unwrap_or((v, "1000"));
+            (h.parse().unwrap_or(f32::INFINITY), budget.parse().unwrap_or(1000))
+        }
+        Err(_) => (f32::INFINITY, 1000),
+    };
     let search = Search {
         ctx: &ctx,
         domain,
@@ -422,6 +604,15 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         trace: std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         defer: std::env::var("POTOROO_LFDR_DEFER").map_or(true, |v| v != "0"),
         keep_best: std::env::var("POTOROO_LFDR_DEFER").is_ok_and(|v| v == "best"),
+        progress: std::env::var_os("POTOROO_LFDR_PROGRESS").is_some(),
+        drop_stale: std::env::var("POTOROO_LFDR_STALE").map_or(true, |v| v != "0"),
+        force_rounds: std::env::var("POTOROO_LFDR_FORCE").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        feasibility_h: feas.0,
+        feasibility_budget: feas.1,
+        feasibility_at_pop: std::env::var("POTOROO_LFDR_FEASPOP").map_or(true, |v| v != "0"),
+        dump: std::env::var("POTOROO_LFDR_DUMP")
+            .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
+            .unwrap_or_default(),
     };
     // One planning graph serves every lane.
     let mut graph = None;
@@ -434,6 +625,7 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
                 estimator,
                 queue: BinaryHeap::new(),
                 exhausted: false,
+                best_f: std::cell::Cell::new(f32::INFINITY),
             }
         })
         .collect();
@@ -697,6 +889,34 @@ fn ground_within(ctx: &Ctx, plan: &Plan, bindings: &mut super::binds::LBindings,
         }
     }
     Some(false)
+}
+
+/// A solution of the plan's binding constraints within `budget` assignments,
+/// trying `hint` (a solution for the parent) first: its values are bound at
+/// once and checked by one propagation, and only the classes it does not
+/// settle are searched.
+pub fn find_witness(ctx: &Ctx, plan: &Plan, hint: Option<&Rc<Witness>>, budget: usize) -> Feasibility {
+    let extract = |b: &super::binds::LBindings| -> Feasibility {
+        Feasibility::Witness(Rc::new((0..b.num_classes() as u32).map(|c| b.value(c)).collect()))
+    };
+    // The parent's solution, repaired where this plan departs from it; then
+    // a fresh search by table lookups; then search with propagation, which
+    // can prove infeasibility within the budget.
+    if let Some(hint) = hint {
+        if let Some(w) = super::plan::extend_witness(ctx, plan, hint, 256) {
+            return Feasibility::Witness(Rc::new(w));
+        }
+    }
+    if let Some(w) = super::plan::extend_witness(ctx, plan, &[], 2048) {
+        return Feasibility::Witness(Rc::new(w));
+    }
+    let mut bindings = plan.bindings.clone();
+    let mut budget = budget;
+    match ground_within(ctx, plan, &mut bindings, &mut budget) {
+        Some(true) => extract(&bindings),
+        Some(false) => Feasibility::Infeasible,
+        None => Feasibility::Unknown,
+    }
 }
 
 /// Whether the plan's binding constraints have a solution, searched within

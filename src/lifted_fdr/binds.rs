@@ -166,6 +166,27 @@ impl LBindings {
         self.classes[c as usize].distinct.as_slice()
     }
 
+    /// Number of class ids (merged ones included).
+    pub fn num_classes(&self) -> usize {
+        self.classes.len()
+    }
+
+    /// The class a class id was merged into (itself when not merged).
+    pub fn representative(&self, mut c: ClassId) -> ClassId {
+        while let Some(next) = self.classes[c as usize].forward {
+            c = next;
+        }
+        c
+    }
+
+    /// The object a class (or the class it merged into) is bound to.
+    pub fn value(&self, mut c: ClassId) -> Option<Object> {
+        while let Some(next) = self.classes[c as usize].forward {
+            c = next;
+        }
+        self.classes[c as usize].constant
+    }
+
     /// Unbound classes in creation order.
     pub fn unbound_classes(&self) -> impl Iterator<Item = ClassId> + '_ {
         self.classes
