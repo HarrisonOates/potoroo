@@ -284,3 +284,70 @@ Per-domain levers found so far:
     elevators p03 only turns a memout into a timeout.
   * Non-local pops make rebuild chains too expensive, and the overhead
     triggers eviction in runs that would have fit.
+
+## Regressions, elevators and memory (November 9, `e132009`–`b556868`)
+
+New screen: 420-task panel at **10 s / 1 GiB**, 6 parallel
+(`target/lfdr/screen/s10.sh`). The reference is the `65d2ac9` search: 89.
+
+| build | solved | change |
+|---|---|---|
+| `65d2ac9` | 89 | reference |
+| + stale threats dropped, joint binding feasibility (child check) | 85 | satellite +4, but 1.31× time |
+| + feasibility at expansion with inherited witnesses (`e132009`, v2) | 100 | time 0.55× |
+| + forced threats in place (v3) | 110 | elevators, data-network, visitall |
+| + batched forcing, pairwise option counts (`ffae936`, v5) | 111 | openstacks p02 back |
+| + dead new threats dropped on generation (`b556868`, v6) | **113** | no losses against `65d2ac9`; time 0.42× |
+
+* **The satellite regression was not a bug.** `LBindings` correctly rules out
+  a reuse that the old `Bindings` counted, so ZLIFO picks a different flaw.
+  The real failure is a **jointly infeasible binding CSP**.
+  * Classes of different steps (satellite, instrument, direction) pass
+    arc consistency and Hall's check but have no common solution.
+  * A plan with no flaws left then fails grounding. Its `NewStep` sibling
+    keeps the same core and adds a `turn_to`, so the subtree is infinite.
+  * In p04 there were 64k expansions at f=33 with h=0.
+* **Joint feasibility check.** Every expanded plan gets a bounded check of
+  its binding constraints. It relaxes threats and orderings, so it is sound.
+  * The parent's solution (a persistent `Witness`) is repaired first, by
+    table lookups over the classes it no longer fits.
+  * If that fails: a fresh search by table lookups, then MAC, which can
+    prove infeasibility.
+  * Results: satellite p04 0.02 s, p07 0.09 s, p08 0.10 s, p10 0.33 s, all
+    unsolved before. Overhead is 2–8%.
+  * Checking every generated child instead costs 12–30%, with the same
+    coverage.
+* **Stale threats were most of the nodes.**
+  * In elevators p03, 992k of 1.24M expansions refined a threat that
+    orderings or bindings had already removed, giving one `Drop` child.
+  * Dropping them at expansion cuts wall time 2–3× on the same search.
+* **Forced threats.** A threat with at most one resolution is applied in
+  place at expansion; one with none kills the plan.
+  * This mostly fixes elevators. Binding the passenger of a
+    `board(?p, lift, …)`, added for the lift's passenger count, to an
+    already-served passenger leaves threats that each have one ordering
+    and are jointly impossible. Before, each cost a search node.
+  * Elevators p03 under ZLIFO@ADD: 472k → 56k nodes (ground FDR: 22k);
+    p04 12.8 → 3.3 s.
+  * Forced orderings are applied directly and the threat list is rebuilt
+    once per round: openstacks plans carry up to 856 threats.
+* **Dead new threats.** A child whose newly added threats include one with
+  no resolution is dropped before ranking: elevators p04 (5 lanes)
+  18.1 → 10.7 s, nomystery p04 5.9 → 4.2 s.
+* **Memory.** Witnesses were 49% of peak heap. As chunked persistent `u32`
+  vectors shared with the parent's, rovers p01 at 3M generated nodes drops
+  from 1.16 GB to 0.64 GB.
+* **Systematic threat resolution (measured, dropped).** Ordering separation
+  and agreement children between the link's ends would make threat children
+  disjoint. In practice no separation or agreement child is ever generated:
+  separable threats are settled by binding flaws, and definite ones only
+  have demote/promote, which are already disjoint.
+* **Still open.** Depots p04–p06 stall at h≈20 early: ADD gives too little
+  guidance, where ground `port3c` has TADD/FLOW and deferral. Rovers, and
+  pathways p09–p10, are unchanged.
+
+Diagnostics: `POTOROO_LFDR_PROGRESS` (each lane's new lowest h),
+`POTOROO_LFDR_DUMP=N,…` with `POTOROO_TRACE` (full plan at expansion N),
+per-child rank lines in the trace, and `-v` timers for forcing and
+feasibility. Knobs: `POTOROO_LFDR_FEAS=off|H[:BUDGET]`, `POTOROO_LFDR_FEASPOP=0`,
+`POTOROO_LFDR_FORCE=N`, `POTOROO_LFDR_STALE=0`, `POTOROO_LFDR_NEWDEAD=0`.
