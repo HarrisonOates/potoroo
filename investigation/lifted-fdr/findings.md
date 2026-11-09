@@ -351,3 +351,55 @@ Diagnostics: `POTOROO_LFDR_PROGRESS` (each lane's new lowest h),
 per-child rank lines in the trace, and `-v` timers for forcing and
 feasibility. Knobs: `POTOROO_LFDR_FEAS=off|H[:BUDGET]`, `POTOROO_LFDR_FEASPOP=0`,
 `POTOROO_LFDR_FORCE=N`, `POTOROO_LFDR_STALE=0`, `POTOROO_LFDR_NEWDEAD=0`.
+
+### Calibrated result for v6 (`b556868`)
+
+* **123/375** at 225 s / 1 GiB, against 109 for `b2d6000` and 117 for the
+  ground `port3c` portfolio. Lifted or `port3c`: 147.
+* **Gained 15:** satellite p04, p07, p08 and p10; elevators p04, p07, p09
+  and p10 (now 9/10); data-network p02, p04 and p05; driverlog p07;
+  nomystery p08; pathways p10; pipesworld-notankage p08.
+* **Lost 1:** pegsol p03.
+* **`port3c` still leads** on depots (4–9), rovers (1–7), parcprinter
+  (4–7), pegsol (4–6), and by one each on elevators, mprime, pathways,
+  storage, freecell and sokoban.
+* Failures are still mostly memory: 209 memouts, 43 timeouts.
+
+## Lifted TADD (`508da7f`, `2d7c686`)
+
+* **What it counts.** A committed step that requires and overwrites an
+  instance's value needs its own segment of that value; so does a goal on
+  that variable.
+* **Lifted version: bipartite matching.** Supplies are initial values and
+  committed writes that may unify with a demand and may precede it.
+  * Demands left unmatched by a maximum matching cost their variable's
+    cheapest writer.
+  * Ground TADD's per-fact counts are the special case with every fact
+    known. The matching also uses orderings, which ground TADD ignores.
+  * Sound as a lower bound: orderings, bindings and the other variables are
+    relaxed.
+* **Grouping is too weak.** First tried: grouping destroyers only when their
+  resolved terms are identical, as the per-fact ground counts would. It
+  almost never fires (depots: mean child h 29.81 vs ADD's 29.84).
+* **Matching, ZLIFO@TADD vs ZLIFO@ADD:**
+
+  | task | ZLIFO@ADD | ZLIFO@TADD |
+  |---|---|---|
+  | elevators p03 | 55,579 nodes | 5,537 nodes |
+  | elevators p04 | 123,669 nodes | 7,349 nodes |
+  | elevators p06 | fail | 1.8 s |
+  | pegsol p05 | 400,688 nodes | 172,624 nodes |
+
+  * Ground FDR needs 22k nodes on elevators p03.
+  * Depots, rovers, sokoban and logistics are unchanged. Per-node overhead
+    is about 20% after indexing supplies by variable, value and first
+    instance object.
+* **Lane screen, 10 s.** Default lanes with ZLIFO@TADD in place of
+  ZLIFO@PADD: 114 vs 113. Gains elevators p04 and p06, loses nomystery p09.
+* **Depots needs FLOW.** On the ground side, depots p04 is solved by the
+  deferred-ZLIFO@FLOW queue (9 s) and the LC20@HYB queue (1.4 s), not by
+  TADD queues. Counting matching initial facts as refinements, so that
+  `{o}20` deferral applies to lifted conditions, did not help (dropped).
+  * Porting FLOW needs ground domain-transition distances per variable
+    instance. With unbound steps relaxed away, its infeasibility pruning
+    would no longer be sound.
