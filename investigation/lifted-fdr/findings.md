@@ -441,3 +441,44 @@ included in its 10 s.
 * **Budget caveat.** FD gains more from time: 118 at 30 s / 2 GiB, and 168
   on this panel in the cluster's 1,800 s / 8 GiB runs. A calibrated
   comparison (225 s / 1 GiB) is still to do.
+
+## Cutset minimality and frontier dominance (Nov 2026)
+
+**Cutset-prune** (Kambhampati, IJCAI 1995, Strategy 2) is in
+`src/lifted_fdr/minimality.rs` (`POTOROO_LFDR_CUTSET=1`, off by default). It
+uses the paper's cutsets (np = out-links ∪ necessarily-spanning links of `s′`,
+pp = out-links ∪ possibly-spanning links of `s″`; `(s′, s″]` is the removed
+segment), with lifted conditions compared by necessary codesignation. The
+classic (`src/minimality.rs`) and ground FDR (`fdr_pruning.rs`) versions use a
+different reading: they keep both anchors, leave out-links out of np, and put
+in-links of `s″` in pp.
+
+On the 420-task 10 s panel it never fires: 125 solved, and generated counts
+match the default on every solved task. Condition (ii), that every open
+condition sits at or before `s″`, held in 18% of checks, but no np-cutset ever
+covered a pp-cutset. Lifted loops keep their variables in distinct unbound
+classes, so `move(?a3,?a2) … move(?a2,?a1)` is not a loop until `?a3 = ?a1`
+is forced.
+
+**Frontier dominance** (`src/lifted_fdr/frontier.rs`,
+`POTOROO_LFDR_FRONTIER=count|1`, off by default) is a closed-list
+counterpart. It splits a plan into a frontier `F` and a settled part `U`:
+- `F` is every open condition's consumer, the steps before them, and any step
+  not after all of these.
+- `U` is the rest, necessarily after all of `F`, so fixed for good.
+
+It keys `F` up to renaming, plus the ground conditions its links carry into
+`U`. A plan is dominated by an expanded plan with the same frontier, a subset
+of its interface, and no greater cost. Classes shared between `F` and `U`
+block the key, since statics could couple them.
+
+In counting mode it found nothing to prune. On solved tasks (gripper,
+freecell, miconic, elevators, depots, visitall, logistics, satellite) a key
+formed in under 1% of expansions, with no dominations. On sokoban, pegsol,
+parcprinter, freecell p03, pipesworld-notankage and blocksworld (30k nodes)
+an open goal condition blocked the key in **every** expansion. While a goal
+is open, its future achiever can be ordered anywhere, including inside `U`.
+Once all goals are supported, independent subplans stay unordered, so no clean
+cut exists. Least commitment is what removes the state a closed list would
+key on. Recognising transpositions needs a search that commits to cuts: a
+regression-anchored lane, or forward partial-order search as in POPF.

@@ -89,6 +89,11 @@ pub struct Stats {
     pub dead: usize,
     /// Plans discarded as non-minimal (`POTOROO_LFDR_CUTSET=1`).
     pub non_minimal: usize,
+    /// Frontier keys formed, plans found dominated, and plans without a key
+    /// by reason (`POTOROO_LFDR_FRONTIER`).
+    pub frontier_keys: usize,
+    pub frontier_dominated: usize,
+    pub frontier_no_key: [usize; 5],
     pub max_steps: usize,
     /// The lane that found the plan.
     pub solved_by: Option<String>,
@@ -243,6 +248,10 @@ struct Search<'a, 'c> {
     /// Discard non-minimal plans when expanded (Kambhampati's cutset-prune;
     /// `POTOROO_LFDR_CUTSET=1`, off by default).
     cutset: bool,
+    /// Frontier dominance against expanded plans (`POTOROO_LFDR_FRONTIER=1`
+    /// prunes, `=count` only counts; off by default).
+    frontier: Option<bool>,
+    closed: std::cell::RefCell<super::frontier::Closed>,
     /// Expansions whose plan is printed in full (`POTOROO_LFDR_DUMP`).
     dump: Vec<usize>,
 }
@@ -380,6 +389,21 @@ impl Search<'_, '_> {
             stats.dead += 1;
             stats.non_minimal += 1;
             return None;
+        }
+        if let Some(prune) = self.frontier {
+            match super::frontier::key(ctx, &plan) {
+                Ok(key) => {
+                    stats.frontier_keys += 1;
+                    if self.closed.borrow_mut().dominated_or_insert(key, plan.cost) {
+                        stats.frontier_dominated += 1;
+                        if prune {
+                            stats.dead += 1;
+                            return None;
+                        }
+                    }
+                }
+                Err(reason) => stats.frontier_no_key[reason as usize] += 1,
+            }
         }
         // The plan's binding solution, for its children to start from; with
         // `feasibility_at_pop` a plan without one is dead.
@@ -632,6 +656,12 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         feasibility_budget: feas.1,
         feasibility_at_pop: std::env::var("POTOROO_LFDR_FEASPOP").map_or(true, |v| v != "0"),
         cutset: std::env::var("POTOROO_LFDR_CUTSET").is_ok_and(|v| v == "1"),
+        frontier: match std::env::var("POTOROO_LFDR_FRONTIER").as_deref() {
+            Ok("1") => Some(true),
+            Ok("count") => Some(false),
+            _ => None,
+        },
+        closed: Default::default(),
         dump: std::env::var("POTOROO_LFDR_DUMP")
             .map(|v| v.split(',').filter_map(|n| n.parse().ok()).collect())
             .unwrap_or_default(),

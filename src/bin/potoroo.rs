@@ -608,6 +608,12 @@ fn run_lifted_fdr(
         if let Some(lane) = &stats.solved_by {
             eprintln!("Lifted FDR lane: {lane}");
         }
+        if stats.frontier_keys + stats.frontier_no_key.iter().sum::<usize>() > 0 {
+            eprintln!(
+                "Lifted FDR frontier: keys {} | dominated {} | no key (threats, goal open, nothing settled, shared class, distinct) {:?}",
+                stats.frontier_keys, stats.frontier_dominated, stats.frontier_no_key
+            );
+        }
         if stats.non_minimal > 0 {
             eprintln!("Lifted FDR non-minimal plans discarded: {}", stats.non_minimal);
         }

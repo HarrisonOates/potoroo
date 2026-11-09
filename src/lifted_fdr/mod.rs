@@ -9,6 +9,7 @@
 
 pub mod binds;
 pub mod flaws;
+pub mod frontier;
 pub mod heuristic;
 pub mod invariants;
 pub mod minimality;
