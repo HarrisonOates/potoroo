@@ -424,3 +424,20 @@ Single-lane 10 s screens, then round-robin mixes:
   * Time 0.43× on tasks both solve.
 * **The four single lanes as an oracle cover 138**, so lane count and
   allocation remain a lever.
+
+### Against Fast Downward A*/FF at 10 s / 1 GiB
+
+Same harness, one single-threaded process per task, FD's translation
+included in its 10 s.
+
+* **Lifted default 125, FD `astar(ff())` 106, either 183.**
+* **FD leads** sokoban 10–0, freecell 10–1, pegsol 9–3, parcprinter 9–4,
+  pipesworld-notankage 6–1, grid, ged, snake, parking, tidybot and
+  blocksworld. These are lock- and token-heavy domains where duplicate
+  detection pays.
+* **Lifted leads** gripper and childsnack 10–0, elevators 10–2, miconic
+  10–3, zenotravel 7–0, driverlog 5–0, satellite 10–6, visitall, logistics,
+  tpp and pathways.
+* **Budget caveat.** FD gains more from time: 118 at 30 s / 2 GiB, and 168
+  on this panel in the cluster's 1,800 s / 8 GiB runs. A calibrated
+  comparison (225 s / 1 GiB) is still to do.
