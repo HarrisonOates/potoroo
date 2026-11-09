@@ -403,3 +403,24 @@ feasibility. Knobs: `POTOROO_LFDR_FEAS=off|H[:BUDGET]`, `POTOROO_LFDR_FEASPOP=0`
   * Porting FLOW needs ground domain-transition distances per variable
     instance. With unbound steps relaxed away, its infeasibility pruning
     would no longer be sound.
+
+### Default lanes (`ZLIFO@TADD`, `MW-Loc@TADD+deg`)
+
+Single-lane 10 s screens, then round-robin mixes:
+
+| lanes | solved |
+|---|---|
+| ZLIFO@ADD alone | 100 |
+| ZLIFO@TADD alone | 105 |
+| MW-Loc@ADD+deg alone | 95 |
+| MW-Loc@TADD+deg alone | 100 |
+| five ADD/PADD lanes (v6 default) | 113 |
+| ZLIFO@TADD + MW-Loc@TADD+deg | **125** |
+| the two TADD lanes + ZLIFO@TADD+deg | 119 |
+
+* **Two TADD lanes against v6:**
+  * Gained 15, including elevators p04, p06, p07, p09 and p10.
+  * Lost nomystery p03, pegsol p02 and zenotravel p09.
+  * Time 0.43× on tasks both solve.
+* **The four single lanes as an oracle cover 138**, so lane count and
+  allocation remain a lever.
