@@ -129,10 +129,21 @@ impl Threat {
 /// children can be kept as `(parent, flaw, choice)` and rebuilt when popped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
-    NewStep { schema: u32, assign: u16, variant: u8 },
-    Reuse { step: u32, assign: u16, variant: u8 },
+    NewStep {
+        schema: u32,
+        assign: u16,
+        variant: u8,
+    },
+    Reuse {
+        step: u32,
+        assign: u16,
+        variant: u8,
+    },
     /// Initial-state support; `instance` indexes the `none` enumeration.
-    Init { instance: u32, variant: u8 },
+    Init {
+        instance: u32,
+        variant: u8,
+    },
     /// The threat is no longer possible.
     Drop,
     Agree,
@@ -145,18 +156,29 @@ pub enum Choice {
 impl Choice {
     fn with_variant(self, v: u8) -> Choice {
         match self {
-            Choice::NewStep { schema, assign, .. } => Choice::NewStep { schema, assign, variant: v },
-            Choice::Reuse { step, assign, .. } => Choice::Reuse { step, assign, variant: v },
-            Choice::Init { instance, .. } => Choice::Init { instance, variant: v },
+            Choice::NewStep { schema, assign, .. } => Choice::NewStep {
+                schema,
+                assign,
+                variant: v,
+            },
+            Choice::Reuse { step, assign, .. } => Choice::Reuse {
+                step,
+                assign,
+                variant: v,
+            },
+            Choice::Init { instance, .. } => Choice::Init {
+                instance,
+                variant: v,
+            },
             other => other,
         }
     }
 
     fn variant(self) -> Option<u8> {
         match self {
-            Choice::NewStep { variant, .. } | Choice::Reuse { variant, .. } | Choice::Init { variant, .. } => {
-                Some(variant)
-            }
+            Choice::NewStep { variant, .. }
+            | Choice::Reuse { variant, .. }
+            | Choice::Init { variant, .. } => Some(variant),
             _ => None,
         }
     }
@@ -210,7 +232,9 @@ impl Table {
     }
 
     fn with(&self, position: usize, object: Object) -> &[u32] {
-        self.by_position.get(&(position, object)).map_or(&[], |v| v.as_slice())
+        self.by_position
+            .get(&(position, object))
+            .map_or(&[], |v| v.as_slice())
     }
 }
 
@@ -293,7 +317,10 @@ impl StaticIndex {
 
     /// Rows of a static predicate.
     pub fn rows(&self, predicate: Predicate) -> &[Vec<Object>] {
-        self.tuples.get(&predicate).map(|v| v.as_slice()).unwrap_or(&[])
+        self.tuples
+            .get(&predicate)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -324,14 +351,20 @@ impl<'a> Ctx<'a> {
         let mut writers: HashMap<u32, Vec<(u32, u16)>> = HashMap::new();
         for (s, schema) in task.schemas.iter().enumerate() {
             for (a, assign) in schema.assigns.iter().enumerate() {
-                writers.entry(assign.fact.var).or_default().push((s as u32, a as u16));
+                writers
+                    .entry(assign.fact.var)
+                    .or_default()
+                    .push((s as u32, a as u16));
             }
         }
         let mut init_by_var: HashMap<u32, Vec<(Vec<Object>, LValue)>> = HashMap::new();
         let mut init: Vec<_> = task.init.iter().collect();
         init.sort();
         for ((var, inv), value) in init {
-            init_by_var.entry(*var).or_default().push((inv.clone(), value.clone()));
+            init_by_var
+                .entry(*var)
+                .or_default()
+                .push((inv.clone(), value.clone()));
         }
         let mut init_rows: HashMap<(u32, u16), Table> = HashMap::new();
         for (var, entries) in &init_by_var {
@@ -358,7 +391,8 @@ impl<'a> Ctx<'a> {
             init_rows,
             static_tables,
             type_sets: Default::default(),
-            num_objects: types.constants.owned_objects().count() + types.objects.owned_objects().count(),
+            num_objects: types.constants.owned_objects().count()
+                + types.objects.owned_objects().count(),
             symmetries: None,
             statics: StaticIndex::new(&task.static_atoms),
             writers,
@@ -432,10 +466,7 @@ impl Plan {
     pub fn initial(ctx: &Ctx) -> Option<Plan> {
         let mut opens = None;
         for i in (0..ctx.task.goal.len()).rev() {
-            opens = chain::cons(
-                Open::new(GOAL_ID, i as u16),
-                opens,
-            );
+            opens = chain::cons(Open::new(GOAL_ID, i as u16), opens);
         }
         let mut bindings = LBindings::default();
         let goal_constraints: Vec<Constraint> = ctx
@@ -507,8 +538,12 @@ pub fn threatens(ctx: &Ctx, plan: &Plan, w: usize, assign: u16, link: &Link) -> 
     if f.var != g.var {
         return false;
     }
-    if !(plan.orderings.possibly_after(w, StepTime::AtEnd, link.producer(), StepTime::AtEnd)
-        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.consumer(), StepTime::AtStart))
+    if !(plan
+        .orderings
+        .possibly_after(w, StepTime::AtEnd, link.producer(), StepTime::AtEnd)
+        && plan
+            .orderings
+            .possibly_before(w, StepTime::AtEnd, link.consumer(), StepTime::AtStart))
     {
         return false;
     }
@@ -562,9 +597,15 @@ fn step_threats(ctx: &Ctx, plan: &mut Plan, w: usize) {
 pub fn step_statics_possible(ctx: &Ctx, plan: &Plan, step: usize) -> bool {
     let schema = ctx.schema_of(plan, step);
     let resolve = |a: &Atom| -> Vec<Term> {
-        a.terms.iter().map(|t| plan.bindings.binding(*t, step)).collect()
+        a.terms
+            .iter()
+            .map(|t| plan.bindings.binding(*t, step))
+            .collect()
     };
-    schema.statics.iter().all(|a| ctx.statics.possible(a, &resolve(a)))
+    schema
+        .statics
+        .iter()
+        .all(|a| ctx.statics.possible(a, &resolve(a)))
         && schema.negated_statics.iter().all(|a| {
             let terms = resolve(a);
             !(terms.iter().all(|t| t.object())
@@ -584,23 +625,50 @@ pub fn all_statics_possible(ctx: &Ctx, plan: &Plan) -> bool {
 /// the same step, and the new threats. Several children when that constraint
 /// is a disjunction; each is tagged with `key` and its variant index, and
 /// `only` keeps just the variant it names.
-fn finish_link(ctx: &Ctx, mut plan: Plan, link: Link, key: Choice, only: Option<Choice>, out: &mut Children) {
+fn finish_link(
+    ctx: &Ctx,
+    mut plan: Plan,
+    link: Link,
+    key: Choice,
+    only: Option<Choice>,
+    out: &mut Children,
+) {
     plan.links = chain::cons(link, plan.links.take());
     let mut variants = vec![plan];
     if link.producer() != INIT_ID && link.producer() != GOAL_ID {
-        let fact = ctx.assignment(&variants[0], link.producer(), link.assign).clone();
+        let fact = ctx
+            .assignment(&variants[0], link.producer(), link.assign)
+            .clone();
         if fact.value == LValue::None {
             let schema = ctx.schema_of(&variants[0], link.producer());
-            for add in schema.assigns.iter().filter(|a| a.fact.var == fact.var && a.fact.value != LValue::None) {
+            for add in schema
+                .assigns
+                .iter()
+                .filter(|a| a.fact.var == fact.var && a.fact.value != LValue::None)
+            {
                 // The add wins when its instance co-designates: require a
                 // differing position (disjoint branches).
                 let mut next = Vec::new();
                 for plan in variants {
                     for i in 0..fact.inv.len() {
                         let mut cs: Vec<Constraint> = (0..i)
-                            .map(|j| (fact.inv[j], link.producer(), add.fact.inv[j], link.producer(), true))
+                            .map(|j| {
+                                (
+                                    fact.inv[j],
+                                    link.producer(),
+                                    add.fact.inv[j],
+                                    link.producer(),
+                                    true,
+                                )
+                            })
                             .collect();
-                        cs.push((fact.inv[i], link.producer(), add.fact.inv[i], link.producer(), false));
+                        cs.push((
+                            fact.inv[i],
+                            link.producer(),
+                            add.fact.inv[i],
+                            link.producer(),
+                            false,
+                        ));
                         if let Some(b) = constrain(ctx, &plan.bindings, &cs) {
                             let mut p = plan.clone();
                             p.bindings = b;
@@ -666,7 +734,12 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
     let mut out = Vec::new();
     let mut cs = Vec::new();
     // New steps.
-    for &(schema_index, a) in ctx.writers.get(&fact.var).map(|v| v.as_slice()).unwrap_or(&[]) {
+    for &(schema_index, a) in ctx
+        .writers
+        .get(&fact.var)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+    {
         let key = Choice::NewStep {
             schema: schema_index,
             assign: a,
@@ -713,11 +786,22 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
             child.num_opens += 1;
         }
         step_threats(ctx, &mut child, n);
-        finish_link(ctx, child, Link::new(n, c, open.cond, a), key, only, &mut out);
+        finish_link(
+            ctx,
+            child,
+            Link::new(n, c, open.cond, a),
+            key,
+            only,
+            &mut out,
+        );
     }
     // Reuse.
     for w in 1..=base.num_steps() {
-        if w == c || !base.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart) {
+        if w == c
+            || !base
+                .orderings
+                .possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
+        {
             continue;
         }
         let schema = ctx.schema_of(&base, w);
@@ -745,7 +829,14 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
             child.bindings = bindings;
             // A new ordering can retire no threat but may create none either:
             // existing threats are re-checked on selection.
-            finish_link(ctx, child, Link::new(w, c, open.cond, a as u16), key, only, &mut out);
+            finish_link(
+                ctx,
+                child,
+                Link::new(w, c, open.cond, a as u16),
+                key,
+                only,
+                &mut out,
+            );
         }
     }
     // Initial state.
@@ -755,7 +846,10 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
             // One child: the condition's tuple must be an initial fact, a
             // table constraint that `propagate_statics` narrows, rather than
             // one child per matching fact.
-            let key = Choice::Init { instance: 0, variant: 0 };
+            let key = Choice::Init {
+                instance: 0,
+                variant: 0,
+            };
             if ctx.init_rows.contains_key(&(fact.var, *part)) && only.is_none_or(|o| o.names(key)) {
                 finish_link(ctx, base.clone(), link, key, only, &mut out);
             }
@@ -794,7 +888,9 @@ pub fn refine_open(ctx: &Ctx, plan: &Plan, open: Open, only: Option<Choice>) -> 
                     variant: 0,
                 };
                 index += 1;
-                if only.is_some_and(|o| !o.names(key)) || ctx.task.init.contains_key(&(fact.var, inv.to_vec())) {
+                if only.is_some_and(|o| !o.names(key))
+                    || ctx.task.init.contains_key(&(fact.var, inv.to_vec()))
+                {
                     return;
                 }
                 let cs: Vec<Constraint> = fact
@@ -837,7 +933,11 @@ pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &Witness, budget: usize) 
     // Distinct pairs between inherited values that now collide.
     for &c in &unbound {
         if let Some(o) = w.get(c) {
-            if b.distinct(c).iter().any(|&d| d != c && rep_value(b, &w, d) == Some(o)) && !missing.contains(&c) {
+            if b.distinct(c)
+                .iter()
+                .any(|&d| d != c && rep_value(b, &w, d) == Some(o))
+                && !missing.contains(&c)
+            {
                 w.set(c, None);
                 missing.push(c);
             }
@@ -948,7 +1048,8 @@ pub fn extend_witness(ctx: &Ctx, plan: &Plan, witness: &Witness, budget: usize) 
                 continue;
             }
             w.set(c, Some(o));
-            if at[i].iter().all(|&s| check(s, w)) && search(i + 1, missing, at, b, w, budget, check) {
+            if at[i].iter().all(|&s| check(s, w)) && search(i + 1, missing, at, b, w, budget, check)
+            {
                 return true;
             }
         }
@@ -981,7 +1082,11 @@ impl Witness {
     const NONE: u32 = u32::MAX;
 
     pub fn get(&self, c: ClassId) -> Option<Object> {
-        self.0.get(c as usize).copied().filter(|&v| v != Self::NONE).map(Object)
+        self.0
+            .get(c as usize)
+            .copied()
+            .filter(|&v| v != Self::NONE)
+            .map(Object)
     }
 
     pub fn set(&mut self, c: ClassId, o: Option<Object>) {
@@ -1023,7 +1128,11 @@ pub fn new_threat_dead(ctx: &Ctx, child: &Plan, parent: &Plan, limit: usize) -> 
     let stop: Vec<*const chain::Chain<Threat>> = parent
         .threats
         .iter()
-        .flat_map(|h| [Rc::as_ptr(h)].into_iter().chain(h.tail.as_ref().map(Rc::as_ptr)))
+        .flat_map(|h| {
+            [Rc::as_ptr(h)]
+                .into_iter()
+                .chain(h.tail.as_ref().map(Rc::as_ptr))
+        })
         .collect();
     let mut node = child.threats.as_deref();
     let mut seen = 0;
@@ -1068,9 +1177,19 @@ pub fn force_threats(ctx: &Ctx, plan: Rc<Plan>, rounds: usize) -> Option<Rc<Plan
                 0 => return None,
                 1 => {
                     let demote = link.producer() != INIT_ID
-                        && p.orderings.possibly_before(w, StepTime::AtEnd, link.producer(), StepTime::AtStart);
+                        && p.orderings.possibly_before(
+                            w,
+                            StepTime::AtEnd,
+                            link.producer(),
+                            StepTime::AtStart,
+                        );
                     let promote = link.consumer() != GOAL_ID
-                        && p.orderings.possibly_before(link.consumer(), StepTime::AtEnd, w, StepTime::AtStart);
+                        && p.orderings.possibly_before(
+                            link.consumer(),
+                            StepTime::AtEnd,
+                            w,
+                            StepTime::AtStart,
+                        );
                     let ordering = if demote {
                         Some(before(w, link.producer()))
                     } else if promote {
@@ -1106,7 +1225,10 @@ pub fn force_threats(ctx: &Ctx, plan: Rc<Plan>, rounds: usize) -> Option<Rc<Plan
         let mut next = current.unwrap_or_else(|| (*plan).clone());
         if !removed.is_empty() {
             let gone: std::collections::HashSet<Threat> = removed.into_iter().collect();
-            let kept: Vec<Threat> = chain::iter(&next.threats).filter(|t| !gone.contains(t)).copied().collect();
+            let kept: Vec<Threat> = chain::iter(&next.threats)
+                .filter(|t| !gone.contains(t))
+                .copied()
+                .collect();
             next.num_threats = kept.len();
             next.threats = None;
             for t in kept.into_iter().rev() {
@@ -1208,10 +1330,17 @@ pub fn count_refinements(ctx: &Ctx, plan: &Plan, open: Open, limit: usize) -> us
     let mut cs = Vec::new();
     let consistent = |cs: &[Constraint]| constrain(ctx, &plan.bindings, cs).is_some();
     let n = plan.num_steps() + 1;
-    for &(schema_index, a) in ctx.writers.get(&fact.var).map(|v| v.as_slice()).unwrap_or(&[]) {
+    for &(schema_index, a) in ctx
+        .writers
+        .get(&fact.var)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+    {
         let schema = &ctx.task.schemas[schema_index as usize];
         cs.clear();
-        if unifier(&schema.assigns[a as usize].fact, n, fact, c, &mut cs) && new_step_compatible(ctx, plan, &cs, n) {
+        if unifier(&schema.assigns[a as usize].fact, n, fact, c, &mut cs)
+            && new_step_compatible(ctx, plan, &cs, n)
+        {
             count += 1;
             if count >= limit {
                 return count;
@@ -1219,7 +1348,11 @@ pub fn count_refinements(ctx: &Ctx, plan: &Plan, open: Open, limit: usize) -> us
         }
     }
     for w in 1..plan.num_steps() + 1 {
-        if w == c || !plan.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart) {
+        if w == c
+            || !plan
+                .orderings
+                .possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
+        {
             continue;
         }
         for assign in &ctx.schema_of(plan, w).assigns {
@@ -1255,13 +1388,19 @@ pub fn reusable(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
     let b = &plan.bindings;
     let mut cs = Vec::new();
     for w in 1..plan.num_steps() + 1 {
-        if w == c || !plan.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart) {
+        if w == c
+            || !plan
+                .orderings
+                .possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
+        {
             continue;
         }
         for assign in &ctx.schema_of(plan, w).assigns {
             cs.clear();
             if unifier(&assign.fact, w, fact, c, &mut cs)
-                && cs.iter().all(|&(l, ls, r, rs, _)| b.terms_equal(l, ls, r, rs))
+                && cs
+                    .iter()
+                    .all(|&(l, ls, r, rs, _)| b.terms_equal(l, ls, r, rs))
             {
                 return true;
             }
@@ -1280,7 +1419,12 @@ pub fn definite(ctx: &Ctx, plan: &Plan, threat: &Threat) -> bool {
     let f = ctx.condition(plan, c, link.cond);
     let g = ctx.assignment(plan, w, threat.assign);
     let b = &plan.bindings;
-    if !f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_equal(*u, w, *t, c)) {
+    if !f
+        .inv
+        .iter()
+        .zip(&g.inv)
+        .all(|(t, u)| b.terms_equal(*u, w, *t, c))
+    {
         return false;
     }
     match (&f.value, &g.value) {
@@ -1321,7 +1465,11 @@ pub fn propagate_statics(ctx: &Ctx, plan: &Plan) -> Option<LBindings> {
     // Negated statics, once decided (positive ones are table constraints).
     for step in 1..=plan.num_steps() {
         for atom in &ctx.schema_of(plan, step).negated_statics {
-            let terms: Vec<Term> = atom.terms.iter().map(|t| bindings.binding(*t, step)).collect();
+            let terms: Vec<Term> = atom
+                .terms
+                .iter()
+                .map(|t| bindings.binding(*t, step))
+                .collect();
             if terms.iter().all(|t| t.object())
                 && ctx.statics.contains(&Atom {
                     predicate: atom.predicate,
@@ -1381,7 +1529,11 @@ fn narrow(
         }
     }
     let terms_of = |spec: &Spec| -> Vec<Resolved> {
-        spec.inv.iter().chain(spec.args).map(|t| b.resolve(*t, spec.step)).collect()
+        spec.inv
+            .iter()
+            .chain(spec.args)
+            .map(|t| b.resolve(*t, spec.step))
+            .collect()
     };
     let touches = |spec: &Spec, classes: &dyn Fn(ClassId) -> bool| {
         spec.inv
@@ -1455,9 +1607,15 @@ fn narrow(
             }
             if let Some((i, size)) = best {
                 if size < table.rows.len() {
-                    let Resolved::Class(k) = terms[i] else { unreachable!() };
+                    let Resolved::Class(k) = terms[i] else {
+                        unreachable!()
+                    };
                     scratch.clear();
-                    scratch.extend(domains[&k].iter().flat_map(|o| table.with(i, o).iter().copied()));
+                    scratch.extend(
+                        domains[&k]
+                            .iter()
+                            .flat_map(|o| table.with(i, o).iter().copied()),
+                    );
                     scratch.sort_unstable();
                     gathered = true;
                 }
@@ -1535,11 +1693,13 @@ fn narrow(
     if !distinct_feasible(b, &mut domains) {
         return None;
     }
-    let mut narrowed: Vec<(ClassId, ObjSet)> = domains.into_iter().filter(|(k, d)| d != b.domain(*k)).collect();
+    let mut narrowed: Vec<(ClassId, ObjSet)> = domains
+        .into_iter()
+        .filter(|(k, d)| d != b.domain(*k))
+        .collect();
     narrowed.sort_by_key(|(k, _)| *k);
     Some(narrowed)
 }
-
 
 /// Whether the only consistent supporter would be a new step (no reuse, no
 /// initial fact).
@@ -1548,12 +1708,18 @@ pub fn only_new_step(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
     let c = open.consumer();
     let mut cs = Vec::new();
     for w in 1..plan.num_steps() + 1 {
-        if w == c || !plan.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart) {
+        if w == c
+            || !plan
+                .orderings
+                .possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
+        {
             continue;
         }
         for assign in &ctx.schema_of(plan, w).assigns {
             cs.clear();
-            if unifier(&assign.fact, w, fact, c, &mut cs) && constrain(ctx, &plan.bindings, &cs).is_some() {
+            if unifier(&assign.fact, w, fact, c, &mut cs)
+                && constrain(ctx, &plan.bindings, &cs).is_some()
+            {
                 return false;
             }
         }
@@ -1561,14 +1727,21 @@ pub fn only_new_step(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
     if let LValue::None = fact.value {
         return false;
     }
-    for (inv, value) in ctx.init_by_var.get(&fact.var).map(|v| v.as_slice()).unwrap_or(&[]) {
+    for (inv, value) in ctx
+        .init_by_var
+        .get(&fact.var)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+    {
         let ground = LFact {
             var: fact.var,
             inv: inv.iter().map(|o| Term::Object(*o)).collect(),
             value: value.clone(),
         };
         cs.clear();
-        if unifier(&ground, INIT_ID, fact, c, &mut cs) && constrain(ctx, &plan.bindings, &cs).is_some() {
+        if unifier(&ground, INIT_ID, fact, c, &mut cs)
+            && constrain(ctx, &plan.bindings, &cs).is_some()
+        {
             return false;
         }
     }
@@ -1589,11 +1762,17 @@ pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<u
     let c = link.consumer();
     let mut n = 0;
     if link.producer() != INIT_ID
-        && plan.orderings.possibly_before(w, StepTime::AtEnd, link.producer(), StepTime::AtStart)
+        && plan
+            .orderings
+            .possibly_before(w, StepTime::AtEnd, link.producer(), StepTime::AtStart)
     {
         n += 1;
     }
-    if c != GOAL_ID && plan.orderings.possibly_before(c, StepTime::AtEnd, w, StepTime::AtStart) {
+    if c != GOAL_ID
+        && plan
+            .orderings
+            .possibly_before(c, StepTime::AtEnd, w, StepTime::AtStart)
+    {
         n += 1;
     }
     let f = ctx.condition(plan, c, link.cond);
@@ -1602,15 +1781,21 @@ pub fn count_threat_options(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Option<u
     // Separation counts once, as VHPOP's disjunctive separation goal does.
     // Pairwise tests, without building the bindings: an upper bound.
     let separable = (0..f.inv.len()).any(|i| {
-        (0..i).all(|j| b.terms_can_equal(g.inv[j], w, f.inv[j], c)) && !b.terms_equal(g.inv[i], w, f.inv[i], c)
+        (0..i).all(|j| b.terms_can_equal(g.inv[j], w, f.inv[j], c))
+            && !b.terms_equal(g.inv[i], w, f.inv[i], c)
     });
     if separable {
         n += 1;
     }
     let agrees = match (&f.value, &g.value) {
         (LValue::Part { part: p, args: a }, LValue::Part { part: q, args: x }) if p == q => {
-            f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
-                && a.iter().zip(x).all(|(y, v)| b.terms_can_equal(*v, w, *y, c))
+            f.inv
+                .iter()
+                .zip(&g.inv)
+                .all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
+                && a.iter()
+                    .zip(x)
+                    .all(|(y, v)| b.terms_can_equal(*v, w, *y, c))
         }
         _ => false,
     };
@@ -1628,14 +1813,21 @@ pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
     let b = &plan.bindings;
     (1..=plan.num_steps()).any(|w| {
         w != c
-            && plan.orderings.possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
+            && plan
+                .orderings
+                .possibly_before(w, StepTime::AtEnd, c, StepTime::AtStart)
             && ctx.schema_of(plan, w).assigns.iter().any(|a| {
                 let g = &a.fact;
                 g.var == f.var
-                    && f.inv.iter().zip(&g.inv).all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
+                    && f.inv
+                        .iter()
+                        .zip(&g.inv)
+                        .all(|(t, u)| b.terms_can_equal(*u, w, *t, c))
                     && match (&f.value, &g.value) {
                         (LValue::None, LValue::None) => false,
-                        (LValue::Part { part: p, args: x }, LValue::Part { part: q, args: y }) if p == q => {
+                        (LValue::Part { part: p, args: x }, LValue::Part { part: q, args: y })
+                            if p == q =>
+                        {
                             !x.iter().zip(y).all(|(s, t)| b.terms_equal(*t, w, *s, c))
                         }
                         _ => true,
@@ -1649,7 +1841,10 @@ pub fn unsafe_open(ctx: &Ctx, plan: &Plan, open: Open) -> bool {
 /// from each class over its distinct neighbours, so this is a sound but
 /// incomplete all-different check (Younes & Simmons, AIPS 2002, note that
 /// separation inequalities alone hide such conflicts).
-fn distinct_feasible(b: &LBindings, domains: &mut crate::fasthash::FastMap<ClassId, ObjSet>) -> bool {
+fn distinct_feasible(
+    b: &LBindings,
+    domains: &mut crate::fasthash::FastMap<ClassId, ObjSet>,
+) -> bool {
     for start in b.unbound_classes() {
         let adjacent: Vec<ClassId> = b
             .distinct(start)
@@ -1660,9 +1855,13 @@ fn distinct_feasible(b: &LBindings, domains: &mut crate::fasthash::FastMap<Class
         if adjacent.is_empty() {
             continue;
         }
-        let domain_of = |k: ClassId, domains: &crate::fasthash::FastMap<ClassId, ObjSet>| -> ObjSet {
-            domains.get(&k).cloned().unwrap_or_else(|| b.domain(k).clone())
-        };
+        let domain_of =
+            |k: ClassId, domains: &crate::fasthash::FastMap<ClassId, ObjSet>| -> ObjSet {
+                domains
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| b.domain(k).clone())
+            };
         let mut clique = vec![start];
         let mut union = domain_of(start, domains);
         for u in adjacent {
@@ -1683,7 +1882,11 @@ fn distinct_feasible(b: &LBindings, domains: &mut crate::fasthash::FastMap<Class
 /// value-symmetry breaking (the children worth trying).
 pub fn binding_candidates(ctx: &Ctx, plan: &Plan) -> Vec<(ClassId, Vec<Object>, Vec<Object>)> {
     let b = &plan.bindings;
-    let used = if ctx.symmetries.is_some() { used_objects(ctx, plan) } else { HashSet::new() };
+    let used = if ctx.symmetries.is_some() {
+        used_objects(ctx, plan)
+    } else {
+        HashSet::new()
+    };
     let mut out = Vec::new();
     for class in b.unbound_classes() {
         let domain: Vec<Object> = b.domain(class).iter().collect();
@@ -1734,8 +1937,14 @@ pub fn threat_classes(ctx: &Ctx, plan: &Plan, threat: &Threat) -> Vec<ClassId> {
             }
         }
     };
-    add(ctx.condition(plan, link.consumer(), link.cond), link.consumer());
-    add(ctx.assignment(plan, threat.step(), threat.assign), threat.step());
+    add(
+        ctx.condition(plan, link.consumer(), link.cond),
+        link.consumer(),
+    );
+    add(
+        ctx.assignment(plan, threat.step(), threat.assign),
+        threat.step(),
+    );
     out
 }
 
@@ -1792,7 +2001,11 @@ fn used_objects(ctx: &Ctx, plan: &Plan) -> HashSet<Object> {
 /// Keeps, of each class of interchangeable objects, the members the plan
 /// already uses and the first unused one: binding to another unused member
 /// yields a renaming of that child.
-fn break_symmetry(symmetries: &crate::symmetry::ObjectSymmetries, domain: &mut Vec<Object>, used: &HashSet<Object>) {
+fn break_symmetry(
+    symmetries: &crate::symmetry::ObjectSymmetries,
+    domain: &mut Vec<Object>,
+    used: &HashSet<Object>,
+) {
     let mut first_unused: HashMap<usize, (usize, Object)> = HashMap::new();
     for &o in domain.iter() {
         if used.contains(&o) {

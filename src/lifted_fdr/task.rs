@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
+use super::invariants::{ISlot, Invariant};
 use crate::domain::Domain;
 use crate::formula::{Atom, Formula, Literal};
-use super::invariants::{ISlot, Invariant};
 use crate::predicates::Predicate;
 use crate::problem::Problem;
 use crate::terms::{Object, Term, Variable};
@@ -172,8 +172,12 @@ impl LiftedTask {
         task.choose_cover(domain, &invariants, &fluent, &negated);
         for (index, action) in domain.actions.iter().enumerate() {
             // One schema per disjunct of the precondition's DNF.
-            let branches = dnf(&action.precondition)
-                .ok_or_else(|| Unsupported(format!("a quantifier or over {MAX_BRANCHES} disjuncts in {}", action.name)))?;
+            let branches = dnf(&action.precondition).ok_or_else(|| {
+                Unsupported(format!(
+                    "a quantifier or over {MAX_BRANCHES} disjuncts in {}",
+                    action.name
+                ))
+            })?;
             for branch in branches {
                 let precondition = Formula::Conjunction(branch);
                 let mut schema = task.rewrite_schema(domain, index, action, &precondition)?;
@@ -222,7 +226,9 @@ impl LiftedTask {
             distinct.sort_by_key(|p| p.0);
             distinct.dedup();
             if distinct.len() != predicates.len()
-                || predicates.iter().any(|p| self.covered.contains_key(p) || !fluent.contains(p))
+                || predicates
+                    .iter()
+                    .any(|p| self.covered.contains_key(p) || !fluent.contains(p))
                 || predicates.iter().any(|p| negated.contains(p))
             {
                 continue;
@@ -305,7 +311,10 @@ impl LiftedTask {
         }
         LFact {
             var,
-            inv: inv.into_iter().map(|t| t.expect("every invariant parameter occurs")).collect(),
+            inv: inv
+                .into_iter()
+                .map(|t| t.expect("every invariant parameter occurs"))
+                .collect(),
             value: LValue::Part {
                 part,
                 args: args.into_iter().map(|t| t.expect("counted slot")).collect(),
@@ -376,16 +385,26 @@ impl LiftedTask {
             var_base: 0,
             var_count: 0,
         };
-        if !action.cost_specs.is_empty() || !action.conditional_costs.is_empty() {
-            if action.cost_specs.iter().any(|s| !s.is_argument_free()) || !action.conditional_costs.is_empty() {
-                return Err(Unsupported(format!("parameter-dependent cost in {}", action.name)));
-            }
+        if action.cost_specs.iter().any(|s| !s.is_argument_free())
+            || !action.conditional_costs.is_empty()
+        {
+            return Err(Unsupported(format!(
+                "parameter-dependent cost in {}",
+                action.name
+            )));
         }
         let mut literals = Vec::new();
-        flatten(precondition, &mut literals, &mut schema.equalities, &mut schema.inequalities)
-            .map_err(|what| Unsupported(format!("{what} in the precondition of {}", action.name)))?;
+        flatten(
+            precondition,
+            &mut literals,
+            &mut schema.equalities,
+            &mut schema.inequalities,
+        )
+        .map_err(|what| Unsupported(format!("{what} in the precondition of {}", action.name)))?;
         for (positive, atom) in literals {
-            if domain.predicates.is_static(atom.predicate) || !self.covered.contains_key(&atom.predicate) {
+            if domain.predicates.is_static(atom.predicate)
+                || !self.covered.contains_key(&atom.predicate)
+            {
                 if positive {
                     schema.statics.push(atom);
                 } else {
@@ -398,7 +417,10 @@ impl LiftedTask {
             } else {
                 let (var, _) = self.covered[&atom.predicate];
                 if !self.vars[var as usize].binary {
-                    return Err(Unsupported(format!("negated group atom in {}", action.name)));
+                    return Err(Unsupported(format!(
+                        "negated group atom in {}",
+                        action.name
+                    )));
                 }
                 LFact {
                     var,
@@ -413,7 +435,10 @@ impl LiftedTask {
             {
                 if *existing != fact {
                     // Two different values for one instance: never applicable.
-                    return Err(Unsupported(format!("contradictory precondition in {}", action.name)));
+                    return Err(Unsupported(format!(
+                        "contradictory precondition in {}",
+                        action.name
+                    )));
                 }
                 continue;
             }
@@ -423,7 +448,10 @@ impl LiftedTask {
         let mut deletes: Vec<LFact> = Vec::new();
         for effect in &action.effects {
             if !effect.parameters.is_empty() || effect.conditional() {
-                return Err(Unsupported(format!("conditional or quantified effect in {}", action.name)));
+                return Err(Unsupported(format!(
+                    "conditional or quantified effect in {}",
+                    action.name
+                )));
             }
             match &effect.literal {
                 Literal::Atom(atom) => adds.push(self.fact_of(atom)),
@@ -431,8 +459,16 @@ impl LiftedTask {
             }
         }
         for add in &adds {
-            if adds.iter().filter(|a| a.var == add.var && a.inv == add.inv).count() > 1 {
-                return Err(Unsupported(format!("two adds on one instance in {}", action.name)));
+            if adds
+                .iter()
+                .filter(|a| a.var == add.var && a.inv == add.inv)
+                .count()
+                > 1
+            {
+                return Err(Unsupported(format!(
+                    "two adds on one instance in {}",
+                    action.name
+                )));
             }
             let pre = schema
                 .conditions
@@ -448,8 +484,12 @@ impl LiftedTask {
         // same instance as an add is subsumed by it.
         let mut nones = Vec::new();
         for delete in &deletes {
-            if adds.iter().any(|a| a.var == delete.var && a.inv == delete.inv)
-                || nones.iter().any(|a: &Assign| a.fact.var == delete.var && a.fact.inv == delete.inv)
+            if adds
+                .iter()
+                .any(|a| a.var == delete.var && a.inv == delete.inv)
+                || nones
+                    .iter()
+                    .any(|a: &Assign| a.fact.var == delete.var && a.fact.inv == delete.inv)
             {
                 continue;
             }
@@ -461,7 +501,10 @@ impl LiftedTask {
             // not pin the instance to it, another member may hold and survive.
             let pinned = pre.is_some_and(|p| schema.conditions[p].value == delete.value);
             if !pinned && !self.vars[delete.var as usize].binary {
-                return Err(Unsupported(format!("delete of an unrequired group atom in {}", action.name)));
+                return Err(Unsupported(format!(
+                    "delete of an unrequired group atom in {}",
+                    action.name
+                )));
             }
             nones.push(Assign {
                 fact: LFact {
@@ -479,10 +522,17 @@ impl LiftedTask {
 
     fn compile_goal(&mut self, domain: &Domain, goal: &Formula) -> Result<(), Unsupported> {
         let mut literals = Vec::new();
-        flatten(goal, &mut literals, &mut self.goal_equalities, &mut self.goal_inequalities)
-            .map_err(|what| Unsupported(format!("{what} in the goal")))?;
+        flatten(
+            goal,
+            &mut literals,
+            &mut self.goal_equalities,
+            &mut self.goal_inequalities,
+        )
+        .map_err(|what| Unsupported(format!("{what} in the goal")))?;
         for (positive, atom) in literals {
-            if domain.predicates.is_static(atom.predicate) || !self.covered.contains_key(&atom.predicate) {
+            if domain.predicates.is_static(atom.predicate)
+                || !self.covered.contains_key(&atom.predicate)
+            {
                 // Static: decided by the initial state.
                 if !atom.terms.iter().all(|t| t.object()) {
                     return Err(Unsupported("lifted static atom in the goal".into()));
@@ -519,11 +569,11 @@ impl LiftedTask {
             if self.vars[var].binary {
                 continue;
             }
-            if self
-                .schemas
-                .iter()
-                .any(|s| s.assigns.iter().any(|a| a.fact.var == var as u32 && a.fact.value == LValue::None))
-            {
+            if self.schemas.iter().any(|s| {
+                s.assigns
+                    .iter()
+                    .any(|a| a.fact.var == var as u32 && a.fact.value == LValue::None)
+            }) {
                 continue;
             }
             let Some(types) = self.parameter_types(domain, var) else {
@@ -562,7 +612,10 @@ impl LiftedTask {
     /// Human-readable fact, for diagnostics.
     pub fn fact_name(&self, domain: &Domain, problem: &Problem, fact: &LFact) -> String {
         let term = |t: &Term| match t {
-            Term::Object(o) => problem.objects.object_name(Some(&domain.constants), *o).to_string(),
+            Term::Object(o) => problem
+                .objects
+                .object_name(Some(&domain.constants), *o)
+                .to_string(),
             Term::Variable(v) => format!("?{}", v.0),
         };
         let inv: Vec<String> = fact.inv.iter().map(term).collect();
@@ -571,10 +624,19 @@ impl LiftedTask {
             LValue::Part { part, args } => {
                 let p = &self.vars[fact.var as usize].parts[*part as usize];
                 let args: Vec<String> = args.iter().map(term).collect();
-                format!("{}({})", domain.predicates.name(p.predicate), args.join(","))
+                format!(
+                    "{}({})",
+                    domain.predicates.name(p.predicate),
+                    args.join(",")
+                )
             }
         };
-        format!("{}({})={}", self.vars[fact.var as usize].name, inv.join(","), value)
+        format!(
+            "{}({})={}",
+            self.vars[fact.var as usize].name,
+            inv.join(","),
+            value
+        )
     }
 }
 
@@ -595,13 +657,27 @@ fn globalise(schema: &mut LSchema, var_types: &mut Vec<Type>) {
             args.iter_mut().for_each(map);
         }
     };
-    schema.parameters.iter_mut().for_each(|v| *v = Variable(v.0 + offset));
+    schema
+        .parameters
+        .iter_mut()
+        .for_each(|v| *v = Variable(v.0 + offset));
     schema.conditions.iter_mut().for_each(map_fact);
-    schema.assigns.iter_mut().for_each(|a| map_fact(&mut a.fact));
-    for atom in schema.statics.iter_mut().chain(schema.negated_statics.iter_mut()) {
+    schema
+        .assigns
+        .iter_mut()
+        .for_each(|a| map_fact(&mut a.fact));
+    for atom in schema
+        .statics
+        .iter_mut()
+        .chain(schema.negated_statics.iter_mut())
+    {
         atom.terms.iter_mut().for_each(map);
     }
-    for (l, r) in schema.equalities.iter_mut().chain(schema.inequalities.iter_mut()) {
+    for (l, r) in schema
+        .equalities
+        .iter_mut()
+        .chain(schema.inequalities.iter_mut())
+    {
         map(l);
         map(r);
     }
@@ -630,13 +706,18 @@ fn fluent_predicates(domain: &Domain) -> HashSet<Predicate> {
 }
 
 /// Predicates that occur negated in a precondition or the goal.
-fn negated_predicates(domain: &Domain, problem: &Problem) -> Result<HashSet<Predicate>, Unsupported> {
+fn negated_predicates(
+    domain: &Domain,
+    problem: &Problem,
+) -> Result<HashSet<Predicate>, Unsupported> {
     fn go(f: &Formula, out: &mut HashSet<Predicate>) {
         match f {
             Formula::Negation(a) => {
                 out.insert(a.predicate);
             }
-            Formula::Conjunction(fs) | Formula::Disjunction(fs) => fs.iter().for_each(|f| go(f, out)),
+            Formula::Conjunction(fs) | Formula::Disjunction(fs) => {
+                fs.iter().for_each(|f| go(f, out))
+            }
             Formula::Exists { body, .. } | Formula::Forall { body, .. } => go(body, out),
             _ => {}
         }
@@ -659,9 +740,10 @@ fn dnf(f: &Formula) -> Option<Vec<Vec<Rc<Formula>>>> {
     match f {
         Formula::True => Some(vec![Vec::new()]),
         Formula::False => Some(Vec::new()),
-        Formula::Atom(_) | Formula::Negation(_) | Formula::Equality { .. } | Formula::Inequality { .. } => {
-            Some(vec![vec![Rc::new(f.clone())]])
-        }
+        Formula::Atom(_)
+        | Formula::Negation(_)
+        | Formula::Equality { .. }
+        | Formula::Inequality { .. } => Some(vec![vec![Rc::new(f.clone())]]),
         Formula::Conjunction(parts) => {
             let mut out: Vec<Vec<Rc<Formula>>> = vec![Vec::new()];
             for part in parts {

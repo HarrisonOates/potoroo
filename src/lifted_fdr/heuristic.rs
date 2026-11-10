@@ -16,7 +16,6 @@ use crate::planning_graph::{HeuristicValue, PlanningGraph};
 use crate::problem::Problem;
 use crate::search::SearchContext;
 
-
 use crate::formula::Atom;
 use crate::planning_graph::hv_min;
 use crate::terms::{Object, Term};
@@ -40,7 +39,6 @@ pub enum Kind {
     Tadd,
 }
 
-
 /// Largest product of narrowed domains enumerated per condition.
 const ENUMERATION_LIMIT: usize = 512;
 
@@ -52,7 +50,9 @@ impl Kind {
             "PADD" => Ok(Kind::Padd),
             "ADDR" => Ok(Kind::Addr),
             "TADD" => Ok(Kind::Tadd),
-            _ => Err(format!("unknown lifted FDR heuristic `{name}` (OC, ADD, PADD, ADDR, TADD)")),
+            _ => Err(format!(
+                "unknown lifted FDR heuristic `{name}` (OC, ADD, PADD, ADDR, TADD)"
+            )),
         }
     }
 }
@@ -111,7 +111,13 @@ impl Estimator {
     /// narrower than their type range over those objects only, enumerated
     /// when the product is small; other variables keep the graph's pattern
     /// minimum over type-compatible objects.
-    pub fn open_value_in(&self, ctx: &Ctx, plan: &Plan, open: super::plan::Open, use_domains: bool) -> HeuristicValue {
+    pub fn open_value_in(
+        &self,
+        ctx: &Ctx,
+        plan: &Plan,
+        open: super::plan::Open,
+        use_domains: bool,
+    ) -> HeuristicValue {
         let Some(graph) = self.graph.as_ref() else {
             return HeuristicValue::ZERO;
         };
@@ -168,12 +174,17 @@ impl Estimator {
         let narrowed: Vec<(Vec<usize>, Vec<Object>)> = classes
             .iter()
             .filter_map(|(k, positions, first)| {
-                let Term::Variable(v) = first else { return None };
+                let Term::Variable(v) = first else {
+                    return None;
+                };
                 let domain = b.domain(*k);
-                (domain.len() < ctx.type_set(*v).len()).then(|| (positions.clone(), domain.iter().collect()))
+                (domain.len() < ctx.type_set(*v).len())
+                    .then(|| (positions.clone(), domain.iter().collect()))
             })
             .collect();
-        let product = narrowed.iter().try_fold(1usize, |acc, (_, d)| acc.checked_mul(d.len()));
+        let product = narrowed
+            .iter()
+            .try_fold(1usize, |acc, (_, d)| acc.checked_mul(d.len()));
         if narrowed.is_empty() || product.is_none_or(|p| p > ENUMERATION_LIMIT) {
             return value_of(atom);
         }

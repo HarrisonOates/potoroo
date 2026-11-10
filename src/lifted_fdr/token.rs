@@ -53,7 +53,9 @@ fn key(b: &LBindings, f: &LFact, step: usize) -> Key {
 fn can_equal(b: &LBindings, x: Resolved, y: Resolved) -> bool {
     match (x, y) {
         (Resolved::Object(a), Resolved::Object(c)) => a == c,
-        (Resolved::Object(o), Resolved::Class(k)) | (Resolved::Class(k), Resolved::Object(o)) => b.domain(k).contains(o),
+        (Resolved::Object(o), Resolved::Class(k)) | (Resolved::Class(k), Resolved::Object(o)) => {
+            b.domain(k).contains(o)
+        }
         (Resolved::Class(a), Resolved::Class(c)) => {
             a == c || (!b.distinct(a).contains(&c) && b.domain(a).intersects(b.domain(c)))
         }
@@ -63,8 +65,14 @@ fn can_equal(b: &LBindings, x: Resolved, y: Resolved) -> bool {
 fn may_unify(b: &LBindings, k: &Key, other: &Key) -> bool {
     k.var == other.var
         && k.part == other.part
-        && k.inv.iter().zip(&other.inv).all(|(x, y)| can_equal(b, *x, *y))
-        && k.args.iter().zip(&other.args).all(|(x, y)| can_equal(b, *x, *y))
+        && k.inv
+            .iter()
+            .zip(&other.inv)
+            .all(|(x, y)| can_equal(b, *x, *y))
+        && k.args
+            .iter()
+            .zip(&other.args)
+            .all(|(x, y)| can_equal(b, *x, *y))
 }
 
 impl Tokens {
@@ -131,7 +139,9 @@ impl Tokens {
         for (gi, g) in ctx.task.goal.iter().enumerate() {
             if g.value == LValue::None
                 || !demands.iter().any(|(k, _)| k.var == g.var)
-                || charged.iter().any(|&(c, k)| c == GOAL_ID && k as usize == gi)
+                || charged
+                    .iter()
+                    .any(|&(c, k)| c == GOAL_ID && k as usize == gi)
             {
                 continue;
             }
@@ -146,14 +156,22 @@ impl Tokens {
             v
         };
         for &var in &vars {
-            for (inv, value) in ctx.init_by_var.get(&var).map(|v| v.as_slice()).unwrap_or(&[]) {
+            for (inv, value) in ctx
+                .init_by_var
+                .get(&var)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+            {
                 if let LValue::Part { part, args } = value {
                     supplies.push((
                         Key {
                             var,
                             inv: inv.iter().map(|o| Resolved::Object(*o)).collect(),
                             part: *part,
-                            args: args.iter().map(|t| Resolved::Object(t.as_object())).collect(),
+                            args: args
+                                .iter()
+                                .map(|t| Resolved::Object(t.as_object()))
+                                .collect(),
                         },
                         super::plan::INIT_ID,
                     ));
@@ -180,7 +198,10 @@ impl Tokens {
         let mut by_value: crate::fasthash::FastMap<Bucket, Vec<usize>> = Default::default();
         let mut by_part: crate::fasthash::FastMap<(u32, u16), Vec<usize>> = Default::default();
         for (j, (k, _)) in supplies.iter().enumerate() {
-            by_value.entry((k.var, k.part, first(k))).or_default().push(j);
+            by_value
+                .entry((k.var, k.part, first(k)))
+                .or_default()
+                .push(j);
             by_part.entry((k.var, k.part)).or_default().push(j);
         }
         let empty: Vec<usize> = Vec::new();
@@ -196,7 +217,13 @@ impl Tokens {
                             .chain(by_value.get(&(d.var, d.part, None)).unwrap_or(&empty))
                             .copied(),
                     ),
-                    None => Box::new(by_part.get(&(d.var, d.part)).unwrap_or(&empty).iter().copied()),
+                    None => Box::new(
+                        by_part
+                            .get(&(d.var, d.part))
+                            .unwrap_or(&empty)
+                            .iter()
+                            .copied(),
+                    ),
                 };
                 candidates
                     .filter(|&j| {
@@ -215,7 +242,12 @@ impl Tokens {
             })
             .collect();
         let mut owner: Vec<Option<usize>> = vec![None; supplies.len()];
-        fn augment(i: usize, edges: &[Vec<usize>], owner: &mut [Option<usize>], seen: &mut [bool]) -> bool {
+        fn augment(
+            i: usize,
+            edges: &[Vec<usize>],
+            owner: &mut [Option<usize>],
+            seen: &mut [bool],
+        ) -> bool {
             for &j in &edges[i] {
                 if seen[j] {
                     continue;
@@ -230,11 +262,14 @@ impl Tokens {
         }
         let mut total = 0.0;
         let mut seen = vec![false; supplies.len()];
-        for i in 0..demands.len() {
+        for (i, (k, _)) in demands.iter().enumerate() {
             seen.iter_mut().for_each(|x| *x = false);
             if !augment(i, &edges, &mut owner, &mut seen) {
-                let k = &demands[i].0;
-                let cost = self.repro.get(&(k.var, k.part)).copied().unwrap_or(f32::INFINITY);
+                let cost = self
+                    .repro
+                    .get(&(k.var, k.part))
+                    .copied()
+                    .unwrap_or(f32::INFINITY);
                 if !cost.is_finite() {
                     return f32::INFINITY;
                 }

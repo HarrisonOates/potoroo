@@ -65,7 +65,11 @@ struct SchemaFacts {
 }
 
 /// Synthesises invariants over the fluent predicates of `domain`.
-pub fn synthesise(domain: &Domain, problem: &Problem, fluent: &HashSet<Predicate>) -> Vec<Invariant> {
+pub fn synthesise(
+    domain: &Domain,
+    problem: &Problem,
+    fluent: &HashSet<Predicate>,
+) -> Vec<Invariant> {
     let schemas: Vec<SchemaFacts> = domain
         .actions
         .iter()
@@ -101,11 +105,18 @@ pub fn synthesise(domain: &Domain, problem: &Problem, fluent: &HashSet<Predicate
     let mut objects_of = |ty: Type| -> HashSet<Object> {
         objects
             .entry(ty)
-            .or_insert_with(|| super::task::objects_of(domain, problem, ty).into_iter().collect())
+            .or_insert_with(|| {
+                super::task::objects_of(domain, problem, ty)
+                    .into_iter()
+                    .collect()
+            })
             .clone()
     };
     // Per schema, per pair of variables: may they co-designate?
-    let can_equal = |schema: &SchemaFacts, a: Term, b: Term, objects_of: &mut dyn FnMut(Type) -> HashSet<Object>| {
+    let can_equal = |schema: &SchemaFacts,
+                     a: Term,
+                     b: Term,
+                     objects_of: &mut dyn FnMut(Type) -> HashSet<Object>| {
         if a == b {
             return true;
         }
@@ -165,7 +176,11 @@ pub fn synthesise(domain: &Domain, problem: &Problem, fluent: &HashSet<Predicate
         let mut refinements = Vec::new();
         let mut unbalanced = false;
         for schema in &schemas {
-            if candidate.parts.iter().any(|p| schema.uncertain.contains(&p.predicate)) {
+            if candidate
+                .parts
+                .iter()
+                .any(|p| schema.uncertain.contains(&p.predicate))
+            {
                 continue 'candidates;
             }
             let mut entering: Vec<(usize, Vec<Term>)> = Vec::new();
@@ -200,7 +215,8 @@ pub fn synthesise(domain: &Domain, problem: &Problem, fluent: &HashSet<Predicate
                 let paired = schema.deletes.iter().any(|deleted| {
                     schema.required.contains(deleted)
                         && candidate.parts.iter().any(|part| {
-                            let mut check: Vec<Option<Term>> = sigma.iter().map(|t| Some(*t)).collect();
+                            let mut check: Vec<Option<Term>> =
+                                sigma.iter().map(|t| Some(*t)).collect();
                             match_lifted(part, deleted, &mut check)
                                 && check.iter().zip(sigma).all(|(c, s)| *c == Some(*s))
                         })
@@ -240,7 +256,11 @@ pub fn synthesise(domain: &Domain, problem: &Problem, fluent: &HashSet<Predicate
     found
 }
 
-fn entailed(formula: &Rc<Formula>, atoms: &mut Vec<Atom>, inequalities: &mut HashSet<(Term, Term)>) {
+fn entailed(
+    formula: &Rc<Formula>,
+    atoms: &mut Vec<Atom>,
+    inequalities: &mut HashSet<(Term, Term)>,
+) {
     match formula.as_ref() {
         Formula::Atom(atom) => atoms.push(atom.clone()),
         Formula::Inequality { left, right, .. } => {

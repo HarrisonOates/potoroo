@@ -94,7 +94,9 @@ impl ObjSet {
     #[inline]
     pub fn contains(&self, o: Object) -> bool {
         let i = o.0 as usize;
-        self.slice().get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+        self.slice()
+            .get(i / 64)
+            .is_some_and(|w| w & (1 << (i % 64)) != 0)
     }
 
     pub fn len(&self) -> usize {
@@ -131,7 +133,10 @@ impl ObjSet {
     }
 
     pub fn intersects(&self, other: &ObjSet) -> bool {
-        self.slice().iter().zip(other.slice()).any(|(a, b)| a & b != 0)
+        self.slice()
+            .iter()
+            .zip(other.slice())
+            .any(|(a, b)| a & b != 0)
     }
 
     pub fn union_with(&mut self, other: &ObjSet) {
@@ -191,6 +196,9 @@ mod tests {
         let mut b = small.clone();
         b.union_with(&large);
         assert_eq!(b, large);
-        assert_eq!(large.iter().map(|o| o.0).collect::<Vec<_>>(), vec![1, 5, 100, 300]);
+        assert_eq!(
+            large.iter().map(|o| o.0).collect::<Vec<_>>(),
+            vec![1, 5, 100, 300]
+        );
     }
 }

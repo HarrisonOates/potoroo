@@ -48,7 +48,12 @@ impl IdList {
     }
 
     fn retain(&mut self, keep: impl Fn(&ClassId) -> bool) {
-        let ids: Vec<ClassId> = self.as_slice().iter().copied().filter(|i| keep(i)).collect();
+        let ids: Vec<ClassId> = self
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|i| keep(i))
+            .collect();
         self.set(ids);
     }
 
@@ -189,10 +194,9 @@ impl LBindings {
 
     /// Unbound classes in creation order.
     pub fn unbound_classes(&self) -> impl Iterator<Item = ClassId> + '_ {
-        self.classes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| (c.constant.is_none() && c.forward.is_none()).then_some(i as ClassId))
+        self.classes.iter().enumerate().filter_map(|(i, c)| {
+            (c.constant.is_none() && c.forward.is_none()).then_some(i as ClassId)
+        })
     }
 
     /// Equality already entailed.
@@ -208,11 +212,11 @@ impl LBindings {
     pub fn terms_can_equal(&self, l: Term, ls: usize, r: Term, rs: usize) -> bool {
         match (self.resolve(l, ls), self.resolve(r, rs)) {
             (Resolved::Object(a), Resolved::Object(b)) => a == b,
-            (Resolved::Object(o), Resolved::Class(c)) | (Resolved::Class(c), Resolved::Object(o)) => {
-                self.domain(c).contains(o)
-            }
+            (Resolved::Object(o), Resolved::Class(c))
+            | (Resolved::Class(c), Resolved::Object(o)) => self.domain(c).contains(o),
             (Resolved::Class(a), Resolved::Class(b)) => {
-                a == b || (!self.distinct(a).contains(&b) && self.domain(a).intersects(self.domain(b)))
+                a == b
+                    || (!self.distinct(a).contains(&b) && self.domain(a).intersects(self.domain(b)))
             }
         }
     }
@@ -232,7 +236,8 @@ impl LBindings {
     /// Binds a class to an object.
     pub fn bind(&self, c: ClassId, o: Object) -> Option<LBindings> {
         let mut next = self.clone();
-        next.relate(Resolved::Class(c), Resolved::Object(o), true).then_some(next)
+        next.relate(Resolved::Class(c), Resolved::Object(o), true)
+            .then_some(next)
     }
 
     /// Restricts a class's domain; binds it when one object remains.
@@ -246,10 +251,10 @@ impl LBindings {
     fn relate(&mut self, a: Resolved, b: Resolved, equal: bool) -> bool {
         match (a, b, equal) {
             (Resolved::Object(x), Resolved::Object(y), _) => (x == y) == equal,
-            (Resolved::Class(c), Resolved::Object(o), true) | (Resolved::Object(o), Resolved::Class(c), true) => {
-                self.assign(c, o)
-            }
-            (Resolved::Class(c), Resolved::Object(o), false) | (Resolved::Object(o), Resolved::Class(c), false) => {
+            (Resolved::Class(c), Resolved::Object(o), true)
+            | (Resolved::Object(o), Resolved::Class(c), true) => self.assign(c, o),
+            (Resolved::Class(c), Resolved::Object(o), false)
+            | (Resolved::Object(o), Resolved::Class(c), false) => {
                 self.class_mut(c).domain.remove(o);
                 self.settle(c)
             }
@@ -401,7 +406,10 @@ mod tests {
     fn inequalities_force_and_fail() {
         let b = two_steps();
         let b = b
-            .add(&[(X, 1, Term::Object(Object(0)), 1, false), (X, 1, Term::Object(Object(1)), 1, false)])
+            .add(&[
+                (X, 1, Term::Object(Object(0)), 1, false),
+                (X, 1, Term::Object(Object(1)), 1, false),
+            ])
             .unwrap();
         assert_eq!(b.binding(X, 1), Term::Object(Object(2)));
         // Binding a class removes its object from distinct classes, which
@@ -409,8 +417,12 @@ mod tests {
         let b = two_steps().add(&[(Y, 2, X, 1, false)]).unwrap();
         let b = b.add(&[(X, 1, Term::Object(Object(0)), 1, true)]).unwrap();
         assert_eq!(b.binding(Y, 2), Term::Object(Object(1)));
-        assert!(b.add(&[(Y, 2, Term::Object(Object(1)), 1, false)]).is_none());
-        assert!(two_steps().add(&[(X, 1, Y, 1, false), (X, 1, Y, 1, true)]).is_none());
+        assert!(b
+            .add(&[(Y, 2, Term::Object(Object(1)), 1, false)])
+            .is_none());
+        assert!(two_steps()
+            .add(&[(X, 1, Y, 1, false), (X, 1, Y, 1, true)])
+            .is_none());
     }
 }
 
@@ -418,6 +430,10 @@ mod tests {
 mod size_tests {
     #[test]
     fn classes_stay_small() {
-        assert!(std::mem::size_of::<super::Class>() <= 64, "{}", std::mem::size_of::<super::Class>());
+        assert!(
+            std::mem::size_of::<super::Class>() <= 64,
+            "{}",
+            std::mem::size_of::<super::Class>()
+        );
     }
 }

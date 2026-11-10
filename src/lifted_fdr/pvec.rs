@@ -45,7 +45,7 @@ impl<T: Clone> PVec<T> {
 
     pub fn push(&mut self, value: T) {
         let chunks = Rc::make_mut(&mut self.chunks);
-        if self.len % CHUNK == 0 {
+        if self.len.is_multiple_of(CHUNK) {
             chunks.push(Rc::new(Vec::with_capacity(CHUNK)));
         }
         Rc::make_mut(chunks.last_mut().expect("a chunk")).push(value);
@@ -82,6 +82,9 @@ mod tests {
         assert_eq!(child[70], 7);
         assert_eq!(child.len(), 101);
         assert_eq!(parent.len(), 100);
-        assert_eq!(child.iter().copied().sum::<u32>(), (0..101).sum::<u32>() - 70 + 7);
+        assert_eq!(
+            child.iter().copied().sum::<u32>(),
+            (0..101).sum::<u32>() - 70 + 7
+        );
     }
 }

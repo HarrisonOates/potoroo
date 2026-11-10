@@ -192,7 +192,11 @@ impl Ord for Node {
 }
 
 /// Compiles and solves. Unsupported tasks are reported, not attempted.
-pub fn solve(domain: &Domain, problem: &Problem, config: &Config) -> Result<(Outcome, Stats), Unsupported> {
+pub fn solve(
+    domain: &Domain,
+    problem: &Problem,
+    config: &Config,
+) -> Result<(Outcome, Stats), Unsupported> {
     let task = LiftedTask::compile(domain, problem)?;
     Ok(solve_task(domain, problem, &task, config))
 }
@@ -275,7 +279,11 @@ impl Search<'_, '_> {
             stats.dead += 1;
             return None;
         }
-        Some((plan.cost as f32 + self.weight * h, h, stats.generated as u32))
+        Some((
+            plan.cost as f32 + self.weight * h,
+            h,
+            stats.generated as u32,
+        ))
     }
 
     fn enqueue(lane: &mut Running, (f, h, id): (f32, f32, u32), entry: Entry) {
@@ -319,7 +327,9 @@ impl Search<'_, '_> {
                 base.witness.clone(),
                 matches!(
                     choice,
-                    super::plan::Choice::Demote | super::plan::Choice::Promote | super::plan::Choice::Drop
+                    super::plan::Choice::Demote
+                        | super::plan::Choice::Promote
+                        | super::plan::Choice::Drop
                 ),
             ),
             Entry::Built(_) => (None, false),
@@ -398,7 +408,13 @@ impl Search<'_, '_> {
         let selected = super::flaws::select(ctx, &plan, &lane.lane.flaw_order, &lane.estimator);
         stats.phase[1] += started.elapsed();
         let started = Instant::now();
-        let binding = choose_binding(ctx, &plan, &selected, self.bind_policy, lane.lane.degree_binding);
+        let binding = choose_binding(
+            ctx,
+            &plan,
+            &selected,
+            self.bind_policy,
+            lane.lane.degree_binding,
+        );
         stats.phase[2] += started.elapsed();
         if stats.expanded <= self.trace {
             self.trace_node(lane, &node, &plan, &selected, &binding);
@@ -410,8 +426,14 @@ impl Search<'_, '_> {
                     let f = ctx.condition(&plan, t.link.consumer(), t.link.cond);
                     eprintln!(
                         "  threat: writer inv {:?} vs link inv {:?}; definite={}",
-                        g.inv.iter().map(|x| b.resolve(*x, t.step())).collect::<Vec<_>>(),
-                        f.inv.iter().map(|x| b.resolve(*x, t.link.consumer())).collect::<Vec<_>>(),
+                        g.inv
+                            .iter()
+                            .map(|x| b.resolve(*x, t.step()))
+                            .collect::<Vec<_>>(),
+                        f.inv
+                            .iter()
+                            .map(|x| b.resolve(*x, t.link.consumer()))
+                            .collect::<Vec<_>>(),
                         super::plan::definite(ctx, &plan, t)
                     );
                 }
@@ -419,9 +441,14 @@ impl Search<'_, '_> {
         }
         let started = Instant::now();
         let (refined, children) = match binding {
-            Some((class, objects)) => (Refined::Bind(class), super::plan::refine_bind(ctx, &plan, class, &objects)),
+            Some((class, objects)) => (
+                Refined::Bind(class),
+                super::plan::refine_bind(ctx, &plan, class, &objects),
+            ),
             None => match selected {
-                super::flaws::Flaw::Threat(t) => (Refined::Threat(t), refine_threat(ctx, &plan, t, None)),
+                super::flaws::Flaw::Threat(t) => {
+                    (Refined::Threat(t), refine_threat(ctx, &plan, t, None))
+                }
                 super::flaws::Flaw::Open(o) => (Refined::Open(o), refine_open(ctx, &plan, o, None)),
                 super::flaws::Flaw::Dead => (Refined::Bind(0), Vec::new()),
             },
@@ -442,11 +469,17 @@ impl Search<'_, '_> {
                 }
                 let same = matches!(
                     choice,
-                    super::plan::Choice::Demote | super::plan::Choice::Promote | super::plan::Choice::Drop
+                    super::plan::Choice::Demote
+                        | super::plan::Choice::Promote
+                        | super::plan::Choice::Drop
                 );
                 let rank = self.evaluate(lane, &child, base.witness.as_ref(), same, stats);
                 if stats.expanded <= self.trace {
-                    eprintln!("  child {:?}: {}", choice, rank.map_or("dead".to_string(), |r| format!("f={} h={}", r.0, r.1)));
+                    eprintln!(
+                        "  child {:?}: {}",
+                        choice,
+                        rank.map_or("dead".to_string(), |r| format!("f={} h={}", r.0, r.1))
+                    );
                 }
                 Some((rank?, choice, child))
             })
@@ -457,7 +490,9 @@ impl Search<'_, '_> {
             .iter()
             .enumerate()
             .min_by(|(_, (a, _, _)), (_, (b, _, _))| {
-                a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)).then(b.2.cmp(&a.2))
+                a.0.total_cmp(&b.0)
+                    .then(a.1.total_cmp(&b.1))
+                    .then(b.2.cmp(&a.2))
             })
             .map(|(i, _)| i);
         for (i, (rank, choice, child)) in ranked.into_iter().enumerate() {
@@ -479,7 +514,11 @@ impl Search<'_, '_> {
     fn dump_plan(&self, plan: &Plan) {
         let ctx = self.ctx;
         let name = |t: Term| match t {
-            Term::Object(o) => self.problem.objects.object_name(Some(&self.domain.constants), o).to_string(),
+            Term::Object(o) => self
+                .problem
+                .objects
+                .object_name(Some(&self.domain.constants), o)
+                .to_string(),
             Term::Variable(v) => format!("?{}", v.0),
         };
         for s in 1..=plan.num_steps() {
@@ -498,12 +537,27 @@ impl Search<'_, '_> {
                 })
                 .collect();
             let after: Vec<usize> = (1..=plan.num_steps())
-                .filter(|&p| p != s && !plan.orderings.possibly_before(s, StepTime::AtEnd, p, StepTime::AtStart))
+                .filter(|&p| {
+                    p != s
+                        && !plan
+                            .orderings
+                            .possibly_before(s, StepTime::AtEnd, p, StepTime::AtStart)
+                })
                 .collect();
-            eprintln!("  step {s}: {}({}) after {:?}", schema.name, args.join(" "), after);
+            eprintln!(
+                "  step {s}: {}({}) after {:?}",
+                schema.name,
+                args.join(" "),
+                after
+            );
         }
         for link in chain::iter(&plan.links) {
-            eprintln!("  link {} -> {} cond {}", link.producer(), link.consumer(), link.cond);
+            eprintln!(
+                "  link {} -> {} cond {}",
+                link.producer(),
+                link.consumer(),
+                link.cond
+            );
         }
     }
 
@@ -532,20 +586,30 @@ impl Search<'_, '_> {
             ctx.task.fact_name(self.domain, self.problem, &resolved)
         };
         let flaw = match (binding, selected) {
-            (Some((class, objects)), _) => format!("bind class {} over {} objects", class, objects.len()),
+            (Some((class, objects)), _) => {
+                format!("bind class {} over {} objects", class, objects.len())
+            }
             (None, super::flaws::Flaw::Open(o)) => {
                 let name = if o.consumer() == super::plan::GOAL_ID {
                     "goal".to_string()
                 } else {
                     ctx.schema_of(plan, o.consumer()).name.clone()
                 };
-                format!("open {} for {}@{}", describe(o.consumer(), ctx.condition(plan, o.consumer(), o.cond)), name, o.consumer())
+                format!(
+                    "open {} for {}@{}",
+                    describe(o.consumer(), ctx.condition(plan, o.consumer(), o.cond)),
+                    name,
+                    o.consumer()
+                )
             }
             (None, super::flaws::Flaw::Threat(t)) => format!(
                 "threat step {} ({}) on {}",
                 t.step(),
                 ctx.schema_of(plan, t.step()).name,
-                describe(t.link.consumer(), ctx.condition(plan, t.link.consumer(), t.link.cond))
+                describe(
+                    t.link.consumer(),
+                    ctx.condition(plan, t.link.consumer(), t.link.cond)
+                )
             ),
             (None, super::flaws::Flaw::Dead) => "dead".to_string(),
         };
@@ -563,7 +627,12 @@ impl Search<'_, '_> {
     }
 }
 
-pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config: &Config) -> (Outcome, Stats) {
+pub fn solve_task(
+    domain: &Domain,
+    problem: &Problem,
+    task: &LiftedTask,
+    config: &Config,
+) -> (Outcome, Stats) {
     let global = GlobalTypes(task.var_types.clone());
     let types = TypeContext {
         types: &domain.types,
@@ -588,7 +657,10 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
     };
     let defaults: Vec<Lane>;
     let lanes: &[Lane] = if config.lanes.is_empty() {
-        defaults = DEFAULT_LANES.iter().map(|l| Lane::parse(l).expect("valid default lane")).collect();
+        defaults = DEFAULT_LANES
+            .iter()
+            .map(|l| Lane::parse(l).expect("valid default lane"))
+            .collect();
         &defaults
     } else {
         &config.lanes
@@ -600,7 +672,10 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         Ok("off") => (-1.0, 0),
         Ok(v) => {
             let (h, budget) = v.split_once(':').unwrap_or((v, "1000"));
-            (h.parse().unwrap_or(f32::INFINITY), budget.parse().unwrap_or(1000))
+            (
+                h.parse().unwrap_or(f32::INFINITY),
+                budget.parse().unwrap_or(1000),
+            )
         }
         Err(_) => (f32::INFINITY, 1000),
     };
@@ -610,14 +685,23 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
         problem,
         weight: config.weight,
         bind_policy: BindPolicy::from_env(),
-        mac_budget: std::env::var("POTOROO_LFDR_MAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
-        trace: std::env::var("POTOROO_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        mac_budget: std::env::var("POTOROO_LFDR_MAC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        trace: std::env::var("POTOROO_TRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         defer: std::env::var("POTOROO_LFDR_DEFER").map_or(true, |v| v != "0"),
         keep_best: std::env::var("POTOROO_LFDR_DEFER").is_ok_and(|v| v == "best"),
         progress: std::env::var_os("POTOROO_LFDR_PROGRESS").is_some(),
         drop_stale: std::env::var("POTOROO_LFDR_STALE").map_or(true, |v| v != "0"),
         dead_new_threats: std::env::var("POTOROO_LFDR_NEWDEAD").map_or(true, |v| v != "0"),
-        force_rounds: std::env::var("POTOROO_LFDR_FORCE").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        force_rounds: std::env::var("POTOROO_LFDR_FORCE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4),
         feasibility_h: feas.0,
         feasibility_budget: feas.1,
         feasibility_at_pop: std::env::var("POTOROO_LFDR_FEASPOP").map_or(true, |v| v != "0"),
@@ -652,7 +736,11 @@ pub fn solve_task(domain: &Domain, problem: &Problem, task: &LiftedTask, config:
             if lane.exhausted {
                 continue;
             }
-            if stats.generated >= config.node_limit || config.time_limit.is_some_and(|limit| start.elapsed() > limit) {
+            if stats.generated >= config.node_limit
+                || config
+                    .time_limit
+                    .is_some_and(|limit| start.elapsed() > limit)
+            {
                 return (Outcome::LimitReached, stats);
             }
             if let Some(solution) = search.expand(lane, &mut stats) {
@@ -668,7 +756,9 @@ fn rebuild(ctx: &Ctx, parent: &Plan, flaw: Refined, choice: super::plan::Choice)
     let mut children = match (flaw, choice) {
         (Refined::Open(o), _) => refine_open(ctx, parent, o, Some(choice)),
         (Refined::Threat(t), _) => refine_threat(ctx, parent, t, Some(choice)),
-        (Refined::Bind(class), super::plan::Choice::Bind(o)) => super::plan::refine_bind(ctx, parent, class, &[o]),
+        (Refined::Bind(class), super::plan::Choice::Bind(o)) => {
+            super::plan::refine_bind(ctx, parent, class, &[o])
+        }
         (Refined::Bind(_), _) => Vec::new(),
     };
     debug_assert!(children.len() <= 1);
@@ -718,11 +808,16 @@ fn choose_binding(
                     return None;
                 }
             }
-            super::plan::binding_candidates(ctx, plan).into_iter().next().map(|(c, _, d)| (c, d))
+            super::plan::binding_candidates(ctx, plan)
+                .into_iter()
+                .next()
+                .map(|(c, _, d)| (c, d))
         }
         BindPolicy::Threat => threat_binding(ctx, plan, selected, degree_binding),
         BindPolicy::Lr => {
-            let (class, _, objects) = super::plan::binding_candidates(ctx, plan).into_iter().next()?;
+            let (class, _, objects) = super::plan::binding_candidates(ctx, plan)
+                .into_iter()
+                .next()?;
             let repairs = match selected {
                 Flaw::Dead => return None,
                 Flaw::Threat(t) => super::plan::count_threat_options(ctx, plan, t).unwrap_or(0),
@@ -800,7 +895,12 @@ fn threat_binding(
         viable.sort_by_key(|(o, removed)| (std::cmp::Reverse(*removed), *o));
         let score = size as f32 / threats.len() as f32;
         if best.as_ref().is_none_or(|(s, _, _, _)| score < *s) {
-            best = Some((score, size, class, viable.into_iter().map(|(o, _)| o).collect()));
+            best = Some((
+                score,
+                size,
+                class,
+                viable.into_iter().map(|(o, _)| o).collect(),
+            ));
         }
     }
     let (score, size, class, objects) = best?;
@@ -837,7 +937,11 @@ fn complete(ctx: &Ctx, domain: &Domain, problem: &Problem, plan: &Plan) -> Optio
         let next = (1..=n).find(|&s| {
             !placed[s]
                 && (1..=n).all(|p| {
-                    placed[p] || p == s || plan.orderings.possibly_before(s, StepTime::AtEnd, p, StepTime::AtStart)
+                    placed[p]
+                        || p == s
+                        || plan
+                            .orderings
+                            .possibly_before(s, StepTime::AtEnd, p, StepTime::AtStart)
                 })
         });
         let Some(next) = next else {
@@ -865,15 +969,26 @@ fn complete(ctx: &Ctx, domain: &Domain, problem: &Problem, plan: &Plan) -> Optio
     };
     match validate(domain, problem, &solution) {
         Ok(()) => Some(solution),
-        Err(e) => panic!("lifted FDR produced an invalid plan: {e}\n{}", solution.format(domain, problem)),
+        Err(e) => panic!(
+            "lifted FDR produced an invalid plan: {e}\n{}",
+            solution.format(domain, problem)
+        ),
     }
 }
 
 /// Depth-first grounding of the unbound classes, smallest domain first,
 /// with arc consistency at each assignment (MAC). `None` when the assignment
 /// budget runs out before an answer.
-fn ground_within(ctx: &Ctx, plan: &Plan, bindings: &mut super::binds::LBindings, budget: &mut usize) -> Option<bool> {
-    let Some(class) = bindings.unbound_classes().min_by_key(|&c| (bindings.domain(c).len(), c)) else {
+fn ground_within(
+    ctx: &Ctx,
+    plan: &Plan,
+    bindings: &mut super::binds::LBindings,
+    budget: &mut usize,
+) -> Option<bool> {
+    let Some(class) = bindings
+        .unbound_classes()
+        .min_by_key(|&c| (bindings.domain(c).len(), c))
+    else {
         return Some(true);
     };
     let objects: Vec<Object> = bindings.domain(class).iter().collect();
@@ -1007,6 +1122,10 @@ mod tests {
     #[test]
     fn queue_entries_stay_small() {
         // A queued child is a recipe: ranks, id, shared expansion, choice.
-        assert!(std::mem::size_of::<super::Node>() <= 40, "{}", std::mem::size_of::<super::Node>());
+        assert!(
+            std::mem::size_of::<super::Node>() <= 40,
+            "{}",
+            std::mem::size_of::<super::Node>()
+        );
     }
 }

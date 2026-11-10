@@ -584,11 +584,17 @@ fn run_lifted_fdr(
     let config = Config {
         lanes,
         weight: cli.params.weight,
-        node_limit: cli.params.search_limits.first().copied().unwrap_or(usize::MAX),
+        node_limit: cli
+            .params
+            .search_limits
+            .first()
+            .copied()
+            .unwrap_or(usize::MAX),
         time_limit: deadline.map(|d| d.saturating_duration_since(Instant::now())),
     };
     let start = Instant::now();
-    let (outcome, stats) = potoroo::lifted_fdr::solve(domain, problem, &config).map_err(|e| e.to_string())?;
+    let (outcome, stats) =
+        potoroo::lifted_fdr::solve(domain, problem, &config).map_err(|e| e.to_string())?;
     let run_stats = RunStats {
         nodes_generated: stats.generated,
         nodes_visited: stats.expanded,

@@ -155,7 +155,10 @@ fn ground_value(value: &LValue, s: &[Option<Object>]) -> LValue {
         LValue::None => LValue::None,
         LValue::Part { part, args } => LValue::Part {
             part: *part,
-            args: args.iter().map(|t| Term::Object(subst(*t, s).unwrap())).collect(),
+            args: args
+                .iter()
+                .map(|t| Term::Object(subst(*t, s).unwrap()))
+                .collect(),
         },
     }
 }
@@ -164,15 +167,35 @@ fn instance(inv: &[Term], s: &[Option<Object>]) -> Vec<Object> {
     inv.iter().map(|t| subst(*t, s).unwrap()).collect()
 }
 
-fn fdr_applicable(task: &LiftedTask, schema: usize, s: &[Option<Object>], state: &FdrState) -> bool {
+fn fdr_applicable(
+    task: &LiftedTask,
+    schema: usize,
+    s: &[Option<Object>],
+    state: &FdrState,
+) -> bool {
     let sc = &task.schemas[schema];
     sc.conditions.iter().all(|c| {
-        let current = state.get(&(c.var, instance(&c.inv, s))).cloned().unwrap_or(LValue::None);
+        let current = state
+            .get(&(c.var, instance(&c.inv, s)))
+            .cloned()
+            .unwrap_or(LValue::None);
         current == ground_value(&c.value, s)
-    }) && sc.statics.iter().all(|a| task.static_atoms.contains(&ground(a, s)))
-        && sc.negated_statics.iter().all(|a| !task.static_atoms.contains(&ground(a, s)))
-        && sc.equalities.iter().all(|(l, r)| subst(*l, s) == subst(*r, s))
-        && sc.inequalities.iter().all(|(l, r)| subst(*l, s) != subst(*r, s))
+    }) && sc
+        .statics
+        .iter()
+        .all(|a| task.static_atoms.contains(&ground(a, s)))
+        && sc
+            .negated_statics
+            .iter()
+            .all(|a| !task.static_atoms.contains(&ground(a, s)))
+        && sc
+            .equalities
+            .iter()
+            .all(|(l, r)| subst(*l, s) == subst(*r, s))
+        && sc
+            .inequalities
+            .iter()
+            .all(|(l, r)| subst(*l, s) != subst(*r, s))
 }
 
 fn fdr_apply(task: &LiftedTask, schema: usize, s: &[Option<Object>], state: &FdrState) -> FdrState {
@@ -207,7 +230,12 @@ fn fdr_atoms(task: &LiftedTask, state: &FdrState) -> HashSet<Atom> {
 
 /// Random walks: at each state, STRIPS-applicable and FDR-applicable ground
 /// actions coincide and their successors agree. Returns states visited.
-pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usize, depth: usize) -> usize {
+pub(crate) fn check_random_walks(
+    domain: &Domain,
+    problem: &Problem,
+    walks: usize,
+    depth: usize,
+) -> usize {
     let task = LiftedTask::compile(domain, problem).expect("compile");
     let fluent: HashSet<_> = task.covered.keys().copied().collect();
     let mut seed = 0x2545F4914F6CDD1Du64;
@@ -223,8 +251,11 @@ pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usiz
         let mut fdr: FdrState = task.init.clone().into_iter().collect();
         for _ in 0..depth {
             visited += 1;
-            let fluent_atoms: HashSet<Atom> =
-                strips.iter().filter(|a| fluent.contains(&a.predicate)).cloned().collect();
+            let fluent_atoms: HashSet<Atom> = strips
+                .iter()
+                .filter(|a| fluent.contains(&a.predicate))
+                .cloned()
+                .collect();
             assert_eq!(fluent_atoms, fdr_atoms(&task, &fdr), "states diverged");
             let mut successors = Vec::new();
             for (index, action) in domain.actions.iter().enumerate() {
@@ -253,11 +284,26 @@ pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usiz
                 let mut all = fdr_atoms(&task, &fdr);
                 all.extend(task.static_atoms.iter().cloned());
                 let mut fdr_ok: Vec<(usize, Vec<Option<Object>>)> = Vec::new();
-                for (schema_index, schema) in task.schemas.iter().enumerate().filter(|(_, s)| s.action == index) {
-                    let mut fdr_positive: Vec<Atom> =
-                        schema.conditions.iter().filter_map(|c| task.atom_of(c)).collect();
+                for (schema_index, schema) in task
+                    .schemas
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.action == index)
+                {
+                    let mut fdr_positive: Vec<Atom> = schema
+                        .conditions
+                        .iter()
+                        .filter_map(|c| task.atom_of(c))
+                        .collect();
                     fdr_positive.extend(schema.statics.iter().cloned());
-                    for sub in substitutions(domain, problem, &schema.parameters, &task.var_types, &fdr_positive, &all) {
+                    for sub in substitutions(
+                        domain,
+                        problem,
+                        &schema.parameters,
+                        &task.var_types,
+                        &fdr_positive,
+                        &all,
+                    ) {
                         if fdr_applicable(&task, schema_index, &sub, &fdr) {
                             fdr_ok.push((schema_index, sub));
                         }
@@ -268,15 +314,23 @@ pub(crate) fn check_random_walks(domain: &Domain, problem: &Problem, walks: usiz
                 let tuple = |params: &[Variable], s: &Vec<Option<Object>>| -> Vec<Object> {
                     params.iter().map(|v| s[v.0 as usize].unwrap()).collect()
                 };
-                let strips_tuples: Vec<Vec<Object>> =
-                    strips_ok.iter().map(|s| tuple(&action.parameters, s)).collect();
-                let mut fdr_tuples: Vec<Vec<Object>> =
-                    fdr_ok.iter().map(|(i, s)| tuple(&task.schemas[*i].parameters, s)).collect();
+                let strips_tuples: Vec<Vec<Object>> = strips_ok
+                    .iter()
+                    .map(|s| tuple(&action.parameters, s))
+                    .collect();
+                let mut fdr_tuples: Vec<Vec<Object>> = fdr_ok
+                    .iter()
+                    .map(|(i, s)| tuple(&task.schemas[*i].parameters, s))
+                    .collect();
                 let mut sorted = strips_tuples.clone();
                 sorted.sort();
                 fdr_tuples.sort();
                 fdr_tuples.dedup();
-                assert_eq!(sorted, fdr_tuples, "applicability differs for {}", action.name);
+                assert_eq!(
+                    sorted, fdr_tuples,
+                    "applicability differs for {}",
+                    action.name
+                );
                 for (s, args) in strips_ok.into_iter().zip(strips_tuples) {
                     let mut global = vec![None; task.var_types.len()];
                     for (v, o) in schema.parameters.iter().zip(&args) {
@@ -356,7 +410,10 @@ fn gripper_random_walks_agree_with_strips() {
 #[ignore]
 fn suite_compiles_and_agrees() {
     let suite = std::env::var("SUITE").unwrap_or_else(|_| "../autoscale-unitcost/agile".into());
-    let mut domains: Vec<_> = std::fs::read_dir(&suite).unwrap().map(|e| e.unwrap().path()).collect();
+    let mut domains: Vec<_> = std::fs::read_dir(&suite)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     domains.sort();
     let (mut ok, mut total) = (0, 0);
     for dir in domains {
@@ -367,7 +424,10 @@ fn suite_compiles_and_agrees() {
         } else {
             dir.join("domain.pddl")
         };
-        let (Ok(d), Ok(p)) = (std::fs::read_to_string(&domain_path), std::fs::read_to_string(&problem_path)) else {
+        let (Ok(d), Ok(p)) = (
+            std::fs::read_to_string(&domain_path),
+            std::fs::read_to_string(&problem_path),
+        ) else {
             continue;
         };
         total += 1;
@@ -395,20 +455,33 @@ fn suite_compiles_and_agrees() {
 #[test]
 #[ignore]
 fn print_groups() {
-    let Ok(dir) = std::env::var("DIAG_DOMAIN") else { return };
+    let Ok(dir) = std::env::var("DIAG_DOMAIN") else {
+        return;
+    };
     let dir = std::path::Path::new(&dir);
-    let domain_path = if dir.join("domain-p01.pddl").exists() { dir.join("domain-p01.pddl") } else { dir.join("domain.pddl") };
+    let domain_path = if dir.join("domain-p01.pddl").exists() {
+        dir.join("domain-p01.pddl")
+    } else {
+        dir.join("domain.pddl")
+    };
     let (domain, problem) = load(
         &std::fs::read_to_string(domain_path).unwrap(),
         &std::fs::read_to_string(dir.join("p01.pddl")).unwrap(),
     );
     let task = LiftedTask::compile(&domain, &problem).unwrap();
     for v in &task.vars {
-        println!("var {} arity {} binary {} none {}", v.name, v.arity, v.binary, v.has_none);
+        println!(
+            "var {} arity {} binary {} none {}",
+            v.name, v.arity, v.binary, v.has_none
+        );
     }
 }
 
-fn solve_config(domain: &Domain, problem: &Problem, kind: super::heuristic::Kind) -> (super::Outcome, super::Stats) {
+fn solve_config(
+    domain: &Domain,
+    problem: &Problem,
+    kind: super::heuristic::Kind,
+) -> (super::Outcome, super::Stats) {
     let config = super::Config {
         lanes: vec![super::Lane {
             name: "test".into(),
@@ -429,7 +502,11 @@ fn gripper_solves_with_open_condition_count() {
     match outcome {
         super::Outcome::Solved(solution) => {
             super::search::validate(&domain, &problem, &solution).unwrap();
-            assert!(solution.actions.len() >= 5, "{}", solution.format(&domain, &problem));
+            assert!(
+                solution.actions.len() >= 5,
+                "{}",
+                solution.format(&domain, &problem)
+            );
         }
         _ => panic!("not solved: {stats:?}"),
     }
@@ -439,7 +516,9 @@ fn gripper_solves_with_open_condition_count() {
 #[test]
 #[ignore]
 fn solve_diag() {
-    let Ok(dir) = std::env::var("DIAG_DOMAIN") else { return };
+    let Ok(dir) = std::env::var("DIAG_DOMAIN") else {
+        return;
+    };
     let dir = std::path::Path::new(&dir);
     let instance = std::env::var("DIAG_PROBLEM").unwrap_or_else(|_| "p01".into());
     let domain_path = if dir.join(format!("domain-{instance}.pddl")).exists() {
@@ -453,12 +532,20 @@ fn solve_diag() {
     );
     let start = std::time::Instant::now();
     let config = super::Config {
-        node_limit: std::env::var("DIAG_NODES").ok().and_then(|n| n.parse().ok()).unwrap_or(1_000_000),
+        node_limit: std::env::var("DIAG_NODES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1_000_000),
         ..super::Config::default()
     };
     let (outcome, stats) = super::solve(&domain, &problem, &config).expect("supported");
     match outcome {
-        super::Outcome::Solved(s) => println!("solved cost {} in {:?}\n{}", s.cost, start.elapsed(), s.format(&domain, &problem)),
+        super::Outcome::Solved(s) => println!(
+            "solved cost {} in {:?}\n{}",
+            s.cost,
+            start.elapsed(),
+            s.format(&domain, &problem)
+        ),
         super::Outcome::NoSolution => println!("no solution"),
         super::Outcome::LimitReached => println!("limit"),
     }

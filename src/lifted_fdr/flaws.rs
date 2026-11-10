@@ -14,7 +14,10 @@ use crate::chain;
 use crate::heuristics::{FlawSelectionOrder, OrderType, SelectionCriterion};
 
 use super::heuristic::Estimator;
-use super::plan::{count_refinements, count_threat_options, definite, only_new_step, unsafe_open, Ctx, Open, Plan, Threat};
+use super::plan::{
+    count_refinements, count_threat_options, definite, only_new_step, unsafe_open, Ctx, Open, Plan,
+    Threat,
+};
 
 pub enum Flaw {
     Threat(Threat),
@@ -41,7 +44,8 @@ pub fn select(ctx: &Ctx, plan: &Plan, order: &FlawSelectionOrder, estimator: &Es
         let mut candidates = Vec::new();
         if criterion.non_separable || criterion.separable {
             for (position, threat) in threats.iter().enumerate() {
-                let count = *threat_counts[position].get_or_insert_with(|| count_threat_options(ctx, plan, threat));
+                let count = *threat_counts[position]
+                    .get_or_insert_with(|| count_threat_options(ctx, plan, threat));
                 let Some(refinements) = count else {
                     // No longer a threat: dropping it is free.
                     return Flaw::Threat(*threat);
@@ -82,7 +86,9 @@ pub fn select(ctx: &Ctx, plan: &Plan, order: &FlawSelectionOrder, estimator: &Es
             let has_new = criterion.order == OrderType::New && only_new_step(ctx, plan, *open);
             let estimate = match criterion.order {
                 OrderType::Lc | OrderType::Mc => estimator.open_value(ctx, plan, *open).add_cost(),
-                OrderType::Lw | OrderType::Mw => estimator.open_value(ctx, plan, *open).add_work() as f32,
+                OrderType::Lw | OrderType::Mw => {
+                    estimator.open_value(ctx, plan, *open).add_work() as f32
+                }
                 _ => 0.0,
             };
             candidates.push(Candidate {
@@ -131,11 +137,13 @@ fn choose(candidates: Vec<Candidate>, order: OrderType) -> Option<Candidate> {
         }
         OrderType::Lr => {
             l.refinements < r.refinements
-                || (l.refinements == r.refinements && (l.is_threat, l.recency) > (r.is_threat, r.recency))
+                || (l.refinements == r.refinements
+                    && (l.is_threat, l.recency) > (r.is_threat, r.recency))
         }
         OrderType::Mr => {
             l.refinements > r.refinements
-                || (l.refinements == r.refinements && (l.is_threat, l.recency) > (r.is_threat, r.recency))
+                || (l.refinements == r.refinements
+                    && (l.is_threat, l.recency) > (r.is_threat, r.recency))
         }
         OrderType::New => (l.has_new, l.recency) > (r.has_new, r.recency),
         OrderType::Reuse => (!l.has_new, l.recency) > (!r.has_new, r.recency),
@@ -148,7 +156,10 @@ fn choose(candidates: Vec<Candidate>, order: OrderType) -> Option<Candidate> {
     };
     let mut selected: Option<Candidate> = None;
     for candidate in candidates {
-        if selected.as_ref().is_none_or(|current| prefer(&candidate, current)) {
+        if selected
+            .as_ref()
+            .is_none_or(|current| prefer(&candidate, current))
+        {
             selected = Some(candidate);
         }
     }
