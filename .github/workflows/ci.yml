@@ -105,8 +105,7 @@ jobs:
           "$POTOROO_DOWNWARD" --help > /dev/null
       - name: Test standalone build
         if: ${{ !matrix.fast_downward }}
-        # This LP regression is slow without FD's grounding; both integration jobs run it.
-        run: cargo +stable test --locked --features "$CARGO_FEATURES" -- --skip lifted_cutset_preserves_optimal_ground_plans
+        run: cargo +stable test --locked --features "$CARGO_FEATURES"
       - name: Test Fast Downward integration
         if: matrix.fast_downward
         run: cargo +stable test --locked --features "$CARGO_FEATURES"
