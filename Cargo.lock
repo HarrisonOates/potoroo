@@ -480,9 +480,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "pddl"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c929cf4ccd605923dbccb45e9991a9443ee476fa113b6d7c742239a046f1cde7"
+checksum = "3db6fdd69a28c6474b8bfb3f4450d5cee679429e4f792adf91641250a5840943"
 dependencies = [
  "nom 8.0.0",
  "nom_locate",
@@ -517,7 +517,6 @@ dependencies = [
  "assert_cmd",
  "clap",
  "good_lp",
- "nom 8.0.0",
  "pddl",
  "thiserror",
 ]

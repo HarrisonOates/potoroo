@@ -29,13 +29,7 @@ htn = []
 highs-lp = ["good_lp/highs"]
 
 [dependencies]
-pddl = "0.2"
-# Only for rendering `pddl`'s parse failures with a line and column: its
-# errors are `nom` types, and `nom::error::Error`'s own `Display` prints an
-# internal combinator name plus the whole unconsumed input. Must stay on the
-# same major version as the one `pddl` uses, which a mismatch catches at
-# compile time.
-nom = "8"
+pddl = "0.3.1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 # Pure-Rust LP modelling + solver (microlp backend) for the Lplan heuristic. No

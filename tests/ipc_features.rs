@@ -871,19 +871,11 @@ fn an_undeclared_predicate_keeps_the_arity_of_its_first_use() {
 
 #[test]
 fn a_domain_and_a_problem_in_one_source_are_read_as_two_units() {
-    // The documented stdin workflow pipes a domain and a problem together, and
-    // the parser reads only the first form in a string.
+    // The documented stdin workflow pipes a domain and a problem together.
     let combined = format!("{COST_DOMAIN}\n{COST_PROBLEM}");
-    let units = potoroo::parser::split_units(&combined);
-    assert_eq!(units.len(), 2);
-    assert!(matches!(
-        read_pddl(&units[0]).unwrap(),
-        ParsedUnit::Domain(_)
-    ));
-    assert!(matches!(
-        read_pddl(&units[1]).unwrap(),
-        ParsedUnit::Problem(_)
-    ));
+    let file = potoroo::parser::read_pddl_file(&combined).unwrap();
+    assert_eq!(file.domains.len(), 1);
+    assert_eq!(file.problems.len(), 1);
 }
 
 #[test]
