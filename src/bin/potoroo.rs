@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use potoroo::domain::Domain;
 use potoroo::heuristics::{FlawSelectionOrder, Heuristic};
 use potoroo::params::{ActionCost, Parameters, SearchAlgorithm};
-use potoroo::parser::{bind_action_costs, lower_domain, lower_problem, read_pddl, ParsedUnit};
+use potoroo::parser::{bind_action_costs, lower_domain, lower_problem, read_pddl_file};
 use potoroo::problem::Problem;
 use potoroo::search::{
     format_steps, plan_with_progress, plan_with_stats, Outcome, SearchContext, SearchProgress,
@@ -297,21 +297,18 @@ fn run() -> Result<ExitCode, String> {
     // Problems are solved in name order, matching the C++ `std::map` iteration.
     let mut problems: BTreeMap<String, Problem> = BTreeMap::new();
 
-    // Each buffer may hold several `(define ...)` forms — the documented stdin
-    // workflow pipes a domain and a problem together — and the parser reads only
-    // the first form in a string, so split before parsing.
+    // Each buffer may hold several `(define ...)` forms: the documented stdin
+    // workflow pipes a domain and a problem together.
     let sources: Vec<String> = if cli.files.is_empty() {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| format!("error reading stdin: {e}"))?;
-        potoroo::parser::split_units(&buf)
+        vec![buf]
     } else {
         let mut v = Vec::new();
         for f in &cli.files {
-            let source =
-                std::fs::read_to_string(f).map_err(|e| format!("error reading {f}: {e}"))?;
-            v.extend(potoroo::parser::split_units(&source));
+            v.push(std::fs::read_to_string(f).map_err(|e| format!("error reading {f}: {e}"))?);
         }
         v
     };
@@ -319,13 +316,12 @@ fn run() -> Result<ExitCode, String> {
     // First pass: lower all domains so problems can reference them.
     let mut problem_units: Vec<pddl::Problem> = Vec::new();
     for src in &sources {
-        match read_pddl(src).map_err(|e| e.to_string())? {
-            ParsedUnit::Domain(d) => {
-                let dom = lower_domain(&d).map_err(|e| e.to_string())?;
-                domains.insert(dom.name.clone(), dom);
-            }
-            ParsedUnit::Problem(p) => problem_units.push(p),
+        let file = read_pddl_file(src).map_err(|e| e.to_string())?;
+        for d in &file.domains {
+            let dom = lower_domain(d).map_err(|e| e.to_string())?;
+            domains.insert(dom.name.clone(), dom);
         }
+        problem_units.extend(file.problems);
     }
     for p in &problem_units {
         let dom_name = p.domain().as_ref();
