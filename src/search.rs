@@ -309,7 +309,22 @@ impl<'a> SearchContext<'a> {
             let mut tuple: Vec<Object> = Vec::with_capacity(schema.parameters.len());
             self.instantiate(schema, &domains, 0, &mut tuple, &mut out);
         }
+        out.retain(|a| self.statically_applicable(&a.precondition));
         out
+    }
+
+    /// Whether every static literal in the top-level conjunction of a ground
+    /// precondition holds initially. No action changes a static predicate, so
+    /// an instance failing one (`board(a, c1)` with `(auto a)` false) can never
+    /// apply; Cartesian grounding would otherwise keep it.
+    fn statically_applicable(&self, precondition: &Formula) -> bool {
+        let fixed = |a: &Atom| a.ground() && self.domain.predicates.is_static(a.predicate);
+        match precondition {
+            Formula::Conjunction(cs) => cs.iter().all(|c| self.statically_applicable(c)),
+            Formula::Atom(a) if fixed(a) => self.problem.init_atoms.contains(a),
+            Formula::Negation(a) if fixed(a) => !self.problem.init_atoms.contains(a),
+            _ => true,
+        }
     }
 
     fn instantiate(
@@ -1886,6 +1901,24 @@ mod review_tests {
         };
         let problem = lower_problem(&p, &domain).unwrap();
         (domain, problem)
+    }
+
+    #[test]
+    fn cartesian_grounding_drops_instances_failing_a_static_precondition() {
+        let read = |path: &str| read_pddl(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let ParsedUnit::Domain(d) = read("examples/ferry-domain.pddl") else {
+            panic!("domain")
+        };
+        let domain = lower_domain(&d).unwrap();
+        let ParsedUnit::Problem(p) = read("examples/test-ferry.pddl") else {
+            panic!("problem")
+        };
+        let problem = lower_problem(&p, &domain).unwrap();
+        let params = Parameters::default();
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        // 3 schemas x 5^2 untyped tuples = 75; only board/debark(c1|c2, a|b)
+        // and sail(a<->b) satisfy `auto`/`place`/`=`.
+        assert_eq!(ctx.ground_actions().len(), 10);
     }
 
     #[test]
