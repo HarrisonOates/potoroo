@@ -1,0 +1,5 @@
+{
+  "status": "superseded",
+  "issue": "Diagnostic::from_env used struct-update Default on a Drop type, emitting an extra zero-valued record. Strict one-record parser rejected output. Raw runs and validated search statistics preserved; v2 changes constructor to avoid the temporary and reruns paired diagnostics.",
+  "v2_sampling": "Increase paired node budget from 50000 to 500000 because the high-branching Pipesworld searches had fewer than 1024 expansions and sampled only their empty initial plan."
+}

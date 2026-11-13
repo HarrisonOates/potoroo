@@ -1,0 +1,43 @@
+{
+  "commands": [
+    "cargo test --lib --bin potoroo",
+    "cargo build --release --bin potoroo",
+    "git diff --check"
+  ],
+  "library_passed": 229,
+  "library_ignored": 1,
+  "binary_passed": 13,
+  "release_build": "passed",
+  "diff_check": "passed",
+  "binary_sha256": "ac634f0e954f8e30b82f83bae74c639c9dff43cc6b6966c05a371d746c278dec",
+  "witness_followup": {
+    "command": "cargo test --lib committed_support_can_raise_relax_rank_while_add_stays_flat",
+    "passed": 1,
+    "FF_g_plus_h": [
+      3,
+      3,
+      4
+    ],
+    "FFR_g_plus_h": [
+      3,
+      3,
+      4
+    ],
+    "ADD_g_plus_h": [
+      4,
+      4,
+      4
+    ],
+    "REPOP_g_plus_h": [
+      3,
+      3,
+      3
+    ],
+    "source_sha256": "bd0977ae16cbe7a1e53bf10c921a89c37c6bf32e7cbb868a8b645c2588468446"
+  },
+  "logs": {
+    "target/relax-investigation/ff-validation/unit-tests.log": "33755eb6c6e44e596b108621acedb744ad47f196ce95c60db41649799a390442",
+    "target/relax-investigation/ff-validation/release-build.log": "916c6052d0f02fa08dc4ed703524329f7208ee2d2308efecc242e0d4a7c0e70d",
+    "target/relax-investigation/ff-validation/witness.log": "fcdf029e6ac05836e15103c83319ea041583cebda24648f8879b9f7d2a63ff81"
+  }
+}

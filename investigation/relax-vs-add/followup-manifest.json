@@ -1,0 +1,416 @@
+[
+  {
+    "label": "fdr-gripper-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-gripper-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-gripper-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-miconic-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-miconic-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-miconic-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-childsnack-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-childsnack-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-childsnack-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-elevators-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-elevators-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-elevators-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-logistics-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-logistics-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-logistics-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/logistics/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-satellite-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-satellite-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-satellite-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-parcprinter-corrected-add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/domain-p03.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-parcprinter-corrected-relax",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/domain-p03.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-parcprinter-relax_gbfs_add",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/domain-p03.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/ADD/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-parcprinter-relax_gbfs_oc",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/domain-p03.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAX/OC/LIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1"
+    ]
+  },
+  {
+    "label": "fdr-parcprinter-relaxr",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/domain-p03.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/parcprinter/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "RELAXR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1"
+    ]
+  }
+]

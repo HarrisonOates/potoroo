@@ -1,0 +1,386 @@
+{
+  "records": [
+    {
+      "case": "thoughtful-p01",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/fd5d723182e9d8b7591066081935f55c72ab733a799db5a260d74375bfff00d6.sas",
+      "sas_sha256": "fd5d723182e9d8b7591066081935f55c72ab733a799db5a260d74375bfff00d6",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom clear(dt)",
+          "ground_achievers": 222,
+          "action_families": {
+            "col-to-home": 2,
+            "home-to-col": 2,
+            "move-col-to-col": 2,
+            "tal-to-col": 170,
+            "tal-to-col-b": 34,
+            "tal-to-col-c": 10,
+            "tal-to-col-d": 2
+          }
+        },
+        {
+          "symbol": "Atom talonplayable(ht)",
+          "ground_achievers": 602,
+          "action_families": {
+            "tal-to-col": 332,
+            "tal-to-col-b": 6,
+            "tal-to-col-c": 34,
+            "tal-to-col-e": 6,
+            "tal-to-col-g": 6,
+            "tal-to-home": 171,
+            "tal-to-home-b": 3,
+            "tal-to-home-c": 19,
+            "turn-deck": 3,
+            "turn-deck-a": 22
+          }
+        },
+        {
+          "symbol": "Atom talonplayable(s7)",
+          "ground_achievers": 658,
+          "action_families": {
+            "tal-to-col": 370,
+            "tal-to-col-b": 4,
+            "tal-to-col-c": 36,
+            "tal-to-col-e": 6,
+            "tal-to-col-g": 6,
+            "tal-to-home": 190,
+            "tal-to-home-b": 2,
+            "tal-to-home-c": 20,
+            "turn-deck": 2,
+            "turn-deck-a": 22
+          }
+        },
+        {
+          "symbol": "Atom talonplayable(dt)",
+          "ground_achievers": 499,
+          "action_families": {
+            "tal-to-col": 262,
+            "tal-to-col-b": 10,
+            "tal-to-col-c": 30,
+            "tal-to-col-e": 6,
+            "tal-to-col-g": 6,
+            "tal-to-home": 136,
+            "tal-to-home-b": 5,
+            "tal-to-home-c": 17,
+            "turn-deck": 5,
+            "turn-deck-a": 22
+          }
+        }
+      ]
+    },
+    {
+      "case": "pipesworld-tankage-p01",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/f25d12e5ed561a1a9dd0364c5716800ccc3fb5232951cd55375d2a2f7b08ef8a.sas",
+      "sas_sha256": "f25d12e5ed561a1a9dd0364c5716800ccc3fb5232951cd55375d2a2f7b08ef8a",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom normal(s13)",
+          "ground_achievers": 520,
+          "action_families": {
+            "pop-end": 360,
+            "push-end": 160
+          }
+        },
+        {
+          "symbol": "Atom normal(s12)",
+          "ground_achievers": 520,
+          "action_families": {
+            "pop-end": 360,
+            "push-end": 160
+          }
+        },
+        {
+          "symbol": "Atom occupied(ta1-1-gasoleo)",
+          "ground_achievers": 180,
+          "action_families": {
+            "pop-end": 180
+          }
+        },
+        {
+          "symbol": "Atom occupied(ta1-2-gasoleo)",
+          "ground_achievers": 180,
+          "action_families": {
+            "pop-end": 180
+          }
+        }
+      ]
+    },
+    {
+      "case": "pipesworld-notankage-p01",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/268a5d6bd83dff3f670ede4c8ef39ae8384ed8a9ae824841870dc6f61d0a5338.sas",
+      "sas_sha256": "268a5d6bd83dff3f670ede4c8ef39ae8384ed8a9ae824841870dc6f61d0a5338",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom normal(s12)",
+          "ground_achievers": 252,
+          "action_families": {
+            "pop-end": 126,
+            "push-end": 126
+          }
+        },
+        {
+          "symbol": "Atom pop-updating(s12)",
+          "ground_achievers": 126,
+          "action_families": {
+            "pop-start": 126
+          }
+        },
+        {
+          "symbol": "Atom push-updating(s12)",
+          "ground_achievers": 126,
+          "action_families": {
+            "push-start": 126
+          }
+        },
+        {
+          "symbol": "Atom last(b0, s12)",
+          "ground_achievers": 22,
+          "action_families": {
+            "pop-start": 11,
+            "push-end": 11
+          }
+        }
+      ]
+    },
+    {
+      "case": "sokoban-p02",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/257156201a299df0ea6771081d9ceb60b57eb7b04fed55e02b76661c1df27d34.sas",
+      "sas_sha256": "257156201a299df0ea6771081d9ceb60b57eb7b04fed55e02b76661c1df27d34",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom at(player-01, pos-3-3)",
+          "ground_achievers": 12,
+          "action_families": {
+            "move": 4,
+            "push-to-nongoal": 8
+          }
+        },
+        {
+          "symbol": "Atom at(player-01, pos-3-4)",
+          "ground_achievers": 12,
+          "action_families": {
+            "move": 4,
+            "push-to-goal": 2,
+            "push-to-nongoal": 6
+          }
+        },
+        {
+          "symbol": "Atom clear(pos-3-5)",
+          "ground_achievers": 7,
+          "action_families": {
+            "move": 3,
+            "push-to-goal": 2,
+            "push-to-nongoal": 2
+          }
+        },
+        {
+          "symbol": "Atom at(player-01, pos-4-3)",
+          "ground_achievers": 7,
+          "action_families": {
+            "move": 3,
+            "push-to-nongoal": 4
+          }
+        }
+      ]
+    },
+    {
+      "case": "parcprinter-p05",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/12b6acbdbd6163e41bf00e3376747182f1536638ae0ee38bf586cfd61b6f5ad4.sas",
+      "sas_sha256": "12b6acbdbd6163e41bf00e3376747182f1536638ae0ee38bf586cfd61b6f5ad4",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom location(sheet1, fe1_exit-im1_feedentry)",
+          "ground_achievers": 2,
+          "action_families": {
+            "fe1-feed-letter": 1,
+            "fe1-feedmsi-letter": 1
+          }
+        },
+        {
+          "symbol": "Atom location(sheet1, some_feeder_tray)",
+          "ground_achievers": 0,
+          "action_families": {}
+        },
+        {
+          "symbol": "Atom location(sheet1, lc1_exit-lc2_entry)",
+          "ground_achievers": 4,
+          "action_families": {
+            "lc1-fmove-letter": 1,
+            "lc1-merge-letter": 1,
+            "lc1-mergeinvert-letter": 2
+          }
+        },
+        {
+          "symbol": "Atom location(sheet1, uc2_entry-uc1_exit)",
+          "ground_achievers": 4,
+          "action_families": {
+            "uc1-fmove-letter": 1,
+            "uc1-merge-letter": 1,
+            "uc1-mergeinvert-letter": 2
+          }
+        }
+      ],
+      "availability_assignments": [
+        {
+          "operator": "initialize ",
+          "variable": 14,
+          "value": "Atom available(fe1-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 13,
+          "value": "Atom available(im1-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 12,
+          "value": "Atom available(lbe-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 11,
+          "value": "Atom available(lc1-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 10,
+          "value": "Atom available(lc2-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 9,
+          "value": "Atom available(lre-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 8,
+          "value": "Atom available(om-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 7,
+          "value": "Atom available(rh1-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 6,
+          "value": "Atom available(rh2-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 5,
+          "value": "Atom available(sys-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 4,
+          "value": "Atom available(ube-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 3,
+          "value": "Atom available(uc1-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 2,
+          "value": "Atom available(uc2-rsrc)"
+        },
+        {
+          "operator": "initialize ",
+          "variable": 1,
+          "value": "Atom available(ure-rsrc)"
+        }
+      ]
+    },
+    {
+      "case": "pegsol-p01",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/9074cd8c6fc7ca1f0ec41d5f3c977d1a1202a1e0ace0cb114cb8b38c82bc2317.sas",
+      "sas_sha256": "9074cd8c6fc7ca1f0ec41d5f3c977d1a1202a1e0ace0cb114cb8b38c82bc2317",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom move-ended()",
+          "ground_achievers": 19,
+          "action_families": {
+            "end-move": 19
+          }
+        },
+        {
+          "symbol": "Atom free(pos-3-4)",
+          "ground_achievers": 16,
+          "action_families": {
+            "jump-continue-move": 8,
+            "jump-new-move": 8
+          }
+        },
+        {
+          "symbol": "Atom free(pos-3-2)",
+          "ground_achievers": 16,
+          "action_families": {
+            "jump-continue-move": 8,
+            "jump-new-move": 8
+          }
+        },
+        {
+          "symbol": "Atom occupied(pos-3-4)",
+          "ground_achievers": 8,
+          "action_families": {
+            "jump-continue-move": 4,
+            "jump-new-move": 4
+          }
+        }
+      ]
+    },
+    {
+      "case": "freecell-p02",
+      "sas": "target/relax-investigation/ff-gap-condition-sas/66487edc1de22dfa1e4d21794810bba95c43aeb468052927ae5ed1c10d26e449.sas",
+      "sas_sha256": "66487edc1de22dfa1e4d21794810bba95c43aeb468052927ae5ed1c10d26e449",
+      "top_fact_achievers": [
+        {
+          "symbol": "Atom colspace(coln2)",
+          "ground_achievers": 124,
+          "action_families": {
+            "move-b": 16,
+            "newcolfromfreecell": 32,
+            "sendtofree-b": 32,
+            "sendtohome-b": 16,
+            "sendtonewcol": 28
+          }
+        },
+        {
+          "symbol": "Atom cellspace(celln2)",
+          "ground_achievers": 128,
+          "action_families": {
+            "colfromfreecell": 16,
+            "homefromfreecell": 16,
+            "newcolfromfreecell": 96
+          }
+        },
+        {
+          "symbol": "Atom colspace(coln3)",
+          "ground_achievers": 124,
+          "action_families": {
+            "move-b": 16,
+            "newcolfromfreecell": 32,
+            "sendtofree-b": 32,
+            "sendtohome-b": 16,
+            "sendtonewcol": 28
+          }
+        },
+        {
+          "symbol": "Atom cellspace(celln1)",
+          "ground_achievers": 252,
+          "action_families": {
+            "colfromfreecell": 16,
+            "homefromfreecell": 16,
+            "newcolfromfreecell": 96,
+            "sendtofree": 28,
+            "sendtofree-b": 96
+          }
+        }
+      ]
+    }
+  ],
+  "script_sha256": "05b587d8290b4a277885a3f170023e793f515ca342b1d7a5c2265c5004618f0a",
+  "attribution_sha256": "7604bdbb1ac7239c0406f1ecf2014875cb2992b17494cfa615806c28cd05536a"
+}

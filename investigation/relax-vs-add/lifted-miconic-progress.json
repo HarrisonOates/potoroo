@@ -1,0 +1,22 @@
+[
+  {
+    "instance": "p01",
+    "status": "memout",
+    "last_h_evals": 11340906,
+    "last_h_eval_ms": 159000,
+    "us_per_eval": 14.02004390125445,
+    "wall_ms": 360339,
+    "fraction_h_time": 0.44125115516222224,
+    "source": "last progress sample in error_tail"
+  },
+  {
+    "instance": "p09",
+    "status": "memout",
+    "last_h_evals": 2013857,
+    "last_h_eval_ms": 796825,
+    "us_per_eval": 395.67109283330444,
+    "wall_ms": 1091619,
+    "fraction_h_time": 0.7299479030687447,
+    "source": "last progress sample in error_tail"
+  }
+]

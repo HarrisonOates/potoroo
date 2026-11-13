@@ -1,0 +1,117 @@
+{
+  "validated": 11,
+  "validator_sha256": "5742ad9b718d7c8e54cd81300d4ae4438b5294fa4ead0f881367de2b0df60bf2",
+  "sas_validator_sha256": "e2062ccb326c9de49468e499ee6e742d58e81fae3386600c25cac745047b2022",
+  "records": [
+    {
+      "label": "miconic-p01-ffoc_ff",
+      "length": 56,
+      "cost": 56,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/006-miconic-p01-ffoc_ff.out": "e6b757ad49ac7056ad71e3e1477aaac276c6e67d5222326b3668d4f111f794b0",
+        "target/relax-investigation/ff-ties/006-miconic-p01-ffoc_ff.replay.plan": "778ef311443adfe2b998e15d2da644609d9595980fbb63767a5e5b5b06490511",
+        "target/relax-investigation/ff-ties-sas/5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40.sas": "5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40"
+      }
+    },
+    {
+      "label": "miconic-p01-ffoc_ffr",
+      "length": 56,
+      "cost": 56,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/007-miconic-p01-ffoc_ffr.out": "6a7b89a4e0f1cf7fc0620aefb30ae5318d14f12fcf21186ae29dbae432a1324b",
+        "target/relax-investigation/ff-ties/007-miconic-p01-ffoc_ffr.replay.plan": "69549423d29057a1a0e0f7962d34131d097f9844884a8f6b5ba79b081f4edb13",
+        "target/relax-investigation/ff-ties-sas/5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40.sas": "5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40"
+      }
+    },
+    {
+      "label": "miconic-p01-add_ffr",
+      "length": 56,
+      "cost": 56,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/008-miconic-p01-add_ffr.out": "5d4496be36d37a17114e8cf55cc3fd0542ec174dbea8a721b678264b700f3aa9",
+        "target/relax-investigation/ff-ties/008-miconic-p01-add_ffr.replay.plan": "69549423d29057a1a0e0f7962d34131d097f9844884a8f6b5ba79b081f4edb13",
+        "target/relax-investigation/ff-ties-sas/5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40.sas": "5699b10c36b8fb0b35d7ec115af892b78c413223ee4b83ca73a682f46b902b40"
+      }
+    },
+    {
+      "label": "miconic-p02-ffoc_ff",
+      "length": 70,
+      "cost": 70,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/009-miconic-p02-ffoc_ff.out": "083e3efb6c48e91d0f8f74e5e6727b8034918e35a6588aa15e48d02c4578e004",
+        "target/relax-investigation/ff-ties/009-miconic-p02-ffoc_ff.replay.plan": "76f57eae6bbe13d8f2e5ad8be317ebb7bcca94218925ca665b8a71c498079e2a",
+        "target/relax-investigation/ff-ties-sas/37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87.sas": "37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87"
+      }
+    },
+    {
+      "label": "miconic-p02-ffoc_ffr",
+      "length": 70,
+      "cost": 70,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/010-miconic-p02-ffoc_ffr.out": "f64d5cefe1067d268b402e7ca4aa230ef9613d87236fc9bf892fe64a017ab3d1",
+        "target/relax-investigation/ff-ties/010-miconic-p02-ffoc_ffr.replay.plan": "76f57eae6bbe13d8f2e5ad8be317ebb7bcca94218925ca665b8a71c498079e2a",
+        "target/relax-investigation/ff-ties-sas/37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87.sas": "37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87"
+      }
+    },
+    {
+      "label": "miconic-p02-add_ffr",
+      "length": 70,
+      "cost": 70,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/011-miconic-p02-add_ffr.out": "0c15091eb3bbe3a33a7052c9f5a59bac509394060bd2b55262a37151c87a3c6c",
+        "target/relax-investigation/ff-ties/011-miconic-p02-add_ffr.replay.plan": "76f57eae6bbe13d8f2e5ad8be317ebb7bcca94218925ca665b8a71c498079e2a",
+        "target/relax-investigation/ff-ties-sas/37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87.sas": "37af2fbf090a0522c880d79169918260af0cd3f0b9de7da07c7f3efaf0f7af87"
+      }
+    },
+    {
+      "label": "childsnack-p01-add_ffr",
+      "length": 18,
+      "cost": 18,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/014-childsnack-p01-add_ffr.out": "fd1442e76e6344647766b6610687d9467fea6ed2337db03129e6db7d6e613f23",
+        "target/relax-investigation/ff-ties/014-childsnack-p01-add_ffr.replay.plan": "52dac91fe5ce3dfcfaf119e3312c6f6fe36cc29d5d3b0cd116df5284206b8f5a",
+        "target/relax-investigation/ff-ties-sas/122b93988a2c024f1b8e7f94abe00e841921bba03839da7ba7d6dd004afad76b.sas": "122b93988a2c024f1b8e7f94abe00e841921bba03839da7ba7d6dd004afad76b"
+      }
+    },
+    {
+      "label": "elevators-p02-add_ffr",
+      "length": 42,
+      "cost": 42,
+      "artifacts": {
+        "target/relax-investigation/ff-ties/017-elevators-p02-add_ffr.out": "dbc3c4402c9ad909f93ca88810985c4c12ba6be5bae4314d357f3ba8da09cbc2",
+        "target/relax-investigation/ff-ties/017-elevators-p02-add_ffr.replay.plan": "d102ef36e66f1d8ba9f6c51d0ec15c3909f342046540eefdd93afdfb344909d2",
+        "target/relax-investigation/ff-ties-sas/7a0a3e478c0d823e2fb1f420fe1dc86bfd3b401916d3d1261e1d3f97d2daa4fd.sas": "7a0a3e478c0d823e2fb1f420fe1dc86bfd3b401916d3d1261e1d3f97d2daa4fd"
+      }
+    },
+    {
+      "label": "satellite-p01-ffoc_ff",
+      "length": 14,
+      "cost": 14,
+      "artifacts": {
+        "target/relax-investigation/ff-ties-vhpop-domains/006-satellite-p01-ffoc_ff.out": "c40365404de2ede3979ca7996c89baa5c393320a7301fd9d3d9489efde89ef1d",
+        "target/relax-investigation/ff-ties-vhpop-domains/006-satellite-p01-ffoc_ff.replay.plan": "cd561c57f86f621c42085ab6563fcb88e13e9f633bec410363c5a22f3e5c0bb0",
+        "target/relax-investigation/ff-ties-vhpop-domains-sas/4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991.sas": "4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991"
+      }
+    },
+    {
+      "label": "satellite-p01-ffoc_ffr",
+      "length": 14,
+      "cost": 14,
+      "artifacts": {
+        "target/relax-investigation/ff-ties-vhpop-domains/007-satellite-p01-ffoc_ffr.out": "7ff186d4cd7dbf6843a6d0481241ebc7ac5d8d0280f2aba3b049678e44e9c05d",
+        "target/relax-investigation/ff-ties-vhpop-domains/007-satellite-p01-ffoc_ffr.replay.plan": "cd561c57f86f621c42085ab6563fcb88e13e9f633bec410363c5a22f3e5c0bb0",
+        "target/relax-investigation/ff-ties-vhpop-domains-sas/4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991.sas": "4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991"
+      }
+    },
+    {
+      "label": "satellite-p01-add_ffr",
+      "length": 14,
+      "cost": 14,
+      "artifacts": {
+        "target/relax-investigation/ff-ties-vhpop-domains/008-satellite-p01-add_ffr.out": "2ee27548dfd586511bd0728fca05555ab257858e1c399da982fce2352b55d4f7",
+        "target/relax-investigation/ff-ties-vhpop-domains/008-satellite-p01-add_ffr.replay.plan": "cd561c57f86f621c42085ab6563fcb88e13e9f633bec410363c5a22f3e5c0bb0",
+        "target/relax-investigation/ff-ties-vhpop-domains-sas/4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991.sas": "4f3c4ea54e2d92253acc0da62a2b1197e326b9291b8ad2dcf233cf8d924b9991"
+      }
+    }
+  ]
+}

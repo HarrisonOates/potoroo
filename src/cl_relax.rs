@@ -64,8 +64,6 @@ pub struct CompiledRelaxation {
     num_operators: usize,
 }
 
-const UNREACHED: u32 = u32::MAX;
-
 impl CompiledRelaxation {
     /// `effect_requirements[o][e]` are the facts effect `e` of operator `o`
     /// needs: the operator's preconditions and the effect's conditions.
@@ -254,7 +252,8 @@ impl CompiledRelaxation {
 
     /// Evaluates the compiled task for a plan with these steps. `None` when
     /// some step can never run or some goal is unreachable — the plan has no
-    /// completion.
+    /// completion. Finite numeric costs saturate at u32::MAX; saturation
+    /// never turns a reached fact into a dead end.
     pub fn evaluate(&self, steps: &[CompiledStep]) -> Option<Estimate> {
         // Facts: the task's, then `done(s)` for each step. Actions: the
         // static ones, then per step one `run` action and one per conditional
@@ -287,7 +286,8 @@ impl CompiledRelaxation {
         dynamic_pre.sort_unstable();
 
         let num_static = self.actions.len();
-        let mut fact_cost = vec![UNREACHED; num_facts];
+        // A saturated finite cost is still reachable; None alone means unreachable.
+        let mut fact_cost = vec![None; num_facts];
         let mut achiever: Vec<Option<usize>> = vec![None; num_facts];
         let mut unsatisfied: Vec<usize> = self
             .actions
@@ -301,11 +301,11 @@ impl CompiledRelaxation {
         let relax = |fact: usize,
                      cost: u32,
                      by: Option<usize>,
-                     fact_cost: &mut [u32],
+                     fact_cost: &mut [Option<u32>],
                      achiever: &mut [Option<usize>],
                      queue: &mut BinaryHeap<(Reverse<u32>, Reverse<usize>)>| {
-            if cost < fact_cost[fact] {
-                fact_cost[fact] = cost;
+            if fact_cost[fact].is_none_or(|old| cost < old) {
+                fact_cost[fact] = Some(cost);
                 achiever[fact] = by;
                 queue.push((Reverse(cost), Reverse(fact)));
             }
@@ -340,14 +340,14 @@ impl CompiledRelaxation {
         }
 
         while let Some((Reverse(cost), Reverse(fact))) = queue.pop() {
-            if cost != fact_cost[fact] {
+            if Some(cost) != fact_cost[fact] {
                 continue;
             }
             let fire =
                 |action: usize,
                  unsatisfied: &mut [usize],
                  pre_sum: &mut [u32],
-                 fact_cost: &mut [u32],
+                 fact_cost: &mut [Option<u32>],
                  achiever: &mut [Option<usize>],
                  queue: &mut BinaryHeap<(Reverse<u32>, Reverse<usize>)>| {
                     unsatisfied[action] -= 1;
@@ -399,10 +399,7 @@ impl CompiledRelaxation {
         let mut add: u32 = 0;
         let mut stack: Vec<usize> = Vec::new();
         for goal in goals {
-            let cost = fact_cost[goal];
-            if cost == UNREACHED {
-                return None;
-            }
+            let cost = fact_cost[goal]?;
             add = add.saturating_add(cost);
             stack.push(goal);
         }

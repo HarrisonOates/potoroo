@@ -1,0 +1,10 @@
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running tests/relax_diagnostic.rs (target/release/deps/relax_diagnostic-401e17a4dc3494c3)
+
+running 1 test
+kind,visited,steps,opens,h_add,h_relax,f_add,f_relax,add_ns,relax_ns
+sample,0,0,150,600,408,600,408,1687,8453987
+test compare_literal_heuristics_on_identical_plans ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+

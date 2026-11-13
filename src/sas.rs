@@ -26,6 +26,8 @@ pub struct GroundTask {
 #[derive(Debug, Clone)]
 pub struct GroundOp {
     pub name: String,
+    /// Resolved action cost, including zero-cost actions.
+    pub cost: usize,
     /// Precondition: each `(fact, required-truth)`.
     pub pre: Vec<(usize, bool)>,
     /// Effects.
@@ -107,7 +109,7 @@ impl GroundTask {
 
         let mut s = String::new();
         s.push_str("begin_version\n3\nend_version\n");
-        s.push_str("begin_metric\n0\nend_metric\n");
+        s.push_str("begin_metric\n1\nend_metric\n");
 
         // Variables (one binary variable per fact; var index = fact id).
         let _ = writeln!(s, "{}", self.facts.len());
@@ -196,8 +198,7 @@ impl GroundOp {
             let _ = writeln!(s, "{line} {} {} {}", e.fact, pre, v(e.value));
         }
 
-        // Unit cost (metric 0).
-        s.push_str("1\n");
+        let _ = writeln!(s, "{}", self.cost);
         s.push_str("end_operator\n");
         s
     }
@@ -221,6 +222,7 @@ mod tests {
         let p = t.add_fact("p", false);
         t.add_goal(p, true);
         t.add_op(GroundOp {
+            cost: 1,
             name: "make-p".to_string(),
             pre: vec![],
             effects: vec![GroundEffect {
@@ -248,6 +250,7 @@ mod tests {
         let q = t.add_fact("q", false);
         t.add_goal(q, true);
         t.add_op(GroundOp {
+            cost: 1,
             name: "a1".to_string(),
             pre: vec![],
             effects: vec![GroundEffect {
@@ -257,6 +260,7 @@ mod tests {
             }],
         });
         t.add_op(GroundOp {
+            cost: 1,
             name: "a2".to_string(),
             pre: vec![(p, true)],
             effects: vec![GroundEffect {

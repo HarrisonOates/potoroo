@@ -1,0 +1,383 @@
+{
+  "provenance": {
+    "binary": "/home/harrison/Documents/Github/downward/builds/release/bin/downward",
+    "binary_sha256": "97409711a90d08c162e263f1fddf7df49bd1604e7c4ab4d120b359d8a29305f9",
+    "revision": "acc6438c7c927ac4de45c2baf263956bfba189e0",
+    "source_hashes": {
+      "src/search/heuristics/ff_heuristic.cc": "b0841687d823b166ff2d552b14fc421b111518be9b2658449bae850e29df0395",
+      "src/search/search_algorithms/plugin_eager_greedy.cc": "6b0709c56864ea29787356bb70dec65bcb3d07d5f84afdb82370cc1d044edbc4"
+    },
+    "script_sha256": "3d359c0d6aee011e213b4ea450d0344e95aa36db3c16b003033e0c441862949a",
+    "pocl_summary_sha256": "0afce50b213dc2f62e7cae77caa64452581f50da55af0efe5b6a8e20debc1723",
+    "seconds": 15,
+    "watchdog_seconds": 20,
+    "address_space_mb": 1536,
+    "rss_stop_mb": 512,
+    "note": "FD search only on identical pretranslated SAS; POCL 15s includes translation. RSS monitored at 50ms intervals; unlike native POCL stop, this kills FD on overflow. Both have 1536MiB per-process address-space limit. No claim of identical end-to-end timing budget."
+  },
+  "records": [
+    {
+      "case": "thoughtful-p01",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 12,
+      "solved": false,
+      "stop_reason": "fd_exit_12",
+      "external_ms": 15155,
+      "sampled_peak_rss_kb": 21456,
+      "cost": null,
+      "length": null,
+      "generated": 167621,
+      "expanded": 31071,
+      "sas_sha256": "fd5d723182e9d8b7591066081935f55c72ab733a799db5a260d74375bfff00d6",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-astar.out": "d925793c29ad55898d2ac1f103b89d28b5aa11a9185c30b8c258fbad4c01fd73",
+        "target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "case": "thoughtful-p01",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 251,
+      "sampled_peak_rss_kb": 19084,
+      "cost": 96,
+      "length": 96,
+      "generated": 931,
+      "expanded": 179,
+      "sas_sha256": "fd5d723182e9d8b7591066081935f55c72ab733a799db5a260d74375bfff00d6",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-gbfs_pref.out": "06521011681240f43b7c051a5cbf540ac4f38cafa9af257cd322d0e633020a28",
+        "target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/thoughtful-p01-gbfs_pref.plan": "e65a2fd3f98a61b84251e8034b28527030a745dc29e24d907c1295faa034c080"
+      }
+    },
+    {
+      "case": "pipesworld-tankage-p01",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 3212,
+      "sampled_peak_rss_kb": 14364,
+      "cost": 22,
+      "length": 22,
+      "generated": 185585,
+      "expanded": 37332,
+      "sas_sha256": "f25d12e5ed561a1a9dd0364c5716800ccc3fb5232951cd55375d2a2f7b08ef8a",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-astar.out": "6838223efae1831564695da2ba37ba6d2ac7dec33a3be8db08ca838468f3974e",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-astar.plan": "65257b6b12452f3a3d8c97d961d1c418db91ebf08b693691860124068e588e92"
+      }
+    },
+    {
+      "case": "pipesworld-tankage-p01",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 955,
+      "sampled_peak_rss_kb": 11540,
+      "cost": 26,
+      "length": 26,
+      "generated": 41659,
+      "expanded": 7562,
+      "sas_sha256": "f25d12e5ed561a1a9dd0364c5716800ccc3fb5232951cd55375d2a2f7b08ef8a",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-gbfs_pref.out": "c799b9111e75dc4ad5d6e6b2545e1f8923e9002f8be9302b354ca64b5db45651",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-tankage-p01-gbfs_pref.plan": "c73e323b5964cb096fa5fdf818c896979d1d231499f0ca5896deb4ec528dbd5b"
+      }
+    },
+    {
+      "case": "pipesworld-notankage-p01",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 524,
+      "cost": 14,
+      "length": 14,
+      "generated": 2040,
+      "expanded": 350,
+      "sas_sha256": "268a5d6bd83dff3f670ede4c8ef39ae8384ed8a9ae824841870dc6f61d0a5338",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-astar.out": "9733e04c0c956d6a804cc5d4aa63e33fd6fea9154ba8b5a118359e624f6c2fe5",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-astar.plan": "9ae62cbdc107f1327fecaee3e5c43284ff5b0adbe3d4d235598e3f59eaa08e50"
+      }
+    },
+    {
+      "case": "pipesworld-notankage-p01",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 856,
+      "cost": 14,
+      "length": 14,
+      "generated": 149,
+      "expanded": 31,
+      "sas_sha256": "268a5d6bd83dff3f670ede4c8ef39ae8384ed8a9ae824841870dc6f61d0a5338",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-gbfs_pref.out": "6c42fe7e41ef997799e1e7194fc837cbbd90ee6f3b5701c148b13a5c2ba3678c",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pipesworld-notankage-p01-gbfs_pref.plan": "cbcfca97951852421eaf15d2ed4004e172b813620cea3110953c494993e386da"
+      }
+    },
+    {
+      "case": "sokoban-p02",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/sokoban-p02-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 980,
+      "cost": 33,
+      "length": 33,
+      "generated": 537,
+      "expanded": 197,
+      "sas_sha256": "257156201a299df0ea6771081d9ceb60b57eb7b04fed55e02b76661c1df27d34",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-astar.out": "74063de8ac6b0e57a2312118289456aacd59bee550d0ab436d3556b2364c76a2",
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-astar.plan": "34de76b5e6d5bd450c4baf8805d82858e8af53d5471f5496129b76a4a4360d04"
+      }
+    },
+    {
+      "case": "sokoban-p02",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/sokoban-p02-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 1116,
+      "cost": 35,
+      "length": 35,
+      "generated": 487,
+      "expanded": 174,
+      "sas_sha256": "257156201a299df0ea6771081d9ceb60b57eb7b04fed55e02b76661c1df27d34",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-gbfs_pref.out": "6c0cbcd28dd1ff9d45453c5b819ee1e74c8d270bf5efdf571e1f49d5a09c92c4",
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/sokoban-p02-gbfs_pref.plan": "b25756ec92946d72227d11d3b9044dcbf396e6a0937c679f9bef4a38dab1991c"
+      }
+    },
+    {
+      "case": "parcprinter-p05",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 1084,
+      "cost": 25,
+      "length": 25,
+      "generated": 100,
+      "expanded": 28,
+      "sas_sha256": "12b6acbdbd6163e41bf00e3376747182f1536638ae0ee38bf586cfd61b6f5ad4",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-astar.out": "87de5dfe8953127b15057bdcf61e82ac45a857ae7714d240f0904d214febad54",
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-astar.plan": "a7b0c1b3496edf5f7247a46ca876b6f2a2bea9373d980f1354fd8e1d380c9d95"
+      }
+    },
+    {
+      "case": "parcprinter-p05",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 1052,
+      "cost": 25,
+      "length": 25,
+      "generated": 96,
+      "expanded": 26,
+      "sas_sha256": "12b6acbdbd6163e41bf00e3376747182f1536638ae0ee38bf586cfd61b6f5ad4",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-gbfs_pref.out": "afb2ee4bf91eb3de677b61e1a7e020b12d19188b9940c5e201c88e29dd45711d",
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/parcprinter-p05-gbfs_pref.plan": "6f7f527a5f1228e47f48a64441fc50d3c8f2545db0c26140bd33ec0278407045"
+      }
+    },
+    {
+      "case": "pegsol-p01",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pegsol-p01-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 868,
+      "cost": 18,
+      "length": 18,
+      "generated": 2568,
+      "expanded": 1076,
+      "sas_sha256": "9074cd8c6fc7ca1f0ec41d5f3c977d1a1202a1e0ace0cb114cb8b38c82bc2317",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-astar.out": "9dcd1ce341854743bf757dff4d597929a2ea7defa2ba7781d133cee2de95804f",
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-astar.plan": "bfe78f5ed0f86c6c02fb3bc48e7445b1b36ce8c7b63d3849e63ab49c724a65df"
+      }
+    },
+    {
+      "case": "pegsol-p01",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/pegsol-p01-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 728,
+      "cost": 21,
+      "length": 21,
+      "generated": 163,
+      "expanded": 67,
+      "sas_sha256": "9074cd8c6fc7ca1f0ec41d5f3c977d1a1202a1e0ace0cb114cb8b38c82bc2317",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-gbfs_pref.out": "fd1ab4487ed69cf8d852318b8daa5734663551f390b2ee655e9845ac37e89990",
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/pegsol-p01-gbfs_pref.plan": "060b4d240de6d90b2d73c4025c49b64fee5eb03fd0ce11e7ad6fa5255369a07c"
+      }
+    },
+    {
+      "case": "freecell-p02",
+      "profile": "astar",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/freecell-p02-astar.plan",
+        "--search",
+        "astar(ff(),max_time=15)"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 940,
+      "cost": 22,
+      "length": 22,
+      "generated": 196,
+      "expanded": 26,
+      "sas_sha256": "66487edc1de22dfa1e4d21794810bba95c43aeb468052927ae5ed1c10d26e449",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-astar.out": "4d0407cff5996ec8ac0429ee9792bea4b0dbe41760a4776e013dbc99d095a204",
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-astar.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-astar.plan": "b647a3fc1c4f4bfe2ca5a18970344ef3a62c2769063102730b84ecb0e4d0c9e0"
+      }
+    },
+    {
+      "case": "freecell-p02",
+      "profile": "gbfs_pref",
+      "command": [
+        "/home/harrison/Documents/Github/potoroo/downward/builds/release/bin/downward",
+        "--internal-plan-file",
+        "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-gap-screen-fd/freecell-p02-gbfs_pref.plan",
+        "--search",
+        "let(h,ff(),eager_greedy([h],preferred=[h],max_time=15))"
+      ],
+      "returncode": 0,
+      "solved": true,
+      "stop_reason": "solved",
+      "external_ms": 51,
+      "sampled_peak_rss_kb": 1112,
+      "cost": 21,
+      "length": 21,
+      "generated": 120,
+      "expanded": 22,
+      "sas_sha256": "66487edc1de22dfa1e4d21794810bba95c43aeb468052927ae5ed1c10d26e449",
+      "artifact_hashes": {
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-gbfs_pref.out": "216babe88a189ba891464557b9e0e5fd19a972ba27f1e142e4ab2c7b8ff91485",
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-gbfs_pref.err": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "target/relax-investigation/ff-gap-screen-fd/freecell-p02-gbfs_pref.plan": "3c6a553abea2eb1e16ae584628494b4ac5d1b675531a5aa5d30f341be6bfeef3"
+      }
+    }
+  ]
+}
