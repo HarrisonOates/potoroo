@@ -1,6 +1,0 @@
-{
-  "source_archive": "target/relax-investigation/ff-gap-condition-frozen/source.tar.gz",
-  "source_archive_sha256": "da5bdf4adcf0371b41ee99f412510b062472535ff870aa3fb3462d434bed77b6",
-  "binary": "target/relax-investigation/ff-gap-condition-frozen/potoroo",
-  "binary_sha256": "77417d67b600486f408f9f717b484b397f47ac217c754951473fb86f3d64507c"
-}

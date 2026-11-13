@@ -1,6 +1,0 @@
-{
-  "binary": "target/relax-investigation/ff-types-frozen/potoroo",
-  "binary_sha256": "851b9280a311e5b81434c6c231f1b5f3e9436f3c3b2502c0ad6ba758c6f68911",
-  "source_archive": "target/relax-investigation/ff-types-frozen/source.tar.gz",
-  "source_archive_sha256": "cd87492ca4ce78ee99a99bb3df483d6e3c441911e72daefe65f01a056adc3459"
-}

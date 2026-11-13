@@ -1,6 +1,0 @@
-{
-  "source_archive": "target/relax-investigation/repop-frozen/source.tar.gz",
-  "source_archive_sha256": "b93b73f76a461bfc9f5c7179c436ffd5918f841ef560d9c51da804fc3d7544a5",
-  "binary": "target/relax-investigation/repop-frozen/potoroo",
-  "binary_sha256": "e63dd6f426ef97456ad9995fd86a5b69416df5274c2b4ee98a8ba6fa689ab16d"
-}

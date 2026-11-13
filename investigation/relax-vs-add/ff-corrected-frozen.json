@@ -1,6 +1,0 @@
-{
-  "source_archive": "target/relax-investigation/ff-corrected-frozen/source.tar.gz",
-  "source_archive_sha256": "443fba984d1134e4e146b1c7c76caf296060b4e68cb24265027d102db8bc9b2a",
-  "binary": "target/relax-investigation/ff-corrected-frozen/potoroo",
-  "binary_sha256": "d13d70b75b76efc3002bc4a5e7e421285ce05a685393bc1e70dfbd6f19f94f3d"
-}

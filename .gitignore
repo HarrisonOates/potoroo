@@ -2,4 +2,4 @@
 /.cargo/config.toml
 /.env
 __pycache__/
-/investigation/*/bin/
+/investigation/

@@ -18,10 +18,7 @@ use super::plan::{refine_open, refine_threat, Ctx, GlobalTypes, Plan};
 use super::task::{LiftedTask, Unsupported};
 
 /// The lanes run when none are given: ZLIFO and MW-Loc ranked by lifted
-/// TADD, the second with degree binding. On the 10 s panel screen each TADD
-/// lane beats its ADD counterpart alone, and the pair (125/420) beats five
-/// ADD/PADD lanes (113) and a third TADD lane (119): every lane divides the
-/// budget (`investigation/lifted-fdr/findings.md`).
+/// TADD, the second with degree binding. Lanes share the search budget.
 pub const DEFAULT_LANES: [&str; 2] = ["ZLIFO@TADD", "MW-Loc@TADD+deg"];
 
 /// One independent best-first search: a flaw order and a ranking heuristic.
