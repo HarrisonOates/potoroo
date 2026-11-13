@@ -1,0 +1,31 @@
+{
+  "original_ff_url": "https://fai.cs.uni-saarland.de/hoffmann/ff/FF-v2.3.tgz",
+  "original_ff_archive": "target/relax-investigation/references/FF-v2.3.tgz",
+  "original_ff_sha256": "3d80fa30bb64b14de3a5156e202fc764301efbbb777fe3b703e67139a6150c88",
+  "original_ff_function": "relax.c::achieve_goals, lines783-854",
+  "downward_root": "/home/harrison/Documents/Github/downward",
+  "downward_revision": "acc6438c7c927ac4de45c2baf263956bfba189e0",
+  "downward_sources": {
+    "src/search/heuristics/ff_heuristic.cc": "b0841687d823b166ff2d552b14fc421b111518be9b2658449bae850e29df0395",
+    "src/search/heuristics/additive_heuristic.cc": "a3a4b599cbd3be696fa76923e0caf34ab37eb0742b636a54117f56539965df73",
+    "src/search/heuristics/relaxation_heuristic.cc": "8c025af56eca7ed44fcbf27c7168f05bbbf2b3807130fa7dbb4e68f21478fefb"
+  },
+  "fixture": {
+    "sas": "target/relax-investigation/references/shared-support.sas",
+    "sas_sha256": "7813819f3ac15f8f225d2e1491e7ae48bc4dcab3f4fc85fe2bc8d17eaaa103ab",
+    "fd_output": "target/relax-investigation/references/shared-support-fd.log",
+    "fd_output_sha256": "a02a56845c43a919c1b41beb95356201710ae84798bd98719f88c33b274b1ce3",
+    "fd_binary_sha256": "97409711a90d08c162e263f1fddf7df49bd1604e7c4ab4d120b359d8a29305f9",
+    "command": [
+      "downward/builds/release/bin/downward",
+      "--internal-plan-file",
+      "target/relax-investigation/references/shared-support.plan",
+      "--search",
+      "astar(ff())"
+    ],
+    "stdin": "target/relax-investigation/references/shared-support.sas",
+    "fd_initial_ff": 4,
+    "native_ff": 3,
+    "native_test": "ff::tests::later_effects_cannot_erase_an_earlier_actions_required_support"
+  }
+}

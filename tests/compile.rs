@@ -192,3 +192,44 @@ fn compile_heuristic_solves_sussman() {
     };
     is_valid_solution(&solution, &ctx).expect("COMPILE_FF solution must be valid");
 }
+
+#[test]
+fn compiled_costs_survive_ground_and_pddl_paths() {
+    use potoroo::compile::ground_task;
+    use potoroo::params::ActionCost;
+    let ParsedUnit::Domain(d) = read_pddl("(define (domain costs) (:requirements :strips :action-costs) (:predicates (p) (q)) (:functions (total-cost)) (:action p :parameters () :precondition (and) :effect (and (p) (increase (total-cost) 0))) (:action q :parameters () :precondition (p) :effect (and (q) (increase (total-cost) 5))))").unwrap() else { panic!() };
+    let domain = lower_domain(&d).unwrap();
+    let ParsedUnit::Problem(p) = read_pddl("(define (problem costs-p) (:domain costs) (:init (= (total-cost) 0)) (:goal (q)) (:metric minimize (total-cost)))").unwrap() else { panic!() };
+    let problem = lower_problem(&p, &domain).unwrap();
+    for (costs, expected) in [(ActionCost::Task, 5.0), (ActionCost::Unit, 2.0)] {
+        let params = Parameters {
+            ground_actions: true,
+            action_cost: costs,
+            ..Parameters::default()
+        };
+        let ctx = SearchContext::new(&domain, &problem, &params);
+        let mut plan = Plan::make_initial_plan(&ctx).unwrap();
+        loop {
+            let ground = ground_task(&plan, &ctx);
+            if potoroo::external::downward_available() {
+                assert!(
+                    matches!(ground.heuristic(FdHeuristic::LmCut).unwrap(), HResult::Finite(h) if h == expected)
+                );
+            }
+            let (d, p) = CompiledProblem::compile(&plan, &ctx).emit_pddl(&ctx);
+            if fd_available() {
+                assert!(
+                    matches!(run_fd_heuristic(&d, &p, FdHeuristic::LmCut).unwrap(), HResult::Finite(h) if h == expected)
+                );
+            }
+            if plan.complete() {
+                assert_eq!(plan.cost() as f32, expected);
+                break;
+            }
+            let mut children = vec![];
+            plan.refinements(&ctx, &mut children);
+            assert_eq!(children.len(), 1);
+            plan = children.pop().unwrap();
+        }
+    }
+}

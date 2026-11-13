@@ -158,6 +158,14 @@ impl Rank {
         self.fifo &= !(1 << index);
     }
 
+    /// This rank with its first (score) term replaced, for re-queuing a
+    /// partially expanded plan at the next f-value it has children for.
+    pub(crate) fn with_primary_score(mut self, score: f32) -> Self {
+        assert!(self.len > 0 && (self.fifo | self.lifo) & 1 == 0 && !self.saved_primary);
+        self.terms[0] = score;
+        self
+    }
+
     pub(crate) fn fifo(id: usize) -> Self {
         let mut rank = Self::from_slice(&[id as f32]);
         rank.mark_fifo(0);

@@ -1,0 +1,14 @@
+{
+  "frozen": {
+    "binary": "target/relax-investigation/ff-target-frozen/potoroo",
+    "binary_sha256": "4dd5c72ad4df790ee6ad5e2f43523e126118b12345c2a88978782a56e705b023",
+    "source_archive": "target/relax-investigation/ff-target-frozen/source.tar.gz",
+    "source_archive_sha256": "c386723d551e39305b3df0901d440ab1f7832dcb41b6334c12b54791b820ed8b"
+  },
+  "tests": "251 library +14 CLI +15 pruning +11 review regressions passed; one diagnostic ignored; unrelated lifted LPLAN optimality test excluded after original run was interrupted",
+  "logs": {
+    "target/relax-investigation/ff-target-final-tests.log": "1e832d311e6d811c88a1a27d007da7e69d02ad8472323df9ee1fc8f21e0396ae",
+    "target/relax-investigation/ff-target-integration-tests.log": "dc46825d43074e806512f4ad6c5d45cff6be6399fbb846a350bb5ffff2b7d51a",
+    "target/relax-investigation/ff-target-build.log": "6bfa9e18ffdef821c711a542cfebd7db0982665615563e5a191285e489609c6f"
+  }
+}

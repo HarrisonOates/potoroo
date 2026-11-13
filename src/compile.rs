@@ -43,6 +43,7 @@ struct RLit {
 struct CompiledStep {
     /// Step id (used to name its indicator props `exec-pos-N`/`exec-neg-N`).
     id: usize,
+    cost: usize,
     /// Unique action name, e.g. `step-3-puton`.
     name: String,
     /// Leftover unbound variables (index, type) → action parameters.
@@ -197,6 +198,7 @@ impl CompiledProblem {
 
             steps.push(CompiledStep {
                 id: sid,
+                cost: ctx.action_cost(action),
                 name,
                 params,
                 subst,
@@ -266,7 +268,7 @@ impl CompiledProblem {
         if typed {
             reqs.push_str(" :typing");
         }
-        reqs.push_str(" :disjunctive-preconditions :negative-preconditions :conditional-effects)");
+        reqs.push_str(" :disjunctive-preconditions :negative-preconditions :conditional-effects :action-costs)");
         let _ = writeln!(s, "{reqs}");
         if typed {
             let _ = writeln!(s, "  (:types {})", simple_type_names(types).join(" "));
@@ -309,6 +311,8 @@ impl CompiledProblem {
         }
         let _ = writeln!(s, "  )");
 
+        let _ = writeln!(s, "  (:functions (total-cost))");
+
         // Committed step actions.
         for st in &self.steps {
             let _ = writeln!(s, "  (:action {}", st.name);
@@ -347,7 +351,7 @@ impl CompiledProblem {
             for g in &st.add_guards {
                 let _ = write!(s, " (guard-{g})");
             }
-            let _ = writeln!(s, ")");
+            let _ = writeln!(s, " (increase (total-cost) {}))", st.cost);
             let _ = writeln!(s, "  )");
         }
 
@@ -394,7 +398,19 @@ impl CompiledProblem {
                 ctx,
                 typed,
             );
-            let _ = writeln!(s, ")");
+            // Lifted schemas retain their resolved lower-bound cost; the ground
+            // fast path below uses exact instance costs.
+            let declared = if ctx.problem.metric == Some(crate::problem::Metric::MinimizeTotalCost)
+            {
+                schema.cost
+            } else {
+                1
+            };
+            let _ = writeln!(
+                s,
+                " (increase (total-cost) {}))",
+                ctx.params.action_cost.resolve(declared)
+            );
             let _ = writeln!(s, "  )");
         }
 
@@ -411,7 +427,7 @@ impl CompiledProblem {
         // committed-step actions there), so the problem declares none.
 
         // Init: problem init + every step's l₋ + guards true initially.
-        let _ = write!(s, "  (:init");
+        let _ = write!(s, "  (:init (= (total-cost) 0)");
         for atom in &ctx.problem.init_order {
             let _ = write!(s, " {}", render_atom(atom, ctx));
         }
@@ -433,6 +449,7 @@ impl CompiledProblem {
             let _ = write!(s, " (exec-pos-{})", st.id);
         }
         let _ = writeln!(s, "))");
+        let _ = writeln!(s, "  (:metric minimize (total-cost))");
         let _ = writeln!(s, ")");
         s
     }
@@ -609,7 +626,12 @@ pub fn build_base(ctx: &SearchContext) -> BaseGroundTask {
         };
         let effects = flatten_effects(&mut int, &ga.effects);
         let name = ground_action_name(&ga, ctx);
-        int.task.add_op(GroundOp { name, pre, effects });
+        int.task.add_op(GroundOp {
+            name,
+            pre,
+            effects,
+            cost: ctx.action_cost(&ga),
+        });
     }
     let num_original_ops = int.task.num_ops();
     BaseGroundTask {
@@ -750,6 +772,7 @@ pub fn ground_task(plan: &Plan, ctx: &SearchContext) -> GroundTask {
 
         int.task.add_op(GroundOp {
             name: format!("step-{sid}"),
+            cost: ctx.action_cost(&step.action),
             pre,
             effects,
         });

@@ -1,0 +1,13 @@
+{
+  "library_passed": 231,
+  "library_ignored": 1,
+  "binary_passed": 13,
+  "release_build": "passed",
+  "diff_check": "passed",
+  "generated_semantic_cases": 4096,
+  "binary_sha256": "d13d70b75b76efc3002bc4a5e7e421285ce05a685393bc1e70dfbd6f19f94f3d",
+  "logs": {
+    "target/relax-investigation/ff-corrected-validation/unit-tests.log": "79e1aaa6db76f074287fbe5220950605925ed7ad3ba24227a2d1f2259e8f6c17",
+    "target/relax-investigation/ff-corrected-validation/release-build.log": "631c033305c95821fa4e377009a27b9ee4dc13ea068072d6c08de18b9205e4f1"
+  }
+}

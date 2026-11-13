@@ -1,0 +1,217 @@
+{
+  "checked": 30,
+  "all_outcomes_equal": true,
+  "all_solved_and_node_limited_counts_and_costs_equal": true,
+  "records": [
+    {
+      "case": "gripper-p01",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "gripper-p01",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "gripper-p01",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "gripper-p03",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "gripper-p03",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "gripper-p03",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p01",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p01",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p01",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p02",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p02",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "miconic-p02",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "childsnack-p01",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "childsnack-p01",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "childsnack-p01",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "elevators-p02",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "elevators-p02",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "elevators-p02",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "parcprinter-p03",
+      "profile": "add",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "parcprinter-p03",
+      "profile": "ff",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "parcprinter-p03",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "driverlog-p01",
+      "profile": "add",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "driverlog-p01",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "driverlog-p01",
+      "profile": "clff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "zenotravel-p01",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "zenotravel-p01",
+      "profile": "ff",
+      "outcome": "limit",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "zenotravel-p01",
+      "profile": "clff",
+      "outcome": "timeout",
+      "generated_equal": false,
+      "cost_equal": true
+    },
+    {
+      "case": "satellite-p01",
+      "profile": "add",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "satellite-p01",
+      "profile": "ff",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    },
+    {
+      "case": "satellite-p01",
+      "profile": "clff",
+      "outcome": "solved",
+      "generated_equal": true,
+      "cost_equal": true
+    }
+  ]
+}

@@ -1,0 +1,125 @@
+[
+  {
+    "label": "driverlog-p01-ff_gbfs_fifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/driverlog/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/driverlog/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "driverlog-p01-ff_gbfs_fifo_pref",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/driverlog/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/driverlog/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none",
+      "--preferred"
+    ]
+  },
+  {
+    "label": "zenotravel-p01-ff_gbfs_fifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/zenotravel/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/zenotravel/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "zenotravel-p01-ff_gbfs_fifo_pref",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/zenotravel/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/zenotravel/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none",
+      "--preferred"
+    ]
+  },
+  {
+    "label": "satellite-p01-ff_gbfs_fifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "satellite-p01-ff_gbfs_fifo_pref",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/release/potoroo",
+    "revision": "2b7bf40+ff-preferred-fifo-investigation",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/satellite/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FF/FIFO",
+      "-s",
+      "GBFS",
+      "-w",
+      "1",
+      "-p",
+      "none",
+      "--preferred"
+    ]
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "frozen": {
+    "source_archive": "target/relax-investigation/ff-gap-condition-frozen/source.tar.gz",
+    "source_archive_sha256": "da5bdf4adcf0371b41ee99f412510b062472535ff870aa3fb3462d434bed77b6",
+    "binary": "target/relax-investigation/ff-gap-condition-frozen/potoroo",
+    "binary_sha256": "77417d67b600486f408f9f717b484b397f47ac217c754951473fb86f3d64507c"
+  },
+  "tests": "245 library passed, one ignored; 14 CLI passed",
+  "logs": {
+    "target/relax-investigation/ff-gap-condition-tests.log": "6e162bbe81dee514f0493f1342caa36fd1d9a3d680f026e564e17499a0caecbe",
+    "target/relax-investigation/ff-gap-condition-build.log": "b07225dc2d9c11dd47e8f831fdd7a8892cfab887cff024124e62af224ab4691a"
+  }
+}

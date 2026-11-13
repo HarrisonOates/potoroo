@@ -127,10 +127,13 @@ impl Cli {
 struct RunStats {
     nodes_generated: usize,
     nodes_visited: usize,
+    preferred_generated: usize,
+    preferred_selected: usize,
     h_evals: usize,
     h_eval_ms: u128,
     pruned: usize,
     supporter_forced: usize,
+    threat_forced: usize,
     // Preprocessing work/time/removals sum across stages; proof counts are
     // maxima because stages can rediscover the same pairs. Status is the last
     // enabled stage's, with run/completion counts showing partial completion.
@@ -150,10 +153,13 @@ impl RunStats {
     fn add(&mut self, stage: &RunStats) {
         self.nodes_generated += stage.nodes_generated;
         self.nodes_visited += stage.nodes_visited;
+        self.preferred_generated += stage.preferred_generated;
+        self.preferred_selected += stage.preferred_selected;
         self.h_evals += stage.h_evals;
         self.h_eval_ms += stage.h_eval_ms;
         self.pruned += stage.pruned;
         self.supporter_forced += stage.supporter_forced;
+        self.threat_forced += stage.threat_forced;
         self.h2_runs += stage.h2_runs;
         self.h2_completed += stage.h2_completed;
         if stage.h2_runs > 0 {
@@ -187,6 +193,9 @@ impl From<potoroo::search::SearchStats> for RunStats {
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
             supporter_forced: 0,
+            threat_forced: 0,
+            preferred_generated: 0,
+            preferred_selected: 0,
             h2: Default::default(),
             h2_runs: 0,
             h2_completed: 0,
@@ -210,6 +219,9 @@ impl From<potoroo::fdr_pocl::SearchStats> for RunStats {
             h_eval_ms: stats.h_eval_ms,
             pruned: stats.pruned,
             supporter_forced: stats.supporter_forced,
+            threat_forced: stats.threat_forced,
+            preferred_generated: stats.preferred_generated,
+            preferred_selected: stats.preferred_selected,
             h2: stats.h2,
             h2_runs: usize::from(stats.h2.status != potoroo::h2::Status::Disabled),
             h2_completed: usize::from(stats.h2.status == potoroo::h2::Status::Complete),
@@ -399,7 +411,8 @@ fn run() -> Result<ExitCode, String> {
                      \"solved\":{},\"plan_len\":{},\"plan_cost\":{},\"nodes_generated\":{},\"nodes_visited\":{},\
                      \"wall_ms\":{},\"h_evals\":{},\"h_eval_ms\":{},\"pruned\":{},\
                      \"max_steps\":{},\"max_open_conditions\":{},\"max_threats\":{},\
-                     \"supporter_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\
+                     \"supporter_forced\":{},\"threat_forced\":{},\"max_disjunctions\":{},\"max_queued\":{},\"dropped\":{},\
+                     \"preferred_generated\":{},\"preferred_selected\":{},\
                      \"h2_status\":\"{}\",\"h2_runs\":{},\"h2_completed\":{},\"h2_work\":{},\"h2_ms\":{},\
                      \"h2_max_mutex_pairs\":{},\"h2_max_new_mutex_pairs\":{},\"h2_max_projected_variables\":{},\"h2_max_unreachable_facts\":{},\"h2_supporters_removed\":{},\
                      \"outcome\":\"{}\",\"peak_rss_kb\":{}}}",
@@ -418,9 +431,12 @@ fn run() -> Result<ExitCode, String> {
                     stats.max_open_conditions,
                     stats.max_threats,
                     stats.supporter_forced,
+                    stats.threat_forced,
                     stats.max_disjunctions,
                     stats.max_queued,
                     stats.dropped,
+                    stats.preferred_generated,
+                    stats.preferred_selected,
                     stats.h2.status.as_str(),
                     stats.h2_runs,
                     stats.h2_completed,
@@ -972,6 +988,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let mut algorithm_name = String::from("A");
     // Track whether the user set these so repeated flags replace the defaults.
     let mut flaw_orders: Vec<FlawSelectionOrder> = Vec::new();
+    let mut order_heuristics: Vec<Option<Heuristic>> = Vec::new();
+    let mut order_weights: Vec<Option<f32>> = Vec::new();
     let mut flaw_order_names: Vec<String> = Vec::new();
     let mut search_limits: Vec<usize> = Vec::new();
     let mut stages: Vec<Stage> = Vec::new();
@@ -1042,12 +1060,42 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
             }
             "f" => {
                 let v = required_value!();
-                flaw_orders.push(FlawSelectionOrder::parse(&v)?);
+                // `ORDER@HEURISTIC[*WEIGHT]` ranks this order's queue by its own
+                // heuristic and weight.
+                let (order, heuristic, weight) = match v.split_once('@') {
+                    Some((order, rest)) => {
+                        let (heuristic, weight) = match rest.rsplit_once('*') {
+                            Some((heuristic, weight)) => {
+                                let w: f32 = weight
+                                    .parse()
+                                    .map_err(|_| format!("invalid queue weight `{weight}`"))?;
+                                if !w.is_finite() || w < 0.0 {
+                                    return Err(format!("invalid queue weight `{weight}`"));
+                                }
+                                (heuristic, Some(w))
+                            }
+                            None => (rest, None),
+                        };
+                        (order, Some(Heuristic::parse(heuristic)?), weight)
+                    }
+                    None => (v.as_str(), None, None),
+                };
+                flaw_orders.push(FlawSelectionOrder::parse(order)?);
+                order_heuristics.push(heuristic);
+                order_weights.push(weight);
                 flaw_order_names.push(v);
             }
             "P" => fdr_pocl = true,
             "lifted-fdr" => lifted_fdr = true,
             "lane" => lanes.push(required_value!()),
+            "preferred" => params.preferred_operators = true,
+            "pea" => params.partial_expansion = true,
+            "pea-min" => {
+                let v = required_value!();
+                params.partial_expansion = true;
+                params.partial_expansion_min =
+                    v.parse().map_err(|_| format!("invalid --pea-min `{v}`"))?;
+            }
             "g" => params.ground_actions = true,
             "h" => {
                 let v = required_value!();
@@ -1136,6 +1184,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
 
     if !flaw_orders.is_empty() {
         params.flaw_orders = flaw_orders;
+        params.order_heuristics = order_heuristics;
+        params.order_weights = order_weights;
     } else {
         flaw_order_names.push("STATIC".to_string());
     }
@@ -1154,10 +1204,46 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Cli>, String>
     let heuristics = std::iter::once(&params.heuristic).chain(stages.iter().map(|s| &s.heuristic));
     for heuristic in heuristics {
         if !fdr_pocl && heuristic.requires_fdr_pocl() {
-            return Err("LMCUT and LMCUTR require --fdr-pocl".to_string());
+            return Err(
+                "LMCUT, LMCUTR, CLADD, CLFF, REPOP, FF, FFR, FFOC, FFOCR, TADD, \
+                        FLOW and HYB require --fdr-pocl"
+                    .to_string(),
+            );
         }
         if fdr_pocl {
             potoroo::fdr_pocl::supports_heuristic(heuristic).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if !fdr_pocl && params.order_heuristics.iter().any(Option::is_some) {
+        return Err("per-order heuristics (`-f ORDER@HEURISTIC`) require --fdr-pocl".to_string());
+    }
+    if !fdr_pocl && params.partial_expansion {
+        return Err("--pea requires --fdr-pocl".to_string());
+    }
+    if fdr_pocl {
+        for heuristic in params.order_heuristics.iter().flatten() {
+            potoroo::fdr_pocl::supports_heuristic(heuristic).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if params.preferred_operators {
+        if !fdr_pocl {
+            return Err("--preferred requires --fdr-pocl".into());
+        }
+        let algorithms: Vec<_> = if stages.is_empty() {
+            vec![params.search_algorithm]
+        } else {
+            stages
+                .iter()
+                .map(|s| s.search_algorithm.unwrap_or(params.search_algorithm))
+                .collect()
+        };
+        if algorithms
+            .iter()
+            .any(|s| !matches!(s, SearchAlgorithm::A | SearchAlgorithm::Gbfs))
+        {
+            return Err("--preferred supports A or GBFS search, including portfolio stages".into());
         }
     }
 
@@ -1236,6 +1322,9 @@ fn long_to_short(name: &str) -> Result<String, String> {
         "fdr-pocl" => "P",
         "lifted-fdr" => "lifted-fdr",
         "lane" => "lane",
+        "preferred" => "preferred",
+        "pea" => "pea",
+        "pea-min" => "pea-min",
         "ground-actions" => "g",
         "heuristic" => "h",
         "help" => "H",
@@ -1336,9 +1425,13 @@ fn print_help() {
          \x20 -g, --ground-actions       plan with ground actions\n\
          \x20 -h, --heuristic=HEUR       plan-ranking heuristic (default ADD/LIFO)\n\
          \x20 -l, --limit=N              search-node limit (or `unlimited`)\n\
+         \x20     --preferred            favour FF-supported refinements (FDR A/GBFS; 5:1)\n\
+         \x20     --pea                  partial-expansion A* (FDR A*): queue only children at\n\
+         \x20                            the plan's f-value, re-queue it at the next one\n\
+         \x20     --pea-min=K            --pea, but fully expand plans with <= K children\n\
          \x20     --max-queued=N         halve the open lists above N queued plans (incomplete)\n\
          \x20     --mem-mb=M             halve the open lists above M MB resident (incomplete)\n\
-         \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, h2, edelete,\n\
+         \x20 -p, --prune=RULES          opt-in pruning: cutset, symbolic, supporters, threats, h2, edelete,\n\
          \x20                            disjunctive, params, joint, recursion, minimality, symmetry, all, none\n\
          \x20                            (default none)\n\
          \x20 -s, --search-algorithm=A   search algorithm: A, IDA, HC, BFS, GBFS, LGBFS, LGBFS-D, ALT\n\
@@ -1361,6 +1454,24 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_requires_native_eager_search_in_every_stage() {
+        for args in [
+            vec!["--preferred"],
+            vec!["--fdr-pocl", "--preferred", "-s", "LGBFS"],
+            vec!["--fdr-pocl", "--preferred", "--stage", "FF@ALT"],
+        ] {
+            assert!(parse_args(args.into_iter().map(str::to_string)).is_err());
+        }
+        assert!(
+            cli(&["--fdr-pocl", "--preferred", "-s", "GBFS"])
+                .params
+                .preferred_operators
+        );
+        let staged = cli(&["--fdr-pocl", "--preferred", "--stage", "FF@GBFS"]);
+        assert!(stage_parameters(&staged, &staged.stages[0], None).preferred_operators);
+    }
 
     #[test]
     fn pair_preprocessing_stats_preserve_work_and_proof_counts_across_stages() {
@@ -1491,6 +1602,10 @@ mod tests {
         // The same rejection `-h` gives, so a portfolio cannot smuggle an FDR
         // heuristic into a representation that has no facts for it.
         assert!(rejects(&["--stage", "LMCUT"]).contains("require --fdr-pocl"));
+        assert!(rejects(&["--stage", "REPOP"]).contains("require --fdr-pocl"));
+        assert!(rejects(&["--stage", "FF"]).contains("require --fdr-pocl"));
+        assert!(rejects(&["--stage", "FFR"]).contains("require --fdr-pocl"));
+        assert!(rejects(&["--stage", "FFOCR"]).contains("require --fdr-pocl"));
         assert!(rejects(&["--stage", "ADD", "--stage", "CLFF"]).contains("require --fdr-pocl"));
     }
 

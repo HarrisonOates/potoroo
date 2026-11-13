@@ -1,0 +1,482 @@
+[
+  {
+    "label": "childsnack-p01-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "childsnack-p01-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "childsnack-p01-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "childsnack-p01-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/childsnack/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  },
+  {
+    "label": "elevators-p02-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "elevators-p02-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "elevators-p02-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "elevators-p02-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/elevators/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  },
+  {
+    "label": "gripper-p01-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p01-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p01-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p01-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  },
+  {
+    "label": "gripper-p03-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p03-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p03-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "gripper-p03-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/gripper/p03.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  },
+  {
+    "label": "miconic-p01-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p01-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p01-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p01-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p01.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  },
+  {
+    "label": "miconic-p02-add_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "ADD/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p02-ffr_zlifo",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "ZLIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p02-ffr_b8",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "none"
+    ]
+  },
+  {
+    "label": "miconic-p02-ffr_b8_t",
+    "binary": "/home/harrison/Documents/Github/potoroo/target/relax-investigation/ff-target-frozen/potoroo",
+    "revision": "2b7bf40+targeted-refinements",
+    "domain": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/domain.pddl",
+    "problem": "/home/harrison/Documents/Github/autoscale-unitcost/agile/miconic/p02.pddl",
+    "args": [
+      "--fdr-pocl",
+      "-f",
+      "{n}LIFO/{o}0LIFO/{o}1NEW/{o}8LIFO/{o}LR/{s}LIFO",
+      "-h",
+      "FFR/LIFO",
+      "-s",
+      "A",
+      "-w",
+      "1",
+      "-p",
+      "threats"
+    ]
+  }
+]

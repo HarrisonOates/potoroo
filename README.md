@@ -14,7 +14,7 @@ Australian marsupial.
 
 ## Build
 
-Install stable [Rust](https://rustup.rs), then:
+Install [Rust with rustup](https://rustup.rs), then:
 
 ```bash
 git clone https://github.com/HarrisonOates/potoroo.git
@@ -22,6 +22,9 @@ cd potoroo
 cargo build --release
 cargo test
 ```
+
+The repository pins Rust 1.99.1 (including Clippy and rustfmt) in
+`rust-toolchain.toml`; rustup selects it automatically. CI uses the same version.
 
 The executable is `target/release/potoroo`. The default build is pure Rust.
 For a faster Lplan LP backend, use `cargo build --release --features highs-lp`;
@@ -129,6 +132,12 @@ exact integer plan IDs. In the table, “literal” means lifted or `-g` search;
 | `ADD`, `ADD_COST`, `ADD_WORK` | Any | Additive relaxed cost or work. |
 | `ADDR`, `ADDR_COST`, `ADDR_WORK` | Any | Additive estimates with committed-action reuse. |
 | `RELAX`, `RELAXR` | Any | Joint relaxed-plan cost, without/with reuse. |
+| `REPOP` | `--fdr-pocl`; unconditional, axiom-free unit-cost tasks | Published §3 regression recurrence using serial planning-graph levels. |
+| `FF`, `FFR` | `--fdr-pocl`; unconditional, axiom-free unit-cost tasks | Joint parallel FF extraction sharing future actions, without/with order-compatible existing-step reuse. |
+| `FFOC`, `FFOCR` | `--fdr-pocl`; unconditional, axiom-free unit-cost tasks | Sum a separate FF support-plan size for every open-condition occurrence; `FFOCR` first discounts order-compatible existing support. |
+| `TADD`, `TADD_H` | `--fdr-pocl` | `ADD` plus value-token shortfalls: each committed step that overwrites a value it requires needs its own production of that value. `_H` omits the plan cost (tie-breaking). |
+| `FLOW`, `FLOW_H` | `--fdr-pocl` | Per-variable min-cost token flow over domain transition graphs; plans with no feasible flow are pruned. |
+| `HYB` | `--fdr-pocl` | `TADD` + ½ `FLOW`. |
 | `CLADD`, `CLFF` | `--fdr-pocl` | Causal-link compilation evaluated natively. |
 | `LMCUT`, `LMCUTR` | `--fdr-pocl`; unconditional SAS+ effects | LM-cut, without/with reuse. |
 | `LM` | Any | Unachieved landmarks: lifted or ground according to representation. |
@@ -136,11 +145,118 @@ exact integer plan IDs. In the table, “literal” means lifted or `-g` search;
 | `LPLAN` | `-g` | Bylander's time-indexed LP relaxation. |
 | `LPSAS`, `LPSAS:MIP`, `LPSAS:MIP50` | `-g`, FD | SAS+ LP, integral operators, or a per-probe MIP budget in milliseconds. |
 | `SAMPLE_FF`, `SAMPLE_FF:k` | `-g` | Sample-FF over `k` linearisations; default 10. |
-| `COMPILE_FF`, `COMPILE_LMCUT`, `COMPILE_HMAX`, `COMPILE_HADD`, `COMPILE_BLIND` | `-g`, FD | Evaluate a compiled classical task using FD. `COMPILE` aliases `COMPILE_FF`. |
+| `COMPILE_FF`, `COMPILE_LMCUT` | Native `--fdr-pocl` on unconditional, axiom-free tasks; literal search with FD (`-g` is faster) | Full occurrence, ordering and causal-link compilation. Subtract committed cost before weighting. `COMPILE` aliases `COMPILE_FF`. |
+| `COMPILE_HMAX`, `COMPILE_HADD`, `COMPILE_BLIND` | Literal search with FD (`-g` is faster) | Full compilation with another FD backend. |
 
 Heuristics differ in cost and suitability; no single configuration dominates
 across domains. Optimality requires an admissible ranking and a compatible search
 configuration.
+
+In native FDR search, `ADD_WORK`/`ADDR_WORK` estimate remaining causal-link
+refinements: initially true or reusable facts cost one link, and other facts
+inherit the effort of cost-minimizing support plus one. Equal-cost alternatives
+use minimum effort. `MW`/`LW` use these work estimates for flaw selection;
+`MC`/`LC` use additive action cost. A composition such as `FFR/ADD_WORK/LIFO`
+uses work only to break equal FFR ranks. The
+[flaw-type investigation](investigation/relax-vs-add/flaw-type-findings.md)
+records the native effort correction and its evaluation.
+
+`FF` adapts Hoffmann and Nebel's [relaxed-plan extraction](https://arxiv.org/pdf/1106.0675)
+to the joint outstanding open conditions. It uses parallel first-appearance
+levels, NOOPs first, minimum summed precondition levels, and all selected effects.
+Effect marks are restricted to the current extraction layer, following the
+author's released FF-v2.3 implementation, to preserve already-required support.
+Ties use ascending fact/operator indices. `FFR` first removes each open condition
+that a committed step could support under the current orderings, following the
+existing-action reuse check discussed in [VHPOP §3.1.2](https://www.cs.cmu.edu/afs/cs/project/jair/pub/volume20/younes03a-html/node6.html).
+The reuse test checks possible producer-before-consumer ordering; it does not
+reject a producer whose fact is necessarily overwritten between those steps.
+The [flaw-type diagnostics](investigation/relax-vs-add/flaw-type-findings.md)
+measure this optimistic occurrence-level eligibility.
+Both share potential future actions; `FFR` additionally considers existing steps.
+This is an experimental POCL adaptation, without FF's helpful-action pruning or
+enforced hill climbing. It retains outstanding preconditions of committed steps.
+It differs from `CLFF`'s causal-link compilation and `RELAX`'s additive achievers.
+The `FFR` reuse filter applies to current open conditions; it does not discount
+existing support needed recursively by a potential future action. See the
+[FF investigation](investigation/relax-vs-add/ff-findings.md) for results and scope.
+The [memory and FD-gap follow-up](investigation/relax-vs-add/memory-and-domain-findings.md)
+compares reuse, preferred refinements, alternative flaw selection, and measured
+search structure on the difficult cluster cases.
+The [targeted-refinement follow-up](investigation/relax-vs-add/targeted-refinement-findings.md)
+tests bounded supporter counts and opt-in forced threat repairs against the
+conditions identified by those diagnostics.
+
+`TADD`, `FLOW` and `HYB` count *value tokens*. A variable's history is a chain
+of segments, one per write; a step that requires `v = a` and overwrites it ends
+one segment of value `a`, and no other step can end the same segment. `TADD`
+charges each shortfall of productions at the value's cheapest reproduction cost
+on top of `ADD`; `FLOW` solves the per-variable transportation problem from
+surplus to deficit values over the domain transition graph. See the
+[token heuristic investigation](investigation/pocl-heuristic/findings.md).
+
+In native FDR search, `-f ORDER@HEURISTIC[*WEIGHT]` gives an interleaved
+flaw-order queue its own ranking (and weight), so one search alternates between
+heuristics; a queue whose heuristic cannot handle the task is dropped.
+`--pea` turns native FDR A* into partial-expansion A* (Yoshizumi, Miura &
+Ishida 2000): a plan queues only its children at its current f-value and is
+re-queued at its next one, which keeps the queue far smaller.
+The recommended token configuration is
+
+```sh
+potoroo --fdr-pocl -s A --pea -f 'ZLIFO@TADD/LIFO' -f 'ZLIFO@FLOW/LIFO' \
+  -f '{n}LIFO/{o}0LIFO/{o}1NEW/{o}LC_add/{s}LIFO@HYB/LIFO' domain.pddl problem.pddl
+```
+
+`--preferred` adds an experimental preferred-refinement queue to native FDR
+`A` or `GBFS` search. It favours new actions selected by the parent's FF relaxed
+plan, links to existing steps, and ordering refinements. With `FFR` or `FFOCR` it uses the
+same existing-support filter as the estimate; other rankings, including `ADD`,
+use ordinary FF extraction for preferences. Five selections use the preferred
+queue for every ordinary-queue selection, with fallback when either is empty.
+Every refinement remains in the ordinary queue and shared entries expand once.
+This changes expansion order even with `A`; it does not preserve A*'s ordering.
+It requires unconditional, axiom-free unit-cost tasks, regardless of the ranking
+heuristic. `preferred_generated` and `preferred_selected` appear in FDR STATS;
+preference extraction contributes to wall time but not `h_eval_ms`.
+See the [preferred-refinement investigation](investigation/relax-vs-add/preferred-findings.md).
+
+`POTOROO_FDR_DIAGNOSTICS=1` emits a separate `FDR_DIAGNOSTIC` JSON record per
+native FDR search stage. It counts selected open/threat refinements and their
+emitted children before outer search pruning (internal refinement checks have
+already run). Bounded samples measure repeated action occurrences,
+ordered pairs of real steps, new threats in insertion children, and existing
+unconditional restorers forced between a deleter and a link's consumer. This
+last counter measures possible white-knight support; it does not change threat
+semantics. Sampling starts at expansion 1, repeats every 1024 expansions, and
+stops after 256 samples; structure checks omit plans with over 256 steps or
+threats and report the omissions. Keep diagnostics off for timing comparisons.
+Additional `FDR_DIAGNOSTIC_CONDITION` records attribute selected open conditions
+and threatened links to `(variable, value)` facts, including emitted children,
+new-step children and links from INIT. IDs refer to the current search task;
+mapping them to captured SAS labels requires unchanged variable indices.
+Also setting `POTOROO_FDR_FLAW_TYPES=1` emits selected-flaw type counts,
+including local/unsafe opens, initially true facts, and support blocked by a
+forced intervening unconditional deletion. Bitmask buckets partition selected
+opens; named types overlap. These observations do not prune or rerank plans.
+
+`FFOC` preserves separate support demands across open conditions while using FF
+sharing inside each demand. `FFOCR` adds FFR's per-consumer existing-support
+filter to this sum; it keeps the outstanding preconditions of committed steps.
+Both are experimental adaptations. Native `COMPILE_FF` uses additive supporters; its
+tie choices need not match FD. Native `COMPILE_LMCUT` uses the existing LM-cut
+evaluator. Both rebuild the full compiled task at each evaluation. See the
+[compiled FF investigation](investigation/relax-vs-add/compiled-ff-corrected-findings.md).
+
+`REPOP` implements the ranking recurrence in Nguyen and Kambhampati (2001),
+[§3](https://rakaposhi.eas.asu.edu/ucpop-revive.pdf), over native finite-domain
+facts. It chooses a highest-level goal, regresses through an earliest-layer
+achiever, removes all its effects, and charges zero for committed operators.
+Equal levels use descending fact index; tied achievers prefer committed actions,
+then translator order. Those tie choices are unspecified in the paper.
+Use `-w 5` for the paper's heuristic weight. The flag alone does not enable
+RePOP's consistency enforcement or change flaw selection. Existing `RELAX`
+and `RELAXR` retain their previous semantics for comparisons.
 
 ### Flaw selection and pruning
 
@@ -163,7 +279,7 @@ Pruning is off by default. Select rules with `-p cutset,edelete`, use `all` or
 | `cutset`, `edelete`, `recursion`, `minimality` | All representations. |
 | `params`, `joint` | Literal representations. |
 | `symbolic` | Lifted cutset checks. |
-| `supporters`, `h2`, `disjunctive` | Finite-domain search. |
+| `supporters`, `threats`, `h2`, `disjunctive` | Finite-domain search. |
 | `symmetry` | Ground literal and finite-domain search. |
 
 Rules have different costs and can change the returned plan.

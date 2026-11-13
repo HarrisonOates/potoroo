@@ -19,6 +19,9 @@ pub struct PruneOptions {
     /// FDR supporter feasibility checks and bounded propagation of forced
     /// support choices, before allocating queue entries.
     pub supporters: bool,
+    /// FDR: compress forced threat resolutions after a threat is selected,
+    /// without queueing every intermediate ordering refinement.
+    pub threats: bool,
     /// Bounded h² preprocessing for FDR. Includes cutsets and supporter
     /// feasibility filtering; forced propagation still requires `supporters`.
     pub h2: bool,
@@ -55,6 +58,7 @@ impl PruneOptions {
             cutset: true,
             symbolic: true,
             supporters: true,
+            threats: true,
             h2: true,
             edelete: true,
             disjunctive: true,
@@ -71,6 +75,7 @@ impl PruneOptions {
         self.cutset
             || self.symbolic
             || self.supporters
+            || self.threats
             || self.h2
             || self.edelete
             || self.disjunctive
@@ -108,6 +113,7 @@ impl PruneOptions {
                 "cutset" => options.cutset = on,
                 "symbolic" => options.symbolic = on,
                 "supporters" => options.supporters = on,
+                "threats" => options.threats = on,
                 "h2" => options.h2 = on,
                 "edelete" | "e-deletion" | "edeletion" => options.edelete = on,
                 "disjunctive" | "disjunctions" => options.disjunctive = on,
@@ -119,7 +125,7 @@ impl PruneOptions {
                 other => {
                     return Err(format!(
                         "unknown pruning rule `{other}` (expected cutset, edelete, \
-                         symbolic, supporters, h2, disjunctive, params, joint, recursion, minimality, symmetry, all or none)"
+                         symbolic, supporters, threats, h2, disjunctive, params, joint, recursion, minimality, symmetry, all or none)"
                     ))
                 }
             }
@@ -163,6 +169,9 @@ impl PruneOptions {
         if self.supporters {
             names.push("supporters");
         }
+        if self.threats {
+            names.push("threats");
+        }
         if self.h2 {
             names.push("h2");
         }
@@ -180,6 +189,9 @@ impl PruneOptions {
         }
         if self.supporters {
             names.push("supporters");
+        }
+        if self.threats {
+            names.push("threats");
         }
         if self.h2 {
             names.push("h2");
@@ -236,6 +248,7 @@ mod tests {
                 "cutset",
                 "symbolic",
                 "supporters",
+                "threats",
                 "h2",
                 "edelete",
                 "disjunctive",
