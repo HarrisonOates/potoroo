@@ -14,7 +14,7 @@ Australian marsupial.
 
 ## Build
 
-Install stable [Rust](https://rustup.rs), then:
+Install [Rust with rustup](https://rustup.rs), then:
 
 ```bash
 git clone https://github.com/HarrisonOates/potoroo.git
@@ -22,6 +22,9 @@ cd potoroo
 cargo build --release
 cargo test
 ```
+
+The repository pins Rust 1.99.1 (including Clippy and rustfmt) in
+`rust-toolchain.toml`; rustup selects it automatically. CI uses the same version.
 
 The executable is `target/release/potoroo`. The default build is pure Rust.
 For a faster Lplan LP backend, use `cargo build --release --features highs-lp`;
