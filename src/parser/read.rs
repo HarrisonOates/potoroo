@@ -27,16 +27,17 @@ impl std::fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// Parse a PDDL source string, auto-detecting whether it declares a domain or a
-/// problem from the leading `(define (domain ...))` / `(define (problem ...))`.
+/// Parse exactly one domain or problem, letting the upstream parser determine
+/// its kind. Use [`read_pddl_file`] for buffers containing several definitions.
 pub fn read_pddl(src: &str) -> Result<ParsedUnit, ReadError> {
-    let src = fold_case(src);
-    if looks_like_problem(&src) {
-        Problem::from_str(&src).map(ParsedUnit::Problem)
-    } else {
-        Domain::from_str(&src).map(ParsedUnit::Domain)
+    let file = read_pddl_file(src)?;
+    match (file.domains.len(), file.problems.len()) {
+        (1, 0) => Ok(ParsedUnit::Domain(file.domains.into_iter().next().unwrap())),
+        (0, 1) => Ok(ParsedUnit::Problem(file.problems.into_iter().next().unwrap())),
+        (domains, problems) => Err(ReadError::Parse(format!(
+            "expected exactly one domain or problem, found {domains} domains and {problems} problems"
+        ))),
     }
-    .map_err(|e| ReadError::Parse(e.to_string()))
 }
 
 /// Parse a buffer holding any number of `(define ...)` forms, such as a domain
@@ -53,24 +54,55 @@ fn fold_case(src: &str) -> String {
     src.to_ascii_lowercase()
 }
 
-/// Heuristic classification: scan for `(define (problem` ignoring whitespace and
-/// comments is overkill; the first occurrence of the `problem`/`domain` keyword
-/// after `(define (` is sufficient for well-formed PDDL. Expects folded source.
-fn looks_like_problem(src: &str) -> bool {
-    match (
-        src.find("(define"),
-        src.find("(problem"),
-        src.find("(domain"),
-    ) {
-        (Some(_), Some(p), Some(d)) => p < d,
-        (Some(_), Some(_), None) => true,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOMAIN: &str = "(define (domain d) (:predicates (p)))";
+    const PROBLEM: &str = "(define (problem q) (:domain d) (:init) (:goal (p)))";
+
+    #[test]
+    fn comments_cannot_change_the_definition_kind() {
+        for comment in [
+            "; Uses (domain d)\n",
+            "; Example (problem q)\n",
+            "; (define (domain fake))\n",
+        ] {
+            assert!(matches!(
+                read_pddl(&format!("{comment}{DOMAIN}")),
+                Ok(ParsedUnit::Domain(_))
+            ));
+            assert!(matches!(
+                read_pddl(&format!("{comment}{PROBLEM}")),
+                Ok(ParsedUnit::Problem(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn single_unit_reader_rejects_empty_or_multiple_definitions() {
+        for src in [
+            String::new(),
+            "; comment only\n".into(),
+            format!("{DOMAIN}\n{PROBLEM}"),
+            format!("{DOMAIN}\n{DOMAIN}"),
+            format!("{PROBLEM}\n{PROBLEM}"),
+        ] {
+            assert!(read_pddl(&src).is_err(), "accepted {src}");
+        }
+    }
+
+    #[test]
+    fn readers_reject_trailing_garbage_and_incomplete_definitions() {
+        for src in [
+            format!("{DOMAIN}\ngarbage"),
+            format!("{DOMAIN}\n(define (problem"),
+            "(define (domain".into(),
+        ] {
+            assert!(read_pddl(&src).is_err(), "accepted {src}");
+            assert!(read_pddl_file(&src).is_err(), "accepted {src}");
+        }
+    }
 
     #[test]
     fn a_buffer_holding_a_domain_and_a_problem_reads_as_two_units() {
